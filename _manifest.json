@@ -1,16 +1,17 @@
 {
   "manifest_version": 2,
-  "id": "xiaocutedog.maibot-sing",
-  "version": "1.1.0",
+  "id": "qr0w.maibot-sing",
+  "version": "0.3.0",
   "name": "让麦麦说话和唱歌",
   "description": "用 RVC 克隆音色翻唱歌曲和说话，内嵌音乐搜索（网易云/QQ）与 MiMo TTS",
   "author": {
-    "name": "xiaocutedog",
-    "url": "https://github.com/xiaocutedog/"
+    "name": "QR-0W (derived from xiaocutedog)",
+    "url": "https://github.com/QR-0W/maibot_sing-main"
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/xiaocutedog/maibot_sing-main/"
+    "repository": "https://github.com/QR-0W/maibot_sing-main/",
+    "upstream": "https://github.com/xiaocutedog/maibot_sing-main/"
   },
   "host_application": {
     "min_version": "1.0.0",

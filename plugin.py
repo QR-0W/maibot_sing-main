@@ -26,6 +26,7 @@ from .music.search import MusicSearchClient, MusicSearchError, SongInfo
 from .rvc_client import RVCClient, RVCSidecarError
 from .services.mimo_tts import MiMoTTSService
 from .services.pipeline import Pipeline
+from .services.local_backend import INDEX, MODEL, LocalBackend
 
 
 # 语音发送的软截止：超过该时长仍未返回，先按失败上报（bot 会说"发不出去"），
@@ -53,8 +54,8 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_label__ = "插件"
     __ui_order__ = 0
 
-    enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.2.0", description="配置版本")
+    enabled: bool = Field(default=False, description="默认禁用；管理员审查后明确启用")
+    config_version: str = Field(default="0.3.0", description="配置版本")
 
 
 class RVCConfig(PluginConfigBase):
@@ -66,7 +67,7 @@ class RVCConfig(PluginConfigBase):
     rvc_root: str = Field(default="D:/RVC20240604Nvidia", description="RVC 安装根目录")
     python_path: str = Field(default="", description="RVC Python 解释器路径，留空自动用 {rvc_root}/runtime/python.exe")
     port: int = Field(default=7898, description="sidecar 监听端口（避开 7897 WebUI）")
-    auto_start: bool = Field(default=True, description="插件加载时自动拉起 sidecar（端口已有服务则复用）")
+    auto_start: bool = Field(default=False, description="旧 sidecar 不自动启动；Linux 本地模式始终忽略此项")
     default_model: str = Field(default="", description="默认音色模型（assets/weights 下的 .pth 文件名，含扩展名）")
     f0_method: str = Field(default="rmvpe", description="音高提取算法: pm/harvest/crepe/rmvpe")
     f0_up_key: int = Field(default=0, description="变调（半音数，升八度 12，降八度 -12）")
@@ -125,7 +126,7 @@ class MiMoConfig(PluginConfigBase):
     preset_voice: str = Field(default="mimo_default", description="预置音色 ID（仅 preset 模式生效）")
     reference_audio: str = Field(default="", description="音色复刻参考音频文件路径（仅 clone 模式生效）")
     rvc_after_tts: bool = Field(
-        default=True,
+        default=False,
         description="说话功能：TTS 输出后再经 RVC 换音色；关闭则直接发送 TTS 原声",
     )
 
@@ -157,10 +158,23 @@ class ComponentConfig(PluginConfigBase):
     tool_enabled: bool = Field(default=True, description="启用工具（LLM 自主触发）")
 
 
+class LocalConfig(PluginConfigBase):
+    backend: str = Field(default="local", description="只支持受限 Linux 本地后端；legacy 禁止不受限推理")
+    output_dir: str = Field(default="", description="永久输出绝对路径；留空使用插件 data_dir/covers")
+    model_path: str = Field(default=str(MODEL), description="管理员配置的固定 RVC 模型绝对路径")
+    index_path: str = Field(default=str(INDEX), description="管理员配置的固定索引绝对路径")
+    max_queue: int = Field(default=2, ge=0, le=8)
+    timeout_s: int = Field(default=900, ge=60, le=900)
+    max_duration_s: int = Field(default=300, ge=30, le=300)
+    max_download_bytes: int = Field(default=67108864, ge=1048576, le=67108864)
+    local_source_allowlist: list[str] = Field(default_factory=list, description="仅用于管理员可控回归")
+
+
 class SingPluginConfig(PluginConfigBase):
     """翻唱插件总配置。"""
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
+    local: LocalConfig = Field(default_factory=LocalConfig)
     rvc: RVCConfig = Field(default_factory=RVCConfig)
     mimo: MiMoConfig = Field(default_factory=MiMoConfig)
     music: MusicConfig = Field(default_factory=MusicConfig)
@@ -178,6 +192,7 @@ class SingPlugin(MaiBotPlugin):
         self._rvc: RVCClient | None = None
         self._mimo: MiMoTTSService | None = None
         self._pipeline: Pipeline | None = None
+        self._local: LocalBackend | None = None
         self._sidecar_proc: asyncio.subprocess.Process | None = None
         # 待选歌曲状态: stream_id -> (结果列表, 平台, 时间戳)
         self._pending: dict[str, tuple[list[SongInfo], str, float]] = {}
@@ -196,10 +211,19 @@ class SingPlugin(MaiBotPlugin):
     # ===== 生命周期 =====
 
     async def on_load(self) -> None:
+        try:
+            await self._load()
+        except BaseException:
+            await self.on_unload()
+            raise
+
+    async def _load(self) -> None:
         self.ctx.logger.info("翻唱插件加载中...")
         self._ensure_config_exists()
 
-        # 每次启动先清理一次过期缓存（放在最前，避免被 sidecar 启动等待等慢步骤推迟）
+        self._local = self._make_local_backend()
+        await self._local.start()
+        # 每次启动先清理一次过期缓存（永久 covers 位于独立目录）
         self._cache_cleanup_task = asyncio.create_task(self._voice_cache_cleanup_loop())
 
         # 初始化 RVC sidecar 客户端
@@ -207,8 +231,8 @@ class SingPlugin(MaiBotPlugin):
         self._rvc = RVCClient(f"http://127.0.0.1:{port}", logger=self.ctx.logger)
 
         # 自动拉起 sidecar（或复用已有服务）
-        if self.config.rvc.auto_start:
-            await self._start_sidecar()
+        if self.config.local.backend == "legacy" and self.config.rvc.auto_start:
+            self.ctx.logger.warning("旧 sidecar 不具备 Linux 资源隔离，拒绝自动拉起")
 
         # 初始化音乐搜索与 MiMo TTS
         self._music = self._build_music_client()
@@ -221,7 +245,18 @@ class SingPlugin(MaiBotPlugin):
         self._pipeline = Pipeline(self._music, self._rvc, self._mimo, self.ctx.logger)
         self.ctx.logger.info("翻唱插件加载完成")
 
+    async def _close_cover_runs(self) -> None:
+        tasks = [entry['task'] for entry in self._cover_runs.values()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._cover_runs.clear()
+
     async def on_unload(self) -> None:
+        await self._close_cover_runs()
+        if self._local is not None:
+            await self._local.close()
+            self._local = None
         if self._music is not None:
             await self._music.close()
             self._music = None
@@ -233,6 +268,7 @@ class SingPlugin(MaiBotPlugin):
             self._rvc = None
         await self._stop_sidecar()
         self._pending.clear()
+        self._cover_runs.clear()
         for watcher in self._late_voice_watchers:
             watcher.cancel()
         self._late_voice_watchers.clear()
@@ -252,7 +288,12 @@ class SingPlugin(MaiBotPlugin):
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
         self.ctx.logger.info("翻唱插件配置已更新，重建客户端")
-        # 重建音乐与 MiMo 客户端（RVC 客户端仅端口可能变化，也重建）
+        # 关闭旧任务后再替换配置，防止热重载产生双重 worker。
+        await self._close_cover_runs()
+        if self._local is not None:
+            await self._local.close()
+        self._local = self._make_local_backend()
+        await self._local.start()
         if self._music is not None:
             await self._music.close()
         if self._mimo is not None:
@@ -262,8 +303,8 @@ class SingPlugin(MaiBotPlugin):
         await self._stop_sidecar()
 
         self._rvc = RVCClient(f"http://127.0.0.1:{self.config.rvc.port}", logger=self.ctx.logger)
-        if self.config.rvc.auto_start:
-            await self._start_sidecar()
+        if self.config.local.backend == "legacy" and self.config.rvc.auto_start:
+            self.ctx.logger.warning("旧 sidecar 不具备 Linux 资源隔离，拒绝自动拉起")
         self._music = self._build_music_client()
         await self._restore_music_logins()
         self._mimo = MiMoTTSService(
@@ -273,7 +314,25 @@ class SingPlugin(MaiBotPlugin):
         )
         self._pipeline = Pipeline(self._music, self._rvc, self._mimo, self.ctx.logger)
         # 保留期等缓存配置可能已变化，立即按新配置清理一次
-        self._cleanup_voice_cache()
+        await asyncio.to_thread(self._cleanup_voice_cache)
+
+    # ===== 本地受限后端 =====
+
+    def _make_local_backend(self) -> LocalBackend:
+        cfg = self.config.local
+        if cfg.backend != 'local':
+            raise RuntimeError('旧 sidecar 未隔离，禁止在本机启用')
+        if cfg.output_dir.strip():
+            output = Path(cfg.output_dir)
+            if not output.is_absolute():
+                raise ValueError('local.output_dir 必须是绝对路径')
+        else:
+            output = Path(self.ctx.paths.data_dir).resolve() / 'covers'
+        return LocalBackend(output, model=Path(cfg.model_path), index=Path(cfg.index_path),
+                            max_queue=cfg.max_queue, timeout_s=cfg.timeout_s,
+                            max_duration_s=cfg.max_duration_s,
+                            max_download_bytes=cfg.max_download_bytes,
+                            allowlist=tuple(Path(path) for path in cfg.local_source_allowlist))
 
     # ===== sidecar 管理 =====
 
@@ -304,7 +363,9 @@ class SingPlugin(MaiBotPlugin):
         return str(Path(__file__).parent / "sidecar" / "server.py")
 
     async def _start_sidecar(self) -> None:
-        """拉起 sidecar；端口已有服务时版本匹配则复用，残留旧代码进程则终止后重启。"""
+        """历史 Windows sidecar；Linux 本地部署禁止启动无界推理。"""
+        if os.name == "posix":
+            raise RuntimeError("Linux 禁止无资源隔离的旧 sidecar")
         rvc = self._rvc
         if rvc is None:
             return
@@ -326,7 +387,8 @@ class SingPlugin(MaiBotPlugin):
                 "端口 %s 上的 sidecar 代码版本过旧（%s != %s），终止后重新拉起",
                 port, version or "未知", EXPECTED_SIDECAR_VERSION,
             )
-            await self._terminate_stale_sidecar(health)
+            self.ctx.logger.error('端口已有不同版本服务；拒绝关闭非本插件拥有的进程')
+            return
 
         rvc_root = self.config.rvc.rvc_root
         python_exe = self._resolve_python_path()
@@ -376,13 +438,8 @@ class SingPlugin(MaiBotPlugin):
         if proc is not None and proc.returncode is None:
             proc.terminate()
         else:
-            # 进程不是本实例拉起的（如上次 MaiBot 异常退出遗留），按 /health 里的 PID 结束
-            pid = health.get("pid")
-            try:
-                if pid:
-                    os.kill(int(pid), 9)
-            except Exception as exc:
-                self.ctx.logger.warning("结束旧 sidecar 进程（pid=%s）失败: %s", pid, exc)
+            self.ctx.logger.warning('拒绝终止其他服务健康检查返回的 PID')
+            return
         self._sidecar_proc = None
         # 等旧进程释放端口
         for _ in range(10):
@@ -553,8 +610,10 @@ class SingPlugin(MaiBotPlugin):
     def _resolve_model(self, sid: str) -> str:
         """解析音色模型名，未指定时用配置默认值。"""
         model = sid.strip() if sid else self.config.rvc.default_model.strip()
+        if not model and self._local is not None:
+            model = self._local.model.name
         if not model:
-            raise RuntimeError("未指定音色模型，请通过 -v 参数指定或在配置中设置 rvc.default_model")
+            raise RuntimeError("未指定音色模型，请配置 rvc.default_model")
         return model
 
     def _resolve_platform(self, platform: str) -> str:
@@ -598,14 +657,14 @@ class SingPlugin(MaiBotPlugin):
         """启动时清理一次，之后每 24 小时巡检一次。"""
         while True:
             try:
-                self._cleanup_voice_cache()
+                await asyncio.to_thread(self._cleanup_voice_cache)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.ctx.logger.exception("清理翻唱语音缓存失败")
             await asyncio.sleep(24 * 3600)
 
-    async def _send_voice(self, audio: bytes, stream_id: str) -> bool:
+    async def _send_voice(self, audio: bytes | Path, stream_id: str) -> bool:
         """发送语音条（wav bytes）。
 
         翻唱整曲 wav 可达数十 MB，base64 后远超 16MB 传输帧上限，
@@ -616,19 +675,24 @@ class SingPlugin(MaiBotPlugin):
         此时严禁重发，否则语音条会发两遍；改为后台观察，若最终送达则补发
         一条文字说明（bot 此前已说"发不出去"）。
         """
-        cache_dir = self._voice_cache_dir()
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = cache_dir / f"sing_{uuid.uuid4().hex}.wav"
-        cache_path.write_bytes(audio)
+        if isinstance(audio, Path):
+            cache_path = audio
+        else:
+            cache_dir = self._voice_cache_dir()
+            await asyncio.to_thread(cache_dir.mkdir, parents=True, exist_ok=True)
+            cache_path = cache_dir / f"sing_{uuid.uuid4().hex}.wav"
+            await asyncio.to_thread(cache_path.write_bytes, audio)
 
-        # 生成标准 file URI（Windows 为 file:///D:/...），NapCat 侧可直接读取本地文件
-        file_reference = "file:///" + cache_path.resolve().as_posix().lstrip("/")
+        # 永久 MP3 直接以文件 URI 发送；绝不复制到五天缓存或因发送失败删除。
+        file_reference = cache_path.resolve().as_uri()
 
         # 首选 voiceurl（文件路径，无大小限制）
         outcome = await self._send_custom_voice("voiceurl", {"url": file_reference}, stream_id)
         if outcome != "failed":
             return outcome == "sent"
 
+        if isinstance(audio, Path):
+            return False  # 永久 MP3 不走 base64 重发或载入内存
         if len(audio) > _B64_FALLBACK_MAX_BYTES:
             self.ctx.logger.warning(
                 "voiceurl 发送失败且音频过大（%d bytes），base64 兜底必超传输帧上限，放弃",
@@ -723,10 +787,10 @@ class SingPlugin(MaiBotPlugin):
     @Command(
         "翻唱",
         description="用克隆音色翻唱歌曲（搜歌 → 人声分离 → 换音色）",
-        pattern=r"^(?P<pfx>\S)翻唱(?:\s+(?P<model>-v\s+\S+|\S+))?\s*(?P<query>.+)$",
+        pattern=r"^(?P<pfx>\S)翻唱\s+(?P<query>.+?)(?:\s+-v\s+(?P<model>\S+))?$",
         # 完整流程（搜歌+下载+分离+转换+发送）远超宿主默认 60s RPC 超时，
         # 超时会导致宿主判定失败而插件仍在后台把语音发出（bot 说失败但语音照发）
-        timeout_ms=900_000,
+        timeout_ms=3_000_000,
     )
     async def handle_cover_command(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
         matched = kwargs.get("matched_groups")
@@ -738,26 +802,26 @@ class SingPlugin(MaiBotPlugin):
         model = re.sub(r"^-v\s*", "", model).strip()
 
         if not query:
-            await self.ctx.send.text("用法：/翻唱 <歌名> [-v 模型名]", stream_id)
+            await self.ctx.send.text("用法：/翻唱 准确歌名 - 艺人名（可选 -v 已配置模型名）", stream_id)
             return False, "缺少歌名", True
 
         try:
             model = self._resolve_model(model)
-            song, audio, reused = await self._run_cover_dedup(query, model, stream_id)
-            if reused:
-                await self.ctx.send.text(f"这首歌正在翻唱中，语音稍后发送：「{song.display()}」", stream_id)
-                return True, f"翻唱进行中: {song.display()}", True
+            song, audio, outcome, reused = await self._run_cover_dedup(query, model, stream_id)
+            if reused and outcome == 'sent':
+                return True, f"已发送过: {song.display()}", True
         except Exception as exc:
             self.ctx.logger.exception("翻唱失败: %s", query)
             await self.ctx.send.text(f"翻唱失败：{exc}", stream_id)
             return False, str(exc), True
 
-        ok = await self._send_voice(audio, stream_id)
-        if ok:
+        if outcome == 'sent':
             await self.ctx.send.text(f"已用克隆音色翻唱「{song.display()}」", stream_id)
+        elif outcome == 'unknown':
+            await self.ctx.send.text(f"翻唱已保存，发送结果尚未确认，请勿重复发送：「{song.display()}」", stream_id)
         else:
-            await self.ctx.send.text(f"翻唱完成但语音发送失败：「{song.display()}」", stream_id)
-        return ok, f"翻唱: {song.display()}", True
+            await self.ctx.send.text(f"翻唱已保存但发送失败，可重新请求：「{song.display()}」", stream_id)
+        return outcome == 'sent', f"翻唱: {song.display()}", True
 
     @Command(
         "说",
@@ -791,6 +855,9 @@ class SingPlugin(MaiBotPlugin):
         pattern=r"^(?P<pfx>\S)音色列表$",
     )
     async def handle_list_models(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
+        if self._local is not None:
+            await self.ctx.send.text(f"本地固定音色：{self._local.model.name}（Natsume Iroha）", stream_id)
+            return True, "本地音色列表", True
         if self._rvc is None:
             await self.ctx.send.text("RVC 客户端未初始化", stream_id)
             return False, "RVC 客户端未初始化", True
@@ -1052,7 +1119,8 @@ class SingPlugin(MaiBotPlugin):
         description=(
             "用克隆音色翻唱一首歌（bot 亲自开口唱）。仅当用户想让 bot 自己唱时调用，"
             "典型说法：「我想听你唱XX」「你唱一首XX」「翻唱XX」「用你的声音唱XX」。"
-            "本工具会搜索歌曲、分离人声、用克隆音色替换，发送语音条。"
+            "传参 query 必须为『准确歌名 - 艺人名』，例如 In the Aeroplane Over the Sea - Neutral Milk Hotel；"
+            "不能只填歌名。会搜索并核对版本、分离人声、换声并永久落盘后发送语音条。"
             "注意：用户只是想听这首歌的原唱/原曲时（如「放一首XX」「发一首XX」「来一首XX的歌」"
             "「放XX听听」），不要调用本工具，应改用 search_and_play_music。"
             "调用前可先自然回应一句（如「我试试」「好呀」）。"
@@ -1061,11 +1129,11 @@ class SingPlugin(MaiBotPlugin):
             "当用户明确要求带伴奏、加上伴奏、有伴奏、跟着伴奏唱时传 true。"
         ),
         activation_type=ActivationType.ALWAYS,
-        # 翻唱链路（下载 120s + sidecar 分离转换 600s + 发送）远超宿主默认 60s
-        # 工具 RPC 超时；超时会让 bot 报"调用失败"而语音随后照发
-        timeout_ms=900_000,
+        # 默认一运行+两排队：3 * (900s worker + 20s 收尾) + 180s 发送。
+        # RPC 覆盖默认队列的最长等待，避免渲染成功而调用端提前报错。
+        timeout_ms=3_000_000,
         parameters=[
-            ToolParameterInfo(name="query", param_type=ToolParamType.STRING, description="歌曲名或关键词", required=True),
+            ToolParameterInfo(name="query", param_type=ToolParamType.STRING, description="准确歌名 - 艺人名；必须包含艺人，不能仅用关键词", required=True),
             ToolParameterInfo(name="with_instrumental", param_type=ToolParamType.BOOLEAN, description="是否混入伴奏（默认 false）", required=False),
         ],
     )
@@ -1075,15 +1143,13 @@ class SingPlugin(MaiBotPlugin):
         sid = self._find_stream_id(stream_id, kwargs)
         try:
             model = self._resolve_model("")
-            song, audio, reused = await self._run_cover_dedup(query, model, sid, with_instrumental=with_instrumental)
-            if reused:
-                # 相同请求已在执行/发送，本调用不重复发送语音
-                return {"content": "", "stop_after_execution": True}
-            ok = await self._send_voice(audio, sid)
-            if ok:
+            song, audio, outcome, reused = await self._run_cover_dedup(query, model, sid, with_instrumental=with_instrumental)
+            if outcome == 'sent':
                 # 语音条已发出，本工具不再输出文本，避免 MaiBot 额外说"我不会唱"
                 return {"content": "", "stop_after_execution": True}
-            return {"content": "翻唱完成但语音发不出去"}
+            if outcome == 'unknown':
+                return {"content": "翻唱已保存，但发送结果尚未确认；不要自动重试"}
+            return {"content": "翻唱已保存但语音发送失败，用户可重新请求；成品不会丢失"}
         except Exception as exc:
             self.ctx.logger.exception("翻唱工具失败: %s", query)
             return {"content": f"翻唱失败：{exc}"}
@@ -1117,77 +1183,65 @@ class SingPlugin(MaiBotPlugin):
 
     async def _run_cover_dedup(
         self, query: str, sid: str, stream_id: str, *, with_instrumental: bool = False
-    ) -> tuple[SongInfo, bytes, bool]:
-        """执行翻唱管线；同一会话同一首歌的并发/短时重复请求只跑一次、只发一条语音。
+    ) -> tuple[SongInfo, Path, str, bool]:
+        """Deduplicate the complete render-and-send operation, not just rendering.
 
-        Returns:
-            (歌曲信息, 音频, 是否复用既有结果)。复用时调用方**不得**再发送语音。
+        A confirmed failed delivery permits a new explicit request using the
+        permanent cache. An ambiguous delivery is never automatically retried.
+        Caller cancellation does not spawn a second send or discard the result.
         """
+        if not stream_id:
+            raise ValueError('缺少当前会话，拒绝发送到未知目标')
         key = (stream_id, query.strip().lower(), sid, bool(with_instrumental))
         now = time.time()
-        # 清理超过去重窗口的已完成条目
-        for stale in [
-            k
-            for k, v in self._cover_runs.items()
-            if v["task"].done() and now - v.get("done_at", 0.0) > _COVER_DEDUP_WINDOW_S
-        ]:
+        for stale in [k for k, v in self._cover_runs.items()
+                      if v['task'].done() and now >= v.get('expires_at', float('inf'))]:
             self._cover_runs.pop(stale, None)
-
         entry = self._cover_runs.get(key)
-        if entry is not None and not entry["task"].done():
-            self.ctx.logger.info("相同翻唱请求执行中，等待既有任务（不重复执行/发送）: %s", query)
-            result = await asyncio.shield(entry["task"])
-            return result[0], result[1], True
-        if entry is not None and entry.get("done_at") and now - entry["done_at"] < _COVER_DEDUP_WINDOW_S:
-            self.ctx.logger.info(
-                "相同翻唱 %.0f 秒前已完成并发送，跳过重复执行: %s", now - entry["done_at"], query
-            )
-            return entry["result"][0], entry["result"][1], True
+        reused = entry is not None
+        if entry is None:
+            async def render_and_send() -> tuple[SongInfo, Path, str]:
+                song, audio = await self._run_cover(query, sid, stream_id, with_instrumental=with_instrumental)
+                # LocalBackend has already committed the permanent MP3. Never
+                # load it as base64 or delete it after a delivery error.
+                outcome = await self._send_custom_voice('voiceurl', {'url': audio.resolve().as_uri()}, stream_id)
+                return song, audio, outcome
 
-        task = asyncio.create_task(self._run_cover(query, sid, stream_id, with_instrumental=with_instrumental))
-        entry = {"task": task, "done_at": 0.0, "result": None}
-        self._cover_runs[key] = entry
-        try:
-            result = await task
-        except BaseException:
-            self._cover_runs.pop(key, None)
-            raise
-        entry["result"] = result
-        entry["done_at"] = time.time()
-        return result[0], result[1], False
+            task = asyncio.create_task(render_and_send())
+            entry = {'task': task}
+            self._cover_runs[key] = entry
 
-    async def _run_cover(self, query: str, sid: str, stream_id: str, *, with_instrumental: bool = False) -> tuple[SongInfo, bytes]:
-        if self._pipeline is None:
-            raise RuntimeError("插件未初始化完成")
-        await self._ensure_sidecar_ready()
-        cfg = self.config
-        convert_kwargs = self._convert_kwargs(sid)
-        _, manual_key = self._resolve_f0_up_key(sid)
-        rvc_cfg = cfg.rvc
-        # 未配置手动映射且开启自动变调时，交给 sidecar 按示例音频音高计算
-        if not manual_key and rvc_cfg.auto_key and rvc_cfg.sample_audio.strip():
-            convert_kwargs["auto_key"] = True
-            convert_kwargs["sample_audio"] = rvc_cfg.sample_audio.strip()
-            convert_kwargs["auto_key_offset"] = rvc_cfg.auto_key_offset
-            convert_kwargs["auto_key_max"] = rvc_cfg.auto_key_max
-        platform = self._resolve_platform("")
-        return await self._pipeline.cover_song(
-            query,
-            sid,
-            platform=platform,
-            search_limit=cfg.music.search_limit,
-            uvr_model=rvc_cfg.uvr_model,
-            uvr_agg=rvc_cfg.uvr_agg,
-            uvr_weights_dir=rvc_cfg.uvr_weights_dir,
-            with_instrumental=with_instrumental,
-            convert_kwargs=convert_kwargs,
-        )
+            def completed(finished: asyncio.Task) -> None:
+                if finished.cancelled() or finished.exception() is not None:
+                    self._cover_runs.pop(key, None)
+                    return
+                outcome = finished.result()[2]
+                if outcome == 'failed':
+                    self._cover_runs.pop(key, None)
+                else:
+                    window = _VOICE_SEND_RPC_TIMEOUT_MS / 1000 if outcome == 'unknown' else _COVER_DEDUP_WINDOW_S
+                    entry['expires_at'] = time.time() + window
+            task.add_done_callback(completed)
+        song, audio, outcome = await asyncio.shield(entry['task'])
+        return song, audio, outcome, reused
+
+    async def _run_cover(self, query: str, sid: str, stream_id: str, *, with_instrumental: bool = False) -> tuple[SongInfo, Path]:
+        if self._local is None:
+            raise RuntimeError('本地后端未初始化')
+        if sid not in (self.config.rvc.default_model.strip(), self._local.model.name, str(self._local.model)):
+            raise ValueError('只允许配置的固定本地模型，不接受聊天指定模型路径')
+        if ' - ' not in query:
+            raise ValueError('为避免误选曲目，请用「准确歌名 - 艺人」指定歌曲')
+        title, artist = query.rsplit(' - ', 1)
+        result = await self._local.cover(title, artist, instrumental=with_instrumental)
+        return SongInfo(result.key, result.title, result.artist, '', 'local'), result.path
 
     async def _run_speak(self, text: str, sid: str, stream_id: str) -> bytes:
         if self._pipeline is None:
             raise RuntimeError("插件未初始化完成")
-        await self._ensure_sidecar_ready()
         cfg = self.config.mimo
+        if cfg.rvc_after_tts:
+            raise RuntimeError('说话 RVC 尚无受限本地转换路径；关闭 mimo.rvc_after_tts 可使用原生 MiMo TTS')
         reference_b64 = ""
         if cfg.voice_mode == "clone":
             ref_path = cfg.reference_audio.strip()
