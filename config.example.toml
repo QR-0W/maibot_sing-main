@@ -1,7 +1,7 @@
 # 示例仅展示无凭证配置；插件默认禁用，启用须经维护者审查。
 [plugin]
 enabled = false
-config_version = "0.3.0"
+config_version = "0.3.1"
 
 [local]
 backend = "local"

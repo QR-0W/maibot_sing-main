@@ -18,6 +18,8 @@ import unicodedata
 
 LOCK = Path('/home/qr0w/audio-lab/inference.lock')
 RVC = Path('/home/qr0w/audio-lab/tools/rvc/rvc_infer.py')
+# Two releases within this many seconds are treated as the same recording.
+RELEASE_CLUSTER_TOLERANCE_S = 4.0
 
 
 def verify_limits() -> None:
@@ -55,6 +57,46 @@ def norm(value: object) -> str:
     return ' '.join(unicodedata.normalize('NFKC', str(value or '')).casefold().split())
 
 
+def select_release(matches: list) -> tuple[object, dict]:
+    """Pick the studio master among official candidates of the same title/artist.
+
+    A popular studio recording is re-released across many compilations, so its
+    duration repeats; a live take has its own distinct duration. Metadata alone
+    cannot label a version as live, so require a duration cluster that at least
+    two independent releases agree on and that clearly beats every other cluster.
+    Otherwise refuse instead of silently converting a live recording.
+
+    Args:
+        matches: Candidate SongInfo objects already filtered by title, artist and length.
+
+    Returns:
+        tuple: The chosen candidate and a record of how it was selected.
+    """
+    if not matches:
+        raise RuntimeError('官方源没有可免费下载的完整版本；请核对「歌名 - 艺人」是否准确，或换一首歌')
+    ordered = sorted(matches, key=lambda song: float(song.duration_s or 0))
+    if len(ordered) == 1:
+        return ordered[0], {'candidates': 1, 'cluster_size': 1, 'cluster_seconds': [round(float(ordered[0].duration_s), 1)],
+                            'reason': '官方源只有唯一候选'}
+    clusters: list[list] = []
+    for song in ordered:
+        if clusters and float(song.duration_s) - float(clusters[-1][-1].duration_s) <= RELEASE_CLUSTER_TOLERANCE_S:
+            clusters[-1].append(song)
+        else:
+            clusters.append([song])
+    ranked = sorted(clusters, key=len, reverse=True)
+    best, runner_up = ranked[0], (ranked[1] if len(ranked) > 1 else [])
+    seconds = sorted(round(float(song.duration_s or 0), 1) for song in best)
+    if len(best) < 2 or len(best) <= len(runner_up):
+        raise RuntimeError('官方源只有多个时长各不相同、无法确认录音室版本的候选（可能都是现场或改编版本）；'
+                           '请换一首歌，或改用你手上的原曲文件')
+    chosen = best[0]
+    return chosen, {'candidates': len(ordered), 'cluster_size': len(best), 'cluster_seconds': seconds,
+                    'runner_up_size': len(runner_up), 'tolerance_s': RELEASE_CLUSTER_TOLERANCE_S,
+                    'chosen_album': str(chosen.album), 'chosen_id': str(chosen.identifier),
+                    'reason': '同一时长在多张官方发行中重复出现，取为录音室母带'}
+
+
 def download(args: argparse.Namespace) -> None:
     # This subprocess runs in the same bounded service, behind its parent's flock.
     resource.setrlimit(resource.RLIMIT_FSIZE, (args.max_bytes, args.max_bytes))
@@ -65,8 +107,8 @@ def download(args: argparse.Namespace) -> None:
         return SongInfo(source=self.source, raw_data={'quality': 'standard'})
 
     source = 'NeteaseMusicClient'
-    cfg = {'work_dir': str(args.scratch / 'musicdl'), 'search_size_per_source': 8,
-           'search_size_per_page': 8, 'max_retries': 1, 'auto_set_proxies': False,
+    cfg = {'work_dir': str(args.scratch / 'musicdl'), 'search_size_per_source': 25,
+           'search_size_per_page': 25, 'max_retries': 1, 'auto_set_proxies': False,
            'maintain_session': True, 'disable_print': True}
     client = MusicClient(music_sources=[source], init_music_clients_cfg={source: cfg},
                          clients_threadings={source: 1}, requests_overrides={source: {'timeout': (8, 15)}})
@@ -79,22 +121,19 @@ def download(args: argparse.Namespace) -> None:
                and not any(tag in norm(song.song_name + ' ' + str(song.album))
                            for tag in ('试听', 'preview', 'live', '现场', '伴奏', 'karaoke'))
                and (not song.file_size_bytes or int(song.file_size_bytes) <= args.max_bytes)]
-    identities = {(norm(song.identifier), norm(song.singers), norm(song.album)) for song in matches}
-    if len(identities) != 1:
-        raise RuntimeError('没有唯一匹配的完整歌曲；请指定准确标题与艺人，或由管理员配置本地 allowlist')
-    chosen = matches[0]
+    chosen, selection = select_release(matches)
     chosen.chunk_size = 64 * 1024
     downloaded = native.download([chosen], num_threadings=1,
                                  request_overrides={'timeout': (8, 20)}, auto_supplement_song=False)
     if len(downloaded) != 1:
-        raise RuntimeError('官方源没有可下载的完整歌曲；不使用第三方解锁')
+        raise RuntimeError('官方源未提供该曲目的下载地址（不绕过付费或会员限制），请换一首歌')
     path = Path(downloaded[0].save_path).resolve(strict=True)
     if not path.is_relative_to((args.scratch / 'musicdl').resolve()) or path.stat().st_size > args.max_bytes:
         raise RuntimeError('下载结果越界或过大')
     (args.scratch / 'source.json').write_text(json.dumps({'source': source,
         'identifier': str(chosen.identifier), 'title': str(chosen.song_name),
         'artist': str(chosen.singers), 'album': str(chosen.album),
-        'expected_duration_s': float(chosen.duration_s),
+        'expected_duration_s': float(chosen.duration_s), 'selection': selection,
         'file': str(path)}, ensure_ascii=False))
 
 

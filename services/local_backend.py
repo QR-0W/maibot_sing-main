@@ -308,9 +308,12 @@ class LocalBackend:
                     if source_file is None:
                         if verified.get('source') != 'NeteaseMusicClient' or not verified.get('identifier'):
                             raise RuntimeError('下载缺少可追溯的官方源身份')
+                        # Different albums are different recordings, so album belongs
+                        # in the cache identity instead of being flattened away.
                         identity = {'type': 'musicdl-native', 'platform': verified['source'],
                                     'identifier': str(verified['identifier']),
-                                    'title': str(verified['title']), 'artist': str(verified['artist'])}
+                                    'title': str(verified['title']), 'artist': str(verified['artist']),
+                                    'album': str(verified.get('album', ''))}
                     else:
                         identity = source
                     actual_key = cache_key(identity, model_hash, index_hash, instrumental)
@@ -329,6 +332,9 @@ class LocalBackend:
                                  'index_sha256': index_hash, 'parameters': PARAMETERS,
                                  'instrumental': instrumental, 'sha256': digest_file(mp3),
                                  'completed_at': time.time()})
+                    # Keep an auditable record of which official release was picked.
+                    if source_file is None and data.get('verified_source', {}).get('selection'):
+                        data['release_selection'] = data['verified_source']['selection']
                     # Publish only the final song and metadata. Original downloads,
                     # separated stems and diagnostic WAVs remain disposable scratch.
                     publishing = root / '.publishing' / (actual_key + '-' + uuid.uuid4().hex)

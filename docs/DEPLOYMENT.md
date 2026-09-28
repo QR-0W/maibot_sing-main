@@ -30,6 +30,6 @@ Natsume Iroha 候选模型推定以日语素材为主，但训练清单不公开
 
 ## 配置示例与实现边界
 
-`config.example.toml` 按插件 `SingPluginConfig` schema 给出无凭证示例，`[plugin].enabled=false` 且 `config_version="0.3.0"`。本地配置包括 schema 实际声明的队列、时长、下载上限和 allowlist；没有 `min_duration_s` 字段，也没有可配置 scratch、分离器或 musicdl 路径。固定模型/index 默认路径来自后端常量。
+`config.example.toml` 按插件 `SingPluginConfig` schema 给出无凭证示例，`[plugin].enabled=false` 且 `config_version="0.3.1"`。本地配置包括 schema 实际声明的队列、时长、下载上限和 allowlist；没有 `min_duration_s` 字段，也没有可配置 scratch、分离器或 musicdl 路径。固定模型/index 默认路径来自后端常量。
 
 历史 `[rvc].auto_start` 默认关闭；本地后端不会启动旧 sidecar。当前 `mimo.rvc_after_tts=true` 会在说话 RVC 路径明确报错，因此示例设为 `false`，可使用原生 MiMo TTS。配置契约中与 schema/实现不一致的细节需由实现负责人修正，不能靠添加不存在的示例键掩盖。真实凭证配置留在本机，不要提交。

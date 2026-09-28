@@ -6,6 +6,7 @@ while the real Host rejects unknown fields at load time.
 """
 from pathlib import Path
 import json
+import re
 
 import pytest
 
@@ -19,11 +20,14 @@ def test_manifest_matches_documented_schema_fields():
     """Keep the field set within Manifest v2 and version in step with the config."""
     assert MANIFEST['manifest_version'] == 2
     assert MANIFEST['id'] == 'qr0w.maibot-sing'
-    assert MANIFEST['version'] == '0.3.0'
+    version = MANIFEST['version']
+    assert re.fullmatch(r'\d+\.\d+\.\d+', version), version
     assert set(MANIFEST['urls']) <= {'repository', 'homepage', 'documentation', 'issues'}
     assert MANIFEST['urls']['repository'].startswith('https://')
-    example = (ROOT / 'config.example.toml').read_text(encoding='utf-8')
-    assert f'config_version = "{MANIFEST["version"]}"' in example
+    # Every place that records the version must agree with the manifest.
+    assert f'config_version = "{version}"' in (ROOT / 'config.example.toml').read_text(encoding='utf-8')
+    assert f'config_version: str = Field(default="{version}"' in (ROOT / 'plugin.py').read_text(encoding='utf-8')
+    assert f'## {version}' in (ROOT / 'CHANGELOG.md').read_text(encoding='utf-8')
     assert (ROOT / MANIFEST['changelog']).is_file()
     assert {item['name'] for item in MANIFEST['dependencies']} == {
         'aiohttp', 'httpx', 'cryptography', 'segno'}

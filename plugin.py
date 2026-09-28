@@ -55,7 +55,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="默认禁用；管理员审查后明确启用")
-    config_version: str = Field(default="0.3.0", description="配置版本")
+    config_version: str = Field(default="0.3.1", description="配置版本")
 
 
 class RVCConfig(PluginConfigBase):
@@ -1124,7 +1124,11 @@ class SingPlugin(MaiBotPlugin):
             "注意：用户只是想听这首歌的原唱/原曲时（如「放一首XX」「发一首XX」「来一首XX的歌」"
             "「放XX听听」），不要调用本工具，应改用 search_and_play_music。"
             "调用前可先自然回应一句（如「我试试」「好呀」）。"
-            "若工具返回成功，说明语音条已发出，无需再补充任何文字；若返回失败，转述「发不出去」即可。"
+            "若工具返回成功，说明语音条已发出，无需再补充任何文字。"
+            "若工具返回失败，必须按返回的具体原因如实简短说明，不要一律说「发不出去」："
+            "返回内容以「翻唱失败：」开头时，是歌曲没做出来（例如官方源没有可下载的完整版本、"
+            "歌名与艺人不匹配），此时应说明原因并建议换一首或核对「歌名 - 艺人」，与发送无关；"
+            "返回内容提到「保存」与「发送」时，才是成品已生成但语音条没发出去。"
             "with_instrumental 参数控制是否混入伴奏：用户只说歌名默认纯人声；"
             "当用户明确要求带伴奏、加上伴奏、有伴奏、跟着伴奏唱时传 true。"
         ),
