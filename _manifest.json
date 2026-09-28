@@ -11,8 +11,9 @@
   "license": "MIT",
   "urls": {
     "repository": "https://github.com/QR-0W/maibot_sing-main/",
-    "upstream": "https://github.com/xiaocutedog/maibot_sing-main/"
+    "issues": "https://github.com/QR-0W/maibot_sing-main/issues"
   },
+  "changelog": "CHANGELOG.md",
   "host_application": {
     "min_version": "1.0.0",
     "max_version": "1.99.99"

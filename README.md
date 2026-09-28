@@ -33,10 +33,14 @@ MaiBot 插件：通过音乐来源搜索与 RVC 本地处理生成歌曲翻唱�
 
 ## 已完成的验证
 
-片段和 202 秒整曲均已真实完成，峰值内存分别约 1.83 / 1.94 GiB；实际 SDK 的缓存与发送失败保留也已验证。见 [完整验证记录](docs/VALIDATION.md)。线上配置仍禁用，未向 QQ 发送消息。
+片段、202 秒整曲及两段 30 秒试听均已真实完成，峰值内存约 1.83–1.94 GiB；实际 SDK 的缓存与发送失败保留也已验证。见 [完整验证记录](docs/VALIDATION.md)。
 
 ```bash
 python -m pytest tests -q
 ```
 
-测试需要插件依赖、maibot-plugin-sdk、pytest 与 pytest-asyncio，不加载 RVC 模型或访问真实聊天。
+测试需要插件依赖、maibot-plugin-sdk、pytest 与 pytest-asyncio，不加载 RVC 模型或访问真实聊天。在 MaiBot 目录内运行时，`tests/test_manifest.py` 会额外调用主程序自身的 Manifest 校验器。
+
+## 已知限制
+
+当前权重在部分高音区会唱不上去或出现破音，《Aoi》开头等片段还原也不理想；这是尚未修复的音质问题，不是下载或编码缺陷。已发布版本仅为可安装初版。

@@ -9,7 +9,9 @@ data/
 cache/
 work/
 covers/
+logs/
 *.log
+*.log.jsonl
 *.wav
 *.mp3
 *.flac

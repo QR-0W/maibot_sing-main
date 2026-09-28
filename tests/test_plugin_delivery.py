@@ -19,9 +19,14 @@ spec.loader.exec_module(plugin_module)
 
 @pytest.fixture
 def plugin(tmp_path):
+    # The SDK installs a root file handler on import; keep test runs from
+    # writing app logs into the plugin checkout.
+    logger = logging.getLogger('sing-test')
+    logger.handlers = [logging.NullHandler()]
+    logger.propagate = False
     instance = plugin_module.create_plugin()
     instance.set_plugin_config(tomllib.loads((ROOT / 'config.example.toml').read_text()))
-    instance._ctx = SimpleNamespace(logger=logging.getLogger('sing-test'), paths=SimpleNamespace(
+    instance._ctx = SimpleNamespace(logger=logger, paths=SimpleNamespace(
         data_dir=str(tmp_path / 'data'), runtime_dir=str(tmp_path / 'runtime')))
     return instance
 
