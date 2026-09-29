@@ -6,7 +6,7 @@ import os
 import pytest
 
 from test_local_backend import backend, fake_runtime_paths
-from test_plugin_delivery import plugin, plugin_module
+from test_plugin_async_lifecycle import plugin, plugin_module, command
 
 
 @pytest.mark.asyncio
@@ -123,17 +123,22 @@ async def test_missing_external_runtime_fails_without_starting_worker(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_tool_reports_choice_not_failed_delivery(plugin, monkeypatch):
-    plugin.config.rvc.default_model = 'NatsumeIroha.pth'
-    async def fail(*args, **kwargs):
-        raise plugin_module.CoverStageError('source_ambiguous', '请明确选择发行版本',
-            [{'source':'NeteaseMusicClient','identifier':'1','album':'Album A','duration_s':'237.9'}])
-    monkeypatch.setattr(plugin,'_run_cover_dedup',fail)
-    result=await plugin.handle_cover_tool('Creep - Radiohead',stream_id='test-stream')
-    assert result['error_code']=='source_ambiguous'
-    assert 'Album A' in result['content'] and 'ID 1' in result['content']
-    assert '这次没有发送语音' in result['content']
-    assert '发不出去' not in result['content']
+async def test_command_reports_ambiguous_choices_without_sending(plugin):
+    instance, sends = plugin
+    await instance.on_load()
+    try:
+        ok, result, _ = await instance.handle_cover_command(**command())
+        assert ok and '待选择任务' in result
+        assert 'Album' in sends[-1][0] and 'ID id-1' in sends[-1][0]
+        assert '请选择明确版本' in sends[-1][0]
+        assert '发不出去' not in sends[-1][0]
+        job_id = result.split()[-1]
+        assert instance._jobs.store.get(job_id, 'stream-1').state == 'needs_selection'
+        tool = await instance.handle_cover_tool('Song - Artist', stream_id='forged')
+        assert '未入队' in tool['content']
+        assert instance._jobs.store.get(job_id, 'stream-1').state == 'needs_selection'
+    finally:
+        await instance.on_unload()
 
 
 def test_cover_command_parses_explicit_album_and_id():

@@ -1,7 +1,7 @@
 # 示例仅展示无凭证配置；插件默认禁用，启用须经维护者审查。
 [plugin]
 enabled = false
-config_version = "0.4.0"
+config_version = "0.5.0"
 
 [local]
 backend = "local"
@@ -10,6 +10,10 @@ output_dir = ""
 # 管理员按本机实际安装填写，留空会拒绝启动本地翻唱后端；不捆绑权重、许可证或隔离环境。
 model_path = ""
 index_path = ""
+# 所有渲染输入必须显式指定；不从开发机路径或缓存隐式回退。
+hubert_path = ""
+demucs_weights_path = ""
+rvc_upstream_path = ""
 worker_python = ""
 musicdl_python = ""
 rvc_script = ""
