@@ -376,7 +376,7 @@ class SingPlugin(MaiBotPlugin):
         # A second Runner must not recover another instance's dispatch or download.
         await asyncio.to_thread(root.mkdir, parents=True, exist_ok=True, mode=0o700)
         owner = exclusive(root / '.durable-scheduler.lock')
-        await asyncio.to_thread(owner.__enter__)
+        ownership_fd = await asyncio.to_thread(owner.__enter__)
         self._scheduler_owner = owner
         store = await asyncio.to_thread(JobStore, root / 'jobs.sqlite3', max(1, self.config.local.max_queue + 1))
         artifacts = ArtifactStore(output)
@@ -389,13 +389,13 @@ class SingPlugin(MaiBotPlugin):
             stage_executor=runtime_dir / 'stage_executor.py',
         ), RuntimeVersionProbe(paths['worker_python']))
         runtime = RenderRuntime(work_root=root / 'jobs', worker_python=paths['worker_python'],
-            worker_script=runtime_dir / 'worker.py', rvc_script=paths['rvc_script'],
+            worker_script=runtime_dir / 'media_stage.py', rvc_script=paths['rvc_script'],
             model=paths['model_path'], index=paths['index_path'], hubert=paths['hubert_path'],
             inference_lock=paths['inference_lock'], max_download_bytes=self.config.local.max_download_bytes,
             max_duration_s=self.config.local.max_duration_s)
         jobs = JobService(store, CatalogueService(self._music,
             max_duration_s=self.config.local.max_duration_s), StageCoordinator(store, runner),
-            artifacts, inventory, runtime)
+            artifacts, inventory, runtime, ownership_fd=ownership_fd)
         outbox = DeliveryOutbox(store, CustomVoiceSender(self.ctx.send.custom), artifacts.verify)
         # Recovery fences pre-restart dispatches BEFORE discovering deliverable rows.
         await outbox.recover()

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import asyncio
 import importlib.util
 import logging
+import subprocess
 import sys
 import tomllib
 
@@ -117,7 +118,7 @@ async def test_command_idempotent_identity_and_tool_fail_closed(plugin):
 
 
 @pytest.mark.asyncio
-async def test_select_status_cancel_only_owner_and_no_render_rpc(plugin):
+async def test_select_status_cancel_only_owner_and_no_render_rpc(plugin, monkeypatch):
     instance, sends = plugin
     await instance.on_load()
     try:
@@ -131,8 +132,10 @@ async def test_select_status_cancel_only_owner_and_no_render_rpc(plugin):
         other_user = command(msg='platform-message-5', user='user-2', text=f'/翻唱状态 {job_id}', groups={'job_id': job_id})
         assert not (await instance.handle_cover_status(**other_user))[0]
         assert instance._jobs.store.get(job_id, 'stream-1').state == 'needs_selection'
-        # Disable scheduling in this test so select remains queued, without launching systemd.
-        await instance._jobs.close()
+        # Prevent scheduling in this test while retaining command cancel API.
+        async def idle():
+            return None
+        monkeypatch.setattr(instance._jobs, 'run_once', idle)
         select['user_id'] = 'user-1'
         assert (await instance.handle_cover_select(**select))[0]
         state = instance._jobs.store.get(job_id, 'stream-1')
@@ -155,6 +158,28 @@ async def test_duplicate_host_scheduler_owner_fails_closed(plugin):
         with pytest.raises(plugin_module.OwnershipBusy):
             await instance._start_durable_services()
         assert instance._jobs is current
+    finally:
+        await instance.on_unload()
+
+
+@pytest.mark.asyncio
+async def test_real_plan_uses_media_stage_cli_and_reaches_sandbox_guard(plugin):
+    instance, _ = plugin
+    await instance.on_load()
+    try:
+        runtime = instance._jobs.runtime
+        assert runtime.worker_script == ROOT / 'runtime' / 'media_stage.py'
+        from sing_async_test.runtime.render_plan import build_plan
+        plan = build_plan(workspace=runtime.work_root / 'example', worker_python=runtime.worker_python,
+            worker_script=runtime.worker_script, rvc_script=runtime.rvc_script,
+            model=runtime.model, index=runtime.index, hubert=runtime.hubert, frames=44_100 * 45)
+        for stage in ('separate', 'mix'):
+            argv = next(item.argv for item in plan if item.name == stage)
+            assert argv[:3] == (str(runtime.worker_python), str(runtime.worker_script), stage)
+            probe = subprocess.run(argv, capture_output=True, text=True, timeout=5, check=False)
+            assert probe.returncode != 0
+            assert '必须在 systemd user service 内运行' in probe.stderr
+            assert 'the following arguments are required' not in probe.stderr
     finally:
         await instance.on_unload()
 
