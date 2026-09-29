@@ -4,7 +4,7 @@
 「搜索 → 获取可播放音频 URL」能力，去掉音乐卡片解析等无关逻辑，
 并补充网易云账号密码登录与 QQ 扫码登录。
 
-依赖: httpx + cryptography（网易云 eapi/weapi 加密）。
+依赖: httpx + cryptography（网易云登录 weapi 加密）。
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import re
 import secrets
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -27,9 +27,6 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 logger = __import__("logging").getLogger("maibot-sing.music")
 
 _REQUEST_TIMEOUT = 10
-
-# 网易云音乐 eapi 加密密钥（16 字节 AES-128-ECB）
-_EAPI_KEY = b"e82ckenh8dichen8"
 
 # 网易云客户端 api 加密（interface3）相关
 _INTERFACE3_DOMAIN = "https://interface3.music.163.com"
@@ -80,11 +77,6 @@ _NETEASE_HEADERS = {
     "Referer": "https://music.163.com/",
 }
 
-_EAPI_HEADERS = {
-    "User-Agent": "NeteaseMusic/9.1.65.240916182646(9001065);Dalvik/2.1.0 (Linux; U; Android 14)",
-    "Referer": "/api/song/enhance/player/url",
-}
-
 _QQ_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://y.qq.com/",
@@ -101,6 +93,7 @@ class SongInfo:
     album: str
     platform: str  # "163" 或 "qq"
     media_id: str = ""  # QQ 音乐的 strMediaMid
+    duration_s: float | None = None  # Catalogue duration, not preview duration
 
     def display(self) -> str:
         parts = [self.name]
@@ -109,17 +102,29 @@ class SongInfo:
         return " ".join(parts)
 
 
+@dataclass(frozen=True)
+class AudioSource:
+    """Ephemeral authorized playback response; never persist its signed URL."""
+    platform: str
+    song_id: str
+    url: str | None = field(repr=False)
+    is_preview: bool = False
+    size_bytes: int | None = None
+
+
 class MusicSearchError(RuntimeError):
-    """音乐平台请求或响应异常。"""
+    """音乐平台请求或响应异常，保留可供调用者判断的错误类别。"""
+    def __init__(self, message: str, *, code: str = "source_request_failed"):
+        super().__init__(message)
+        self.code = code
 
 
-def _aes_ecb_encrypt(key: bytes, data: bytes) -> bytes:
-    """AES-128-ECB 加密，PKCS7 填充。"""
-    cipher = Cipher(algorithms.AES(key), modes.ECB())
-    encryptor = cipher.encryptor()
-    pad_len = 16 - (len(data) % 16)
-    padded = data + bytes([pad_len] * pad_len)
-    return encryptor.update(padded) + encryptor.finalize()
+def _duration(value: Any, divisor: int = 1) -> float | None:
+    import math
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    seconds = value / divisor
+    return seconds if math.isfinite(seconds) and seconds > 0 else None
 
 
 def _aes_cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
@@ -166,20 +171,11 @@ def _qr_png(text: str) -> bytes:
     return buf.getvalue()
 
 
-def _eapi_encrypt(url: str, params: dict[str, Any]) -> str:
-    """网易云音乐 eapi 加密参数。"""
-    data_text = json.dumps(params, separators=(",", ":"), ensure_ascii=False)
-    sign_src = f"nobody{url}use{data_text}md5forencrypt"
-    md5_hash = hashlib.md5(sign_src.encode()).hexdigest()
-    sign_text = f"{url}-36cd479b6b5-{data_text}-36cd479b6b5-{md5_hash}"
-    return _aes_ecb_encrypt(_EAPI_KEY, sign_text.encode()).hex().upper()
-
-
 class MusicSearchClient:
     """音乐搜索客户端，支持网易云（默认，无需登录）与 QQ 音乐（需登录）。
 
     Args:
-        netease_cookie: 网易云登录态 {"MUSIC_U": ..., "__csrf": ...}，可选，用于高音质。
+        netease_cookie: 管理员提供的网易云登录态；用于该账号有权访问的曲目。
         qq_cookie: QQ 音乐登录态 {"uin": ..., "qqmusic_key": ...}，可选。
     """
 
@@ -667,6 +663,10 @@ class MusicSearchClient:
 
     async def search(self, query: str, platform: str, limit: int = 5) -> list[SongInfo]:
         """搜索歌曲，platform 为 "163" 或 "qq"。"""
+        if platform not in ("163", "qq") or not 1 <= limit <= 25:
+            raise ValueError("无效平台或搜索结果数")
+        if not isinstance(query, str) or not query.strip() or len(query) > 300:
+            raise ValueError("搜索关键词为空或过长")
         if platform == "qq":
             return await self._search_qq(query, limit)
         return await self._search_netease(query, limit)
@@ -699,14 +699,15 @@ class MusicSearchClient:
             song_id = str(song.get("id", ""))
             name = str(song.get("name", ""))
             if song_id and name:
-                results.append(SongInfo(song_id, name, artists, album, "163"))
+                results.append(SongInfo(song_id, name, artists, album, "163",
+                    duration_s=_duration(song.get("duration", song.get("dt")), 1000)))
         return results
 
     async def _search_qq(self, query: str, limit: int) -> list[SongInfo]:
         uin = self._qq_cookie.get("uin", "").strip()
         qqmusic_key = self._qq_cookie.get("qqmusic_key", "").strip()
         if not uin or not qqmusic_key:
-            raise MusicSearchError("QQ音乐搜索需要登录，请在配置中填写 qq.uin 与 qq.qqmusic_key")
+            raise MusicSearchError("QQ音乐搜索需要在插件中登录", code="source_login_required")
 
         req_data = {
             "req_1": {
@@ -742,7 +743,8 @@ class MusicSearchClient:
             name = str(song.get("name", "") or song.get("songname", ""))
             media_mid = str(song.get("file", {}).get("media_mid", "") or song.get("strMediaMid", ""))
             if song_mid and name:
-                results.append(SongInfo(song_mid, name, artists, album, "qq", media_mid))
+                results.append(SongInfo(song_mid, name, artists, album, "qq", media_mid,
+                                        duration_s=_duration(song.get("interval"))))
         return results
 
     def _build_qq_comm(self, uin: str, qqmusic_key: str) -> dict[str, Any]:
@@ -756,65 +758,55 @@ class MusicSearchClient:
         return comm
 
     async def get_song_url(self, song_id: str, platform: str, media_id: str = "") -> str | None:
-        """获取歌曲可播放音频 URL，失败返回 None。"""
-        if platform == "qq":
-            return await self._get_qq_song_url(song_id, media_id)
-        return await self._get_netease_song_url(song_id)
+        """Legacy adapter: use the same resolver; never return a flagged preview."""
+        resolved = await self.resolve_audio(song_id, platform, media_id)
+        return None if resolved.is_preview else resolved.url
 
-    async def _get_netease_song_url(self, song_id: str) -> str | None:
-        # 1. eapi 加密接口
-        api_path = "/api/song/enhance/player/url"
-        params: dict[str, Any] = {"ids": f"[{song_id}]", "br": 999000}
-        csrf = self._netease_cookie.get("__csrf", "")
-        if csrf:
-            params["csrf_token"] = csrf
+    async def resolve_audio(self, song_id: str, platform: str, media_id: str = "") -> AudioSource:
+        """Resolve an exact ID with this client's current login, without searching again.
+
+        No shared cookies, third-party unlocker, or outer-link full-body GET.
+        A URL is only access evidence; the downloader must still validate media.
+        """
+        if platform not in ("163", "qq") or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", song_id):
+            raise ValueError("无效的来源平台或曲目 ID")
+        if platform == "qq":
+            if not self._qq_cookie.get("uin") or not self._qq_cookie.get("qqmusic_key"):
+                raise MusicSearchError("QQ 音乐需要在插件中登录", code="source_login_required")
+            return AudioSource(platform, song_id, await self._get_qq_song_url(song_id, media_id))
+        if not song_id.isascii() or not song_id.isdecimal():
+            raise ValueError("网易云曲目 ID 必须是数字")
         try:
-            enc = _eapi_encrypt(api_path, params)
-            resp = await self._netease_client.post(
-                f"https://interface.music.163.com/eapi{api_path}",
-                data={"params": enc},
-                headers=_EAPI_HEADERS,
+            # Same _netease_client/cookies as search and explicit plugin login.
+            response = await self._netease_client.get(
+                "https://music.163.com/api/song/enhance/player/url",
+                params={"ids": json.dumps([int(song_id)]), "br": "320000"},
                 follow_redirects=False,
             )
-            resp.raise_for_status()
-            data = resp.json()
-            url_list = data.get("data", [])
-            if url_list and isinstance(url_list, list):
-                url = str(url_list[0].get("url", "") or "").strip()
-                if url:
-                    return url
-        except Exception:
-            logger.debug("网易云 eapi 取链失败: %s", song_id)
-
-        # 2. 标准 Web 接口
-        try:
-            resp = await self._netease_client.get(
-                "https://music.163.com/api/song/enhance/player/url",
-                params={"ids": f"[{song_id}]", "br": "999000"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            url_list = data.get("data", [])
-            if url_list and isinstance(url_list, list):
-                url = str(url_list[0].get("url", "") or "").strip()
-                if url:
-                    return url
-        except Exception:
-            logger.debug("网易云标准接口取链失败: %s", song_id)
-
-        # 3. 直链重定向兜底
-        try:
-            resp = await self._netease_client.get(
-                f"https://music.163.com/song/media/outer/url?id={song_id}.mp3",
-                follow_redirects=True,
-            )
-            final_url = str(resp.url)
-            if final_url and any(ext in final_url for ext in (".mp3", ".flac", ".m4a", ".wav", ".ogg", ".aac")):
-                return final_url
-        except Exception:
-            logger.debug("网易云直链取链失败: %s", song_id)
-
-        return None
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPError as exc:
+            raise MusicSearchError("网易云取链请求失败；未替换其他版本", code="source_network_error") from exc
+        except ValueError as exc:
+            raise MusicSearchError("网易云取链响应不是有效 JSON", code="source_protocol_error") from exc
+        if not isinstance(data, dict) or data.get("code") != 200:
+            raise MusicSearchError("网易云未接受取链请求", code="source_access_denied")
+        items = data.get("data")
+        if not isinstance(items, list):
+            raise MusicSearchError("网易云取链响应缺少曲目记录", code="source_protocol_error")
+        item = next((row for row in items if isinstance(row, dict) and str(row.get("id")) == song_id), None)
+        if item is None:
+            raise MusicSearchError("网易云返回的曲目 ID 与选择不符", code="source_identity_mismatch")
+        url = item.get("url")
+        if url is not None and not isinstance(url, str):
+            raise MusicSearchError("网易云音频链接格式无效", code="source_protocol_error")
+        if url:
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+                raise MusicSearchError("网易云音频链接格式无效", code="source_protocol_error")
+        size = item.get("size")
+        size = size if type(size) is int and size > 0 else None
+        return AudioSource(platform, song_id, url or None, bool(item.get("freeTrialInfo")), size)
 
     async def _get_qq_song_url(self, song_mid: str, media_mid: str) -> str | None:
         resource_mid = media_mid or song_mid

@@ -15,6 +15,7 @@ class CatalogueItem:
     duration_s: Optional[float] = None
     availability: str = 'unknown'
     version: str = 'unspecified'
+    media_id: str = ''  # QQ Music resource identifier, not an access credential.
 
     def __post_init__(self):
         for value in (self.provider, self.track_id, self.title, self.artist):
@@ -22,6 +23,8 @@ class CatalogueItem:
                 raise ValueError('Invalid catalogue text')
         if not isinstance(self.album, str) or len(self.album) > 300 or any(ord(c) < 32 for c in self.album):
             raise ValueError('Invalid album')
+        if not isinstance(self.media_id, str) or len(self.media_id) > 100 or any(ord(c) < 32 for c in self.media_id):
+            raise ValueError('Invalid media resource ID')
         if self.availability not in ('unknown','available','requires_login','unavailable','over_limit'):
             raise ValueError('Invalid availability')
         if self.version not in ('unspecified','studio','live','acoustic','instrumental','remix'):
