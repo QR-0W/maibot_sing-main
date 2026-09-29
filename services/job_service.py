@@ -6,7 +6,9 @@ runtime versions, executes the frozen finite plan, and publishes an immutable
 artifact.  It never performs a replacement keyword search and never persists a
 signed playback URL.
 """
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 import asyncio
@@ -14,6 +16,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import uuid
 
 from ..runtime.recipe_identity import fingerprint, recipe_document, validate_document
@@ -141,7 +144,8 @@ class JobService:
                  plan_builder: Callable = build_plan,
                  recipe_builder: Callable = recipe_document,
                  publisher: Callable = publish_job,
-                 scanner: Optional[Callable[[JobStore, Iterable[str]], list[Job]]] = None):
+                 scanner: Optional[Callable[[JobStore, Iterable[str]], list[Job]]] = None,
+                 ownership_fd: Optional[int] = None, close_drain_s: float = 1.0):
         self.store = store
         self.catalogue = catalogue
         self.coordinator = coordinator
@@ -154,24 +158,95 @@ class JobService:
         self.recipe_builder = recipe_builder
         self.publisher = publisher
         self.scanner = scanner or SqliteJobScanner()
+        if ownership_fd is not None:
+            if type(ownership_fd) is not int:
+                raise ValueError('Scheduler ownership fd must be an integer')
+            try:
+                if not stat.S_ISREG(os.fstat(ownership_fd).st_mode):
+                    raise ValueError('Scheduler ownership fd must reference a regular file')
+            except OSError as exc:
+                raise ValueError('Scheduler ownership fd is not open') from exc
+        if (isinstance(close_drain_s, bool) or not isinstance(close_drain_s, (int, float))
+                or not 0 <= close_drain_s <= 10):
+            raise ValueError('Invalid finite close drain')
+        self._ownership_fd = ownership_fd
+        self._close_drain_s = float(close_drain_s)
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='sing-job-io')
+        self._offloads: set[asyncio.Future] = set()
+        self._late_offload_errors: list[BaseException] = []
         self._wake = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        self._closing = False
         self._closed = False
+
+    def _finish_offload(self, future: asyncio.Future) -> None:
+        """Retrieve and retain late failures after an awaiting task is cancelled."""
+        self._offloads.discard(future)
+        if future.cancelled():
+            return
+        try:
+            error = future.exception()
+        except BaseException as exc:
+            error = exc
+        if error is not None:
+            self._late_offload_errors.append(error)
+            del self._late_offload_errors[:-16]
+
+    async def _offload(self, function: Callable, /, *args, **kwargs):
+        """Run synchronous work while a duplicate scheduler lease remains open."""
+        if self._closing:
+            raise RuntimeError('Job service is closing')
+        lease_fd = None
+        if self._ownership_fd is not None:
+            try:
+                lease_fd = os.dup(self._ownership_fd)
+            except OSError as exc:
+                raise JobServiceError('scheduler_ownership_lost',
+                                      'Scheduler ownership is no longer available') from exc
+        operation = partial(function, *args, **kwargs)
+
+        def owned_call():
+            try:
+                return operation()
+            finally:
+                if lease_fd is not None:
+                    os.close(lease_fd)
+
+        loop = asyncio.get_running_loop()
+        try:
+            future = loop.run_in_executor(self._executor, owned_call)
+        except BaseException:
+            if lease_fd is not None:
+                os.close(lease_fd)
+            raise
+        self._offloads.add(future)
+        future.add_done_callback(self._finish_offload)
+        return await asyncio.shield(future)
 
     async def start(self) -> None:
         if self._closed:
             raise RuntimeError('Job service is closed')
-        await asyncio.to_thread(self._ensure_work_root)
+        await self._offload(self._ensure_work_root)
         if self._task is None:
             self._task = asyncio.create_task(self._loop(), name='sing-durable-job-service')
             self._wake.set()
 
     async def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
         self._closed = True
         task, self._task = self._task, None
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        # Do not stall SDK unload indefinitely. Pending worker calls retain their
+        # duplicated flock lease until their own finally block, so the entrypoint
+        # may close its fd after this bounded drain without allowing a new host in.
+        pending = tuple(self._offloads)
+        if pending and self._close_drain_s:
+            await asyncio.wait(pending, timeout=self._close_drain_s)
+        self._executor.shutdown(wait=False, cancel_futures=False)
 
     def _ensure_work_root(self) -> None:
         root = self.runtime.work_root
@@ -194,20 +269,20 @@ class JobService:
         instrumental = request.get('instrumental', False)
         if type(instrumental) is not bool:
             raise ValueError('Instrumental must be explicit bool')
-        job, created = await asyncio.to_thread(
+        job, created = await self._offload(
             self.store.submit, stream_id, request_token, request,
             auto_reply=auto_reply, consent_event=consent_event)
         # Retry a host crash between submit/offer/select without a new search.
         if job.state == 'searching':
-            job = await asyncio.to_thread(self.store.offer, job.id, stream_id, [selected],
+            job = await self._offload(self.store.offer, job.id, stream_id, [selected],
                                           expected_revision=job.revision)
         if job.state == 'needs_selection':
-            choices = await asyncio.to_thread(self.store.choices, job.id, stream_id)
+            choices = await self._offload(self.store.choices, job.id, stream_id)
             items = choices['items']
             if len(items) != 1 or (items[0]['provider'], items[0]['track_id']) != (
                     selected.provider, selected.track_id):
                 raise JobConflict('Persisted selection differs from this exact provider track')
-            job = await asyncio.to_thread(self.store.select, job.id, stream_id,
+            job = await self._offload(self.store.select, job.id, stream_id,
                                           choices['offer_id'], 1)
         if (job.state not in (frozenset(('queued', 'running', 'cancel_requested')) | self._TERMINAL)
                 or not job.selected_source
@@ -218,17 +293,17 @@ class JobService:
         return job, created
 
     async def cancel(self, job_id: str, stream_id: str) -> Job:
-        result = await asyncio.to_thread(self.store.cancel, job_id, stream_id)
+        result = await self._offload(self.store.cancel, job_id, stream_id)
         self._wake.set()
         return result
 
     async def run_once(self) -> Optional[Job]:
         """Reconcile one owned run, or atomically claim and run one queued job."""
-        active = await asyncio.to_thread(self.scanner, self.store,
+        active = await self._offload(self.scanner, self.store,
                                          ('running', 'cancel_requested'))
         if len(active) > 1:
             raise JobServiceError('job_ownership_conflict', 'More than one media job owns the slot')
-        job = active[0] if active else await asyncio.to_thread(self.store.claim_next)
+        job = active[0] if active else await self._offload(self.store.claim_next)
         if job is None:
             return None
         try:
@@ -237,7 +312,7 @@ class JobService:
             raise
         except Exception as exc:
             await self._preserve_failure(job, exc)
-        return await asyncio.to_thread(self.store.get, job.id, job.stream_id)
+        return await self._offload(self.store.get, job.id, job.stream_id)
 
     async def _loop(self) -> None:
         while not self._closed:
@@ -280,7 +355,7 @@ class JobService:
         return item
 
     async def _progress(self, job: Job, stage: str, done: int, total: int) -> Job:
-        current = await asyncio.to_thread(self.store.get, job.id, job.stream_id)
+        current = await self._offload(self.store.get, job.id, job.stream_id)
         if current.state == 'cancel_requested':
             return current
         if current.state != 'running':
@@ -291,17 +366,17 @@ class JobService:
             return current
         if current.chunk_total and current.chunk_total != total:
             raise JobServiceError('plan_progress_conflict', 'Frozen stage count changed after recovery')
-        return await asyncio.to_thread(self.store.progress, current.id, current.run_token,
+        return await self._offload(self.store.progress, current.id, current.run_token,
                                        stage=stage, done=done, total=total)
 
     async def _cancel_without_unit(self, job: Job) -> bool:
-        current = await asyncio.to_thread(self.store.get, job.id, job.stream_id)
+        current = await self._offload(self.store.get, job.id, job.stream_id)
         if current.state != 'cancel_requested':
             return False
-        attempts = await asyncio.to_thread(self.store.stage_attempts, current.id, current.stream_id)
+        attempts = await self._offload(self.store.stage_attempts, current.id, current.stream_id)
         if any(item['status'] == 'claimed' for item in attempts):
             return False
-        await asyncio.to_thread(self.store.finish_failure, current.id, current.run_token,
+        await self._offload(self.store.finish_failure, current.id, current.run_token,
             {'code': 'cancelled', 'message': '用户取消；未启动新的媒体阶段，已有证据保留。'},
             expected_unit=current.unit_name, expected_revision=current.revision)
         return True
@@ -360,11 +435,11 @@ class JobService:
         return recipe, steps, plan_path
 
     async def _prepare(self, job: Job, workspace: Path, selected: CatalogueItem):
-        frozen = await asyncio.to_thread(self._read_frozen, workspace, selected)
+        frozen = await self._offload(self._read_frozen, workspace, selected)
         if frozen is not None:
             return (*frozen, True)
         source, report = await self._source(job, workspace, selected)
-        inventory = await asyncio.to_thread(self.inventory.build, source)
+        inventory = await self._offload(self.inventory.build, source)
         duration = report.get('duration_s')
         frames = report.get('frames')
         if type(frames) is not int:
@@ -379,13 +454,13 @@ class JobService:
             hashes=inventory.hashes, versions=inventory.versions, steps=steps,
             **self._runtime_args(workspace))
         recipe_path, plan_path = workspace / 'recipe.json', workspace / 'plan.json'
-        await asyncio.to_thread(_atomic_json, recipe_path, recipe)
+        await self._offload(_atomic_json, recipe_path, recipe)
         # If recipe survived a crash before plan creation, require byte-identical
         # reconstruction from the current real assets before completing the plan.
-        stored = json.loads(await asyncio.to_thread(recipe_path.read_text, encoding='utf-8'))
+        stored = json.loads(await self._offload(recipe_path.read_text, encoding='utf-8'))
         if stored != recipe:
             raise JobServiceError('recipe_conflict', 'Real render assets changed during plan freeze')
-        await asyncio.to_thread(save_plan, plan_path, workspace=workspace,
+        await self._offload(save_plan, plan_path, workspace=workspace,
                                 recipe=fingerprint(recipe),
                                 inference_lock=self.runtime.inference_lock, steps=steps)
         return recipe, tuple(steps), plan_path, False
@@ -393,7 +468,7 @@ class JobService:
     async def _verify_resume_inventory(self, workspace: Path, recipe: dict) -> None:
         """Fail closed if a frozen job would launch with different real assets."""
         source = workspace / 'source.audio'
-        current = await asyncio.to_thread(self.inventory.build, source)
+        current = await self._offload(self.inventory.build, source)
         changed_hashes = sorted(name for name, digest in recipe['hashes'].items()
                                 if current.hashes.get(name) != digest)
         changed_versions = sorted(name for name, version in recipe['versions'].items()
@@ -435,12 +510,12 @@ class JobService:
     async def _drive(self, job: Job) -> None:
         selected = self._selected(job)
         workspace = self._workspace(job)
-        await asyncio.to_thread(self._ensure_workspace, workspace)
+        await self._offload(self._ensure_workspace, workspace)
         if await self._cancel_without_unit(job):
             return
         recipe, steps, plan_path, frozen = await self._prepare(job, workspace, selected)
         recipe_key = fingerprint(recipe)
-        attempts = await asyncio.to_thread(self.store.stage_attempts, job.id, job.stream_id)
+        attempts = await self._offload(self.store.stage_attempts, job.id, job.stream_id)
         start = self._attempt_prefix(steps, attempts)
         total = len(steps)
         # A completed plan can be published from its immutable bytes and receipts
@@ -450,7 +525,7 @@ class JobService:
         if frozen and start < total:
             await self._verify_resume_inventory(workspace, recipe)
         for position in range(start, total):
-            current = await asyncio.to_thread(self.store.get, job.id, job.stream_id)
+            current = await self._offload(self.store.get, job.id, job.stream_id)
             if current.state == 'cancel_requested' and not any(
                     item['status'] == 'claimed' for item in attempts):
                 if await self._cancel_without_unit(current):
@@ -466,11 +541,11 @@ class JobService:
                 return
             if result.get('state') != 'completed':
                 raise JobServiceError('stage_result_invalid', 'Stage coordinator returned an invalid state')
-            attempts = await asyncio.to_thread(self.store.stage_attempts, job.id, job.stream_id)
+            attempts = await self._offload(self.store.stage_attempts, job.id, job.stream_id)
             await self._progress(current, self._stage_progress(step), position + 1, total)
-        current = await asyncio.to_thread(self.store.get, job.id, job.stream_id)
+        current = await self._offload(self.store.get, job.id, job.stream_id)
         await self._progress(current, 'publishing', total, total)
-        await asyncio.to_thread(self.publisher, self.store, self.artifacts,
+        await self._offload(self.publisher, self.store, self.artifacts,
             job_id=current.id, stream_id=current.stream_id, run_token=current.run_token,
             workspace=workspace, recipe=recipe)
 
@@ -491,18 +566,18 @@ class JobService:
         return {'code': code, 'message': message}
 
     async def _preserve_failure(self, original: Job, exc: Exception) -> None:
-        current = await asyncio.to_thread(self.store.get, original.id, original.stream_id)
+        current = await self._offload(self.store.get, original.id, original.stream_id)
         if current.state in self._TERMINAL:
             return
         if current.state not in ('running', 'cancel_requested'):
             return
-        attempts = await asyncio.to_thread(self.store.stage_attempts, current.id, current.stream_id)
+        attempts = await self._offload(self.store.stage_attempts, current.id, current.stream_id)
         # An active/unknown unit still owns the slot.  StageCoordinator will
         # reconcile it on the next scan; never convert uncertainty into failure.
         if any(item['status'] == 'claimed' for item in attempts):
             return
         error = self._error(exc)
-        await asyncio.to_thread(self.store.finish_failure, current.id, current.run_token, error,
+        await self._offload(self.store.finish_failure, current.id, current.run_token, error,
             expected_unit=current.unit_name, expected_revision=current.revision,
             interrupted=error['code'] in ('stage_timeout', 'unit_timeout', 'unit_signal',
                                           'stage_terminated', 'launch_unknown', 'unit_wait_unknown'))

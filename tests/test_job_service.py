@@ -6,6 +6,8 @@ import importlib
 import importlib.util
 import json
 import sys
+import threading
+import time
 
 import pytest
 
@@ -20,6 +22,7 @@ inventory_module = importlib.import_module('job_service_test_pkg.services.asset_
 ledger = importlib.import_module('job_service_test_pkg.services.job_store')
 offers = importlib.import_module('job_service_test_pkg.services.source_offer')
 download_module = importlib.import_module('job_service_test_pkg.services.source_download')
+ownership = importlib.import_module('job_service_test_pkg.services.ownership')
 recipes = importlib.import_module('job_service_test_pkg.runtime.recipe_identity')
 
 
@@ -74,8 +77,17 @@ def selected(track_id='track-42'):
                                 'Fixture Album', 31.0, 'available')
 
 
+async def wait_until(predicate, timeout=2.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError('Synthetic threaded operation did not reach expected state')
+        await asyncio.sleep(.005)
+
+
 def make_service(tmp_path, *, store=None, catalogue=None, coordinator=None,
-                 downloader=None, publisher=None, pause_first=False):
+                 downloader=None, publisher=None, pause_first=False,
+                 ownership_fd=None, close_drain_s=1.0):
     store = store or ledger.JobStore(tmp_path / 'jobs.sqlite3')
     catalogue = catalogue or FakeCatalogue()
     files = {}
@@ -124,7 +136,8 @@ def make_service(tmp_path, *, store=None, catalogue=None, coordinator=None,
     instance = service_module.JobService(
         store, catalogue, coordinator, NoopArtifacts(), inventory, runtime,
         downloader=downloader or exact_download, probe=fake_probe,
-        publisher=publisher or fake_publish)
+        publisher=publisher or fake_publish, ownership_fd=ownership_fd,
+        close_drain_s=close_drain_s)
     return instance, store, catalogue, coordinator, calls
 
 
@@ -266,6 +279,102 @@ async def test_specific_download_error_is_preserved_without_fallback_search(tmp_
                             'message': 'Selected source stream interrupted'}
     assert catalogue.searches == 0 and catalogue.resolved == []
     assert coordinator.calls == [] and store.claim_next() is None
+
+
+@pytest.mark.asyncio
+async def test_close_leaves_flock_with_delayed_publisher_until_thread_finishes(tmp_path):
+    lock = tmp_path / 'global-scheduler.lock'
+    entered, release = threading.Event(), threading.Event()
+    owner = ownership.exclusive(lock)
+    owner_fd = owner.__enter__()
+    instance = None
+    try:
+        def delayed_publish(*args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            raise RuntimeError('synthetic late publisher failure')
+
+        instance, store, catalogue, coordinator, downloads = make_service(
+            tmp_path, publisher=delayed_publish, ownership_fd=owner_fd,
+            close_drain_s=.02)
+        await instance.submit_selected('stream-close', 'rpc-message-close',
+                                       {'instrumental': False}, selected('close-publish'))
+        await instance.start()
+        await wait_until(entered.is_set)
+        started = time.monotonic()
+        await instance.close()
+        assert time.monotonic() - started < .5
+    finally:
+        owner.__exit__(None, None, None)
+
+    try:
+        with pytest.raises(ownership.OwnershipBusy):
+            with ownership.exclusive(lock):
+                pass
+    finally:
+        release.set()
+    await wait_until(lambda: not instance._offloads)
+    assert any('late publisher failure' in str(error)
+               for error in instance._late_offload_errors)
+    with ownership.exclusive(lock):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_close_leaves_flock_with_delayed_sqlite_rpc_until_thread_finishes(tmp_path):
+    lock = tmp_path / 'global-scheduler.lock'
+    entered, release = threading.Event(), threading.Event()
+    owner = ownership.exclusive(lock)
+    owner_fd = owner.__enter__()
+    store = ledger.JobStore(tmp_path / 'jobs.sqlite3')
+    instance, _, catalogue, coordinator, downloads = make_service(
+        tmp_path, store=store, ownership_fd=owner_fd, close_drain_s=.02)
+    original_submit = store.submit
+
+    def delayed_submit(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original_submit(*args, **kwargs)
+
+    store.submit = delayed_submit
+    request = asyncio.create_task(instance.submit_selected(
+        'stream-sqlite', 'rpc-message-sqlite', {'instrumental': False}, selected('sqlite-rpc')))
+    await wait_until(entered.is_set)
+    try:
+        await instance.close()
+    finally:
+        owner.__exit__(None, None, None)
+    try:
+        with pytest.raises(ownership.OwnershipBusy):
+            with ownership.exclusive(lock):
+                pass
+    finally:
+        release.set()
+    with pytest.raises(RuntimeError, match='closing'):
+        await request
+    await wait_until(lambda: not instance._offloads)
+    with ownership.exclusive(lock):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_executor_submission_failure_closes_duplicated_lease(tmp_path, monkeypatch):
+    lock = tmp_path / 'global-scheduler.lock'
+    owner = ownership.exclusive(lock)
+    owner_fd = owner.__enter__()
+    instance, store, catalogue, coordinator, downloads = make_service(
+        tmp_path, ownership_fd=owner_fd, close_drain_s=0)
+
+    def rejected_submit(*args, **kwargs):
+        raise RuntimeError('synthetic executor rejection')
+
+    monkeypatch.setattr(instance._executor, 'submit', rejected_submit)
+    with pytest.raises(RuntimeError, match='executor rejection'):
+        await instance._offload(lambda: None)
+    await instance.close()
+    owner.__exit__(None, None, None)
+    with ownership.exclusive(lock):
+        pass
 
 
 @pytest.mark.asyncio
