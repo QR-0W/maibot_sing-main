@@ -1,6 +1,6 @@
 # maibot-sing
 
-MaiBot 插件：通过音乐来源搜索与 RVC 本地处理生成歌曲翻唱。此仓库是 [xiaocutedog/maibot_sing-main](https://github.com/xiaocutedog/maibot_sing-main) 的 QR-0W fork；上游原有的说话/MiMo TTS 等能力及致谢信息见下文。当前 dev 分支的本地后端、持久化及安全约束以 [部署与数据说明](docs/DEPLOYMENT.md) 和 [配置契约](docs/CONFIG_CONTRACT.md) 为准；本说明不表示插件已在任何运行实例启用。
+MaiBot 插件：通过音乐来源搜索与 RVC 本地处理生成歌曲翻唱。此仓库是 [xiaocutedog/maibot_sing-main](https://github.com/xiaocutedog/maibot_sing-main) 的 QR-0W fork；上游原有的说话/MiMo TTS 等能力及致谢信息见下文。当前 dev 分支的本地后端、持久化及安全约束以 [部署与数据说明](docs/DEPLOYMENT.md)、[配置契约](docs/CONFIG_CONTRACT.md) 和 [SDK 合规审计](docs/SDK_COMPLIANCE.md) 为准；本说明不表示插件已在任何运行实例启用，也不表示当前重构已经通过完整 Host 加载验收。
 
 ## 功能概览
 
@@ -12,6 +12,34 @@ MaiBot 插件：通过音乐来源搜索与 RVC 本地处理生成歌曲翻唱�
 
 > 运行环境、隔离要求、输出目录和部署前检查见 [DEPLOYMENT.md](docs/DEPLOYMENT.md)。操作前先审阅 [config.example.toml](config.example.toml) 与当前 [CONFIG_CONTRACT.md](docs/CONFIG_CONTRACT.md)。不要把包含凭证的真实 `config.toml` 提交到版本库。
 
+## 安装与启用
+
+本插件遵循 MaiBot 官方的 [Vibe Coding 插件开发指南](https://docs.mai-mai.org/plugin/vibe-coding)、[Manifest](https://docs.mai-mai.org/plugin/manifest)、[生命周期](https://docs.mai-mai.org/plugin/lifecycle) 与 [配置管理](https://docs.mai-mai.org/plugin/config) 约定。将仓库作为独立插件目录放入 MaiBot 的 `plugins/` 下；不要复制文件到 MaiBot 的 `src/`、`dashboard/` 或全局 `config/`：
+
+```bash
+cd /path/to/MaiBot/plugins
+git clone https://github.com/QR-0W/maibot_sing-main.git maibot-sing
+```
+
+重启 MaiBot 后，在插件管理界面确认 manifest 校验与依赖解析没有报错，再由管理员显式启用。插件默认 `plugin.enabled = false`；在受限本地后端的模型路径、隔离 Python、推理锁和输出路径完成审查前，不应启用渲染。
+
+## 配置
+
+配置结构和默认值唯一由 `plugin.py` 中的 `config_model` 定义。Runner 首次加载时在已安装插件目录生成 `config.toml`，后续模型新增字段也由 Runner 补齐；仓库中的 [config.example.toml](config.example.toml) 仅供审阅，不是运行时配置源。请通过 WebUI 或 Runner 管理的运行时配置修改当前实例，不要提交生成的 `config.toml`、登录态、密钥或数据库。
+
+关键部署字段及边界见 [配置契约](docs/CONFIG_CONTRACT.md)。`local.backend` 应保持为受限的 `local`；模型、索引、HuBERT、Demucs、RVC 脚本、隔离解释器和共享推理锁均由管理员提供绝对路径。旧 sidecar 配置不能替代受限本地执行路径。
+
+## 命令与 Tool
+
+- `/翻唱 <准确歌名> - <艺人名>`：搜索明确录音版本并创建持久任务；可追加 `--album` 或 `--source-id` 缩小候选。
+- `/翻唱选择 <任务ID> <序号>`：从插件已显示的候选快照中选择版本。
+- `/翻唱状态 <任务ID>`：查询渲染与投递状态。
+- `/翻唱取消 <任务ID>`：持久化取消请求；不能撤回已被平台接受的发送。
+- `/说 <文本>`、`/音色列表`：旧说话/音色入口，是否可用取决于受限后端和管理员配置。
+- `/qq音乐登录`、`/网易云音乐登录`、`/163logintest`、`/qqlogintest`：仅 operator 使用的登录与诊断命令。
+
+插件还声明了供 LLM 发现的翻唱与说话 Tool；默认不要把它们提升为核心工具。`/163cookie` 会在聊天命令中携带登录凭证，当前审计将其列为待整改项，不建议在生产会话使用。实际启用前请核对 [SDK 合规审计](docs/SDK_COMPLIANCE.md) 的组件与安全待验项。
+
 ## 模型来源与限制
 
 使用的角色模型候选是《碧蓝档案》枣伊吕波（Natsume Iroha），不是《魔法纪录》环彩羽（Tamaki Iroha）。现有公开材料倾向于日语语料，但作者没有公开训练集清单，因此训练语言与内容仍属未完全核实；“国际服”不等同英语配音，也不代表英语CV或英语训练数据存在。模型卡上的许可 tag 不等于游戏录音、声优表演或所有相关声音素材均获授权，更不构成商业使用许可。使用者须自行确认适用权利及许可。
@@ -20,7 +48,7 @@ MaiBot 插件：通过音乐来源搜索与 RVC 本地处理生成歌曲翻唱�
 
 ## 依赖与安全
 
-插件依赖以 `requirements.txt` / manifest 为准；本说明不要求安装或改变 MaiBot 核心环境。不得把密钥、登录态、模型、歌曲音频或运行配置提交到仓库。推理和资源限制要求见 [DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+插件依赖的唯一权威来源是 [_manifest.json](_manifest.json) 的 `dependencies`。MaiBot Host 负责检查冲突并安装缺失依赖；不要依据 `requirements.txt` 手工改动 MaiBot 核心环境，也不要把该文件当成插件加载契约。不得把密钥、登录态、模型、歌曲音频、日志、SQLite 数据库或运行配置提交到仓库。推理和资源限制要求见 [DEPLOYMENT.md](docs/DEPLOYMENT.md)。
 
 ## 上游说明与鸣谢
 
@@ -31,16 +59,36 @@ MaiBot 插件：通过音乐来源搜索与 RVC 本地处理生成歌曲翻唱�
 - [Retrieval-based-Voice-Conversion-WebUI (RVC)](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) — 语音音色转换框架。
 - [Ultimate Vocal Remover (UVR5)](https://github.com/leebufan/Ultimate-Vocal-Remover) — 人声/伴奏分离工具。
 
-## 已完成的验证
+## 验证
 
-片段、202 秒整曲及两段 30 秒试听均已真实完成，峰值内存约 1.83–1.94 GiB；实际 SDK 的缓存与发送失败保留也已验证。见 [完整验证记录](docs/VALIDATION.md)。
+独立仓库测试：
 
 ```bash
 python -m pytest tests -q
 ```
 
-测试需要插件依赖、maibot-plugin-sdk、pytest 与 pytest-asyncio，不加载 RVC 模型或访问真实聊天。在 MaiBot 目录内运行时，`tests/test_manifest.py` 会额外调用主程序自身的 Manifest 校验器。
+如需调用指定 MaiBot checkout 的真实 `ManifestValidator`，并用当前解释器中实际安装的 `maibot_sdk` 生成配置 Schema，请显式提供只读 Host 根目录并使用该 Host 的 Python 环境：
+
+```bash
+MAIBOT_TEST_HOST_ROOT=/path/to/MaiBot \
+  /path/to/MaiBot/.venv/bin/python -m pytest tests/test_manifest.py -q
+```
+
+该测试只导入插件定义、校验 manifest 并构建配置 Schema；不会调用 `create_plugin()`、`on_load()`、模型推理或消息发送。未设置 `MAIBOT_TEST_HOST_ROOT` 时，独立仓库会跳过 Host 专属校验，而不是猜测本机目录。本次审计实际覆盖 Host `1.3.0` 与 SDK `2.8.2`；manifest 的最低版本已收紧到这两个实测版本，因为可信 Command 原始消息 payload 与 detailed send `return_details` 是授权投递所需契约。此结果不承诺更旧版本兼容，也不等于正式 Runner 加载验收。完整的已验证项和待验项见 [SDK 合规审计](docs/SDK_COMPLIANCE.md)。
+
+### 历史 v0.4.0 音频实验
+
+旧实现曾完成片段、202 秒整曲及两段 30 秒试听，记录峰值内存约 1.83–1.94 GiB，详见 [历史验证记录](docs/VALIDATION.md)。这些结果仅说明当时的音频实验与资源测量，不证明当前持久化队列、Runner 生命周期、配置热重载、Host 加载或授权投递已经验收通过。
+
+## 常见问题
+
+- **插件未出现在管理界面**：先查看 Host 的 manifest 校验错误，确认目录根部包含 `_manifest.json` 与 `plugin.py`，并检查 Host/SDK 版本是否落在 manifest 的闭区间内。
+- **依赖冲突或缺包**：以 `_manifest.json` 的 `dependencies` 为准排查 Host 依赖解析结果；不要手工把 `requirements.txt` 安装进 MaiBot 核心环境来掩盖冲突。
+- **没有生成 `config.toml`**：确认 Runner 已成功导入入口并识别 `config_model`。该文件应由 Runner 在安装目录生成，不要从仓库复制真实配置。
+- **配置页面无法渲染**：运行上面的 Host 专属 manifest/Schema 测试，检查 `PluginConfigBase` 字段是否都有默认值、`plugin.config_version` 是否存在。
+- **任务无法开始**：确认插件仍为管理员有意启用，并逐项检查受限本地后端所需的绝对路径、systemd user service、共享推理锁与资源限制；不要回退到无隔离推理。
+- **发送结果不确定**：不要自动重发。保留 JobStore 与私有日志供协调器对账，只有平台明确确认后才标记送达。
 
 ## 已知限制
 
-当前权重在部分高音区会唱不上去或出现破音，《Aoi》开头等片段还原也不理想；这是尚未修复的音质问题，不是下载或编码缺陷。已发布版本仅为可安装初版。
+当前权重在部分高音区会唱不上去或出现破音，《Aoi》开头等片段还原也不理想；这是尚未修复的音质问题，不是下载或编码缺陷。历史音质结果不能替代当前架构的整曲、生命周期与投递验收；在 [SDK 合规审计](docs/SDK_COMPLIANCE.md) 的待验项完成前，不应宣称新架构已经发布就绪。
