@@ -6,6 +6,7 @@ import importlib
 import importlib.util
 import sys
 import threading
+import types
 
 import httpx
 import pytest
@@ -16,6 +17,7 @@ spec=importlib.util.spec_from_file_location('download_test_pkg',root/'__init__.p
 package=importlib.util.module_from_spec(spec);sys.modules[spec.name]=package;spec.loader.exec_module(package)
 source=importlib.import_module('download_test_pkg.services.source_download')
 service=importlib.import_module('download_test_pkg.services.catalogue_service')
+jobs_module=importlib.import_module('download_test_pkg.services.job_service')
 music=importlib.import_module('download_test_pkg.music.search')
 Item=importlib.import_module('download_test_pkg.services.source_offer').CatalogueItem
 
@@ -172,70 +174,124 @@ async def test_blocked_disk_write_does_not_block_event_loop(tmp_path,gateway,mon
 
 
 @pytest.mark.asyncio
-async def test_cancelled_default_offload_observes_late_error():
-    entered,release=threading.Event(),threading.Event()
+async def test_cancelled_default_offload_returns_before_late_error():
+    entered,release,finished=threading.Event(),threading.Event(),threading.Event()
+    loop=asyncio.get_running_loop(); errors=[]
+    previous=loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop,context: errors.append(context))
     def broken():
         entered.set()
-        if not release.wait(2):
-            raise AssertionError('test did not release broken offload')
-        raise RuntimeError('late disk failure')
-    task=asyncio.create_task(source._offload_io(None,broken))
-    await wait_thread_flag(entered)
-    task.cancel()
-    release.set()
-    with pytest.raises(asyncio.CancelledError) as exc:
-        await task
-    assert isinstance(exc.value.__cause__,RuntimeError)
-    assert str(exc.value.__cause__)=='late disk failure'
+        try:
+            if not release.wait(2):
+                raise AssertionError('test did not release broken offload')
+            raise RuntimeError('late disk failure')
+        finally:
+            finished.set()
+    try:
+        task=asyncio.create_task(source._offload_io(None,broken))
+        await wait_thread_flag(entered)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task,.2)
+        assert not finished.is_set()
+        release.set()
+        await wait_thread_flag(finished)
+        await asyncio.sleep(.02)
+        assert errors==[]
+    finally:
+        release.set()
+        loop.set_exception_handler(previous)
 
 
 @pytest.mark.asyncio
-async def test_cancelled_blocked_write_finishes_only_private_part(tmp_path,gateway,monkeypatch):
+async def test_job_service_close_does_not_wait_for_blocked_download_write(tmp_path,gateway,monkeypatch):
     client,catalogue=gateway
     mock_success(client)
-    entered,release=threading.Event(),threading.Event()
+    entered,release,finished=threading.Event(),threading.Event(),threading.Event()
     original=source._append_block
     def blocked(*args):
         entered.set()
-        if not release.wait(2):
-            raise AssertionError('test did not release disk write')
-        return original(*args)
+        try:
+            if not release.wait(2):
+                raise AssertionError('test did not release disk write')
+            return original(*args)
+        finally:
+            finished.set()
     monkeypatch.setattr(source,'_append_block',blocked)
-    task=asyncio.create_task(source.download_selected(catalogue,chosen(),tmp_path))
-    await wait_thread_flag(entered)
-    task.cancel()
+    runtime=types.SimpleNamespace(work_root=tmp_path/'jobs')
+    jobs=jobs_module.JobService(object(),catalogue,object(),object(),object(),runtime,
+                                close_drain_s=.01)
+    task=asyncio.create_task(source.download_selected(
+        catalogue,chosen(),tmp_path,offload=jobs._offload))
+    jobs._task=task
+    try:
+        await wait_thread_flag(entered)
+        await asyncio.wait_for(jobs.close(),.2)
+        assert task.done() and not finished.is_set()
+        assert not (tmp_path/'source.audio').exists()
+    finally:
+        release.set()
+    await wait_thread_flag(finished)
     await asyncio.sleep(.02)
-    assert not task.done() and not (tmp_path/'source.audio').exists()
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
     parts=list(tmp_path.glob('source-*.part'))
     assert len(parts)==1 and parts[0].read_bytes()==b'A'*2048
     assert not (tmp_path/'source.audio').exists()
 
 
 @pytest.mark.asyncio
-async def test_cancelled_publish_never_leaves_completed_target(tmp_path,gateway,monkeypatch):
+async def test_cancel_before_link_returns_fast_and_keeps_private_part(tmp_path,gateway,monkeypatch):
     client,catalogue=gateway
     mock_success(client)
-    entered,release=threading.Event(),threading.Event()
+    entered,release,finished=threading.Event(),threading.Event(),threading.Event()
     original=source._publish_part
     def blocked(*args):
         entered.set()
-        if not release.wait(2):
-            raise AssertionError('test did not release publication')
-        return original(*args)
+        try:
+            if not release.wait(2):
+                raise AssertionError('test did not release publication')
+            return original(*args)
+        finally:
+            finished.set()
     monkeypatch.setattr(source,'_publish_part',blocked)
     task=asyncio.create_task(source.download_selected(catalogue,chosen(),tmp_path))
     await wait_thread_flag(entered)
     task.cancel()
-    await asyncio.sleep(.02)
-    assert not task.done()
-    release.set()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task,.2)
+    assert not finished.is_set() and not (tmp_path/'source.audio').exists()
+    release.set()
+    await wait_thread_flag(finished)
     assert not (tmp_path/'source.audio').exists()
-    assert len(list(tmp_path.glob('source-*.part')))==1
+    parts=list(tmp_path.glob('source-*.part'))
+    assert len(parts)==1 and parts[0].read_bytes()==b'A'*2048
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_link_keeps_complete_committed_source(tmp_path,gateway,monkeypatch):
+    client,catalogue=gateway
+    mock_success(client)
+    entered,release,finished=threading.Event(),threading.Event(),threading.Event()
+    original=source._fsync_directory
+    def blocked(workspace):
+        entered.set()
+        try:
+            if not release.wait(2):
+                raise AssertionError('test did not release directory fsync')
+            return original(workspace)
+        finally:
+            finished.set()
+    monkeypatch.setattr(source,'_fsync_directory',blocked)
+    task=asyncio.create_task(source.download_selected(catalogue,chosen(),tmp_path))
+    await wait_thread_flag(entered)
+    assert (tmp_path/'source.audio').read_bytes()==b'A'*2048
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task,.2)
+    release.set()
+    await wait_thread_flag(finished)
+    await asyncio.sleep(.02)
+    assert (tmp_path/'source.audio').read_bytes()==b'A'*2048
+    assert not list(tmp_path.glob('source-*.part'))
 
 
 @pytest.mark.asyncio

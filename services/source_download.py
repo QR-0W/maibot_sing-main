@@ -93,25 +93,10 @@ def _fsync_directory(workspace):
         os.close(fd)
 
 
-def _remove_owned_target(target, identity, workspace):
-    """Remove only the exact inode published by this attempt."""
-    if identity is None:
-        return False
-    try:
-        current = os.stat(target,follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    if (current.st_dev,current.st_ino) != identity or not stat.S_ISREG(current.st_mode):
-        return False
-    os.unlink(target)
-    _fsync_directory(workspace)
-    return True
-
-
 def _publish_part(temporary, target, workspace, cancelled):
-    """Fsync and exclusively publish; cancellation never leaves our target."""
+    """Fsync then exclusively link; the link is the irreversible commit point."""
     if cancelled.is_set():
-        return None
+        return False
     fd = os.open(temporary,os.O_RDONLY|os.O_NOFOLLOW)
     try:
         info = os.fstat(fd)
@@ -121,66 +106,40 @@ def _publish_part(temporary, target, workspace, cancelled):
     finally:
         os.close(fd)
     if cancelled.is_set():
-        return None
-    identity = None
+        return False
     try:
-        try:
-            os.link(temporary,target,follow_symlinks=False)
-        except FileExistsError as exc:
-            raise DownloadError('source_exists',
-                'Source already present; verify its receipt before reuse') from exc
-        published = os.stat(target,follow_symlinks=False)
-        identity = (published.st_dev,published.st_ino)
-        if cancelled.is_set():
-            _remove_owned_target(target,identity,workspace)
-            return None
-        _fsync_directory(workspace)
-        if cancelled.is_set():
-            _remove_owned_target(target,identity,workspace)
-            return None
-        os.unlink(temporary)
-        return identity
+        os.link(temporary,target,follow_symlinks=False)
+    except FileExistsError as exc:
+        raise DownloadError('source_exists',
+            'Source already present; verify its receipt before reuse') from exc
+    # Cancellation after link cannot undo a complete source. Finish durability;
+    # later probe/receipt reconciliation decides whether it may be reused.
+    _fsync_directory(workspace)
+    os.unlink(temporary)
+    return True
+
+
+def _consume_offload(future):
+    """Retrieve late errors after a cancelled await without blocking shutdown."""
+    if future.cancelled():
+        return
+    try:
+        future.exception()
     except BaseException:
-        if identity is not None:
-            try:
-                _remove_owned_target(target,identity,workspace)
-            except OSError:
-                pass
-        raise
+        pass
 
 
-async def _offload_result(offload, function, /, *args, cancel_signal=None, **kwargs):
-    """Drain one sync operation after cancellation so its handles cannot escape."""
+async def _offload_io(offload, function, /, *args, cancel_signal=None, **kwargs):
+    """Start one owned sync call; cancellation never waits for blocked disk I/O."""
     runner = asyncio.to_thread if offload is None else offload
     operation = asyncio.ensure_future(runner(function,*args,**kwargs))
-    cancellation = None
-    while True:
-        try:
-            result = await asyncio.shield(operation)
-            return result,cancellation
-        except asyncio.CancelledError as exc:
-            if operation.done() and operation.cancelled() and cancellation is None:
-                raise
-            if cancellation is None:
-                cancellation = exc
-                if cancel_signal is not None:
-                    cancel_signal()
-            if operation.done():
-                try:
-                    return operation.result(),cancellation
-                except BaseException as operation_error:
-                    raise cancellation from operation_error
-        except BaseException as exc:
-            if cancellation is not None:
-                raise cancellation from exc
-            raise
-
-
-async def _offload_io(offload, function, /, *args, **kwargs):
-    result,cancellation = await _offload_result(offload,function,*args,**kwargs)
-    if cancellation is not None:
-        raise cancellation
-    return result
+    operation.add_done_callback(_consume_offload)
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        if cancel_signal is not None:
+            cancel_signal()
+        raise
 
 
 async def download_selected(catalogue: CatalogueService, chosen: CatalogueItem, workspace: Path,
@@ -248,15 +207,8 @@ async def _download_inner(catalogue: CatalogueService, chosen: CatalogueItem, wo
     if amount < 1024:
         raise DownloadError('source_incomplete','Media stream was empty or implausibly short')
     cancel_signal = threading.Event()
-    identity,cancellation = await _offload_result(offload,_publish_part,temporary,target,workspace,
-                                                   cancel_signal,cancel_signal=cancel_signal.set)
-    if cancellation is not None:
-        if identity is not None:
-            _,cleanup_cancellation = await _offload_result(
-                offload,_remove_owned_target,target,identity,workspace)
-            if cleanup_cancellation is not None:
-                cancellation = cleanup_cancellation
-        raise cancellation
-    if identity is None:
+    committed = await _offload_io(offload,_publish_part,temporary,target,workspace,
+                                  cancel_signal,cancel_signal=cancel_signal.set)
+    if not committed:
         raise asyncio.CancelledError
     return target,digest.hexdigest(),amount
