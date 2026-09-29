@@ -296,12 +296,57 @@ class SingPlugin(MaiBotPlugin):
         self._track_startup_task(task)
         return await asyncio.shield(task)
 
+    def _raise_cleanup_errors(self, errors: list[tuple[str,BaseException]]) -> None:
+        if not errors:
+            return
+        for label,error in errors:
+            try:
+                self.ctx.logger.error('资源清理失败（%s）：%s',label,error,
+                                      exc_info=(type(error),error,error.__traceback__))
+            except BaseException:
+                pass
+        cancellations=[error for _,error in errors
+                       if isinstance(error,asyncio.CancelledError)]
+        if cancellations:
+            primary=cancellations[0]
+            for label,error in errors:
+                if error is not primary:
+                    primary.add_note(f'另一个清理步骤失败（{label}）：{error!r}')
+            raise primary
+        fatal=[error for _,error in errors if not isinstance(error,Exception)]
+        if fatal:
+            primary=fatal[0]
+            for label,error in errors:
+                if error is not primary:
+                    primary.add_note(f'另一个清理步骤失败（{label}）：{error!r}')
+            raise primary
+        regular=[error for _,error in errors]
+        if len(regular)==1:
+            raise regular[0]
+        raise ExceptionGroup('多个插件资源清理步骤失败',regular)
+
+    async def _close_after_failure(self, original: BaseException) -> None:
+        try:
+            await self._close_resources()
+        except BaseException as cleanup:
+            try:
+                self.ctx.logger.error('启动/重载失败后的资源清理也失败：%s',cleanup,
+                                      exc_info=(type(cleanup),cleanup,cleanup.__traceback__))
+            except BaseException:
+                pass
+            if (isinstance(cleanup,asyncio.CancelledError)
+                    and not isinstance(original,asyncio.CancelledError)):
+                cleanup.add_note(f'取消前的原始启动/重载失败：{original!r}')
+                raise cleanup from original
+            original.add_note(f'后续资源清理失败：{cleanup!r}')
+            raise original from cleanup
+
     async def on_load(self) -> None:
         async with self._lifecycle_lock:
             try:
                 await self._load_resources()
-            except BaseException:
-                await self._close_resources()
+            except BaseException as original:
+                await self._close_after_failure(original)
                 raise
 
     async def _load_resources(self) -> None:
@@ -330,51 +375,96 @@ class SingPlugin(MaiBotPlugin):
     async def _stop_durable_services(self) -> None:
         self._active_cover=None
         task,self._delivery_task=self._delivery_task,None
+        outbox,self._outbox=self._outbox,None
+        jobs,self._jobs=self._jobs,None
+        owner,self._scheduler_owner=self._scheduler_owner,None
+        pending=tuple(self._startup_tasks)
+        errors: list[tuple[str,BaseException]]=[]
         if task is not None:
             task.cancel()
-            await asyncio.gather(task,return_exceptions=True)
+            try:
+                await asyncio.gather(task,return_exceptions=True)
+            except BaseException as exc:
+                errors.append(('delivery_task',exc))
         # An in-flight platform send is fenced unknown on next startup. Never
         # launch a replacement send for pending/dispatching/unknown automatically.
-        outbox,self._outbox=self._outbox,None
         if outbox is not None:
-            await outbox.shutdown(timeout_s=1.0)
-        jobs,self._jobs=self._jobs,None
+            try:
+                await outbox.shutdown(timeout_s=1.0)
+            except BaseException as exc:
+                errors.append(('outbox',exc))
         if jobs is not None:
-            await jobs.close()
-        owner,self._scheduler_owner=self._scheduler_owner,None
+            try:
+                await jobs.close()
+            except BaseException as exc:
+                errors.append(('jobs',exc))
         if owner is not None:
-            owner.__exit__(None,None,None)
-        pending=tuple(self._startup_tasks)
+            try:
+                owner.__exit__(None,None,None)
+            except BaseException as exc:
+                errors.append(('scheduler_owner',exc))
         if pending:
-            await asyncio.wait(pending,timeout=1.0)
+            try:
+                await asyncio.wait(pending,timeout=1.0)
+            except BaseException as exc:
+                errors.append(('startup_tasks',exc))
+        self._raise_cleanup_errors(errors)
 
     async def _close_resources(self) -> None:
-        await self._stop_durable_services()
-        if self._local is not None:
-            await self._local.close()
-            self._local=None
-        current_tasks=[task for task in (self._qq_login_task,self._netease_login_task,
-                                         self._cache_cleanup_task) if task is not None]
-        for task in current_tasks:
-            task.cancel()
-        if current_tasks:
-            await asyncio.gather(*current_tasks,return_exceptions=True)
+        local,self._local=self._local,None
+        login_tasks=[task for task in (self._qq_login_task,self._netease_login_task,
+                                       self._cache_cleanup_task) if task is not None]
         self._qq_login_task=self._netease_login_task=self._cache_cleanup_task=None
         sender,self._voice_sender=self._voice_sender,None
-        if sender is not None:
-            await sender.shutdown(timeout_s=1.0)
-        if self._music is not None:
-            await self._music.close()
-            self._music=None
-        if self._mimo is not None:
-            await self._mimo.close()
-            self._mimo=None
-        if self._rvc is not None:
-            await self._rvc.close()
-            self._rvc=None
-        await self._stop_sidecar()
-        self._pending.clear()
+        music,self._music=self._music,None
+        mimo,self._mimo=self._mimo,None
+        rvc,self._rvc=self._rvc,None
+        sidecar,self._sidecar_proc=self._sidecar_proc,None
         self._pipeline=None
+        self._pending.clear()
+        errors: list[tuple[str,BaseException]]=[]
+        try:
+            await self._stop_durable_services()
+        except BaseException as exc:
+            errors.append(('durable_services',exc))
+        if local is not None:
+            try:
+                await local.close()
+            except BaseException as exc:
+                errors.append(('local_backend',exc))
+        for task in login_tasks:
+            task.cancel()
+        if login_tasks:
+            try:
+                await asyncio.gather(*login_tasks,return_exceptions=True)
+            except BaseException as exc:
+                errors.append(('login_or_cache_tasks',exc))
+        if sender is not None:
+            try:
+                await sender.shutdown(timeout_s=1.0)
+            except BaseException as exc:
+                errors.append(('voice_sender',exc))
+        if music is not None:
+            try:
+                await music.close()
+            except BaseException as exc:
+                errors.append(('music_client',exc))
+        if mimo is not None:
+            try:
+                await mimo.close()
+            except BaseException as exc:
+                errors.append(('mimo_client',exc))
+        if rvc is not None:
+            try:
+                await rvc.close()
+            except BaseException as exc:
+                errors.append(('rvc_client',exc))
+        try:
+            await self._close_sidecar_process(sidecar)
+        except BaseException as exc:
+            errors.append(('sidecar',exc))
+        if errors:
+            self._raise_cleanup_errors(errors)
         self.ctx.logger.info("翻唱插件已卸载")
 
     async def on_unload(self) -> None:
@@ -390,8 +480,8 @@ class SingPlugin(MaiBotPlugin):
             await self._close_resources()
             try:
                 await self._load_resources()
-            except BaseException:
-                await self._close_resources()
+            except BaseException as original:
+                await self._close_after_failure(original)
                 raise
 
     # ===== 持久化渲染与投递 =====
@@ -650,15 +740,17 @@ class SingPlugin(MaiBotPlugin):
         self.ctx.logger.warning("sidecar 未就绪，自动重新拉起")
         await self._start_sidecar()
 
-    async def _stop_sidecar(self) -> None:
-        proc = self._sidecar_proc
-        self._sidecar_proc = None
+    async def _close_sidecar_process(self, proc) -> None:
         if proc is not None and proc.returncode is None:
             proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except asyncio.TimeoutError:
                 proc.kill()
+
+    async def _stop_sidecar(self) -> None:
+        proc,self._sidecar_proc=self._sidecar_proc,None
+        await self._close_sidecar_process(proc)
 
     def _build_music_client(self) -> MusicSearchClient:
         netease_cookie: dict[str, str] = {}

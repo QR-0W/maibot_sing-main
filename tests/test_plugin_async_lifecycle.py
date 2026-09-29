@@ -83,6 +83,47 @@ def command(stream='stream-1', msg='platform-message-1', *, user='user-1', text=
                         'message_info': {'user_info': {'user_id': user}}}}
 
 
+def install_cleanup_fakes(instance, monkeypatch, failure, error_type=OSError):
+    calls=[]
+    async def invoke(label):
+        calls.append(label)
+        if label==failure:
+            raise error_type(label)
+    class Outbox:
+        async def shutdown(self,*,timeout_s): await invoke('outbox')
+    class Jobs:
+        async def close(self): await invoke('jobs')
+    class Owner:
+        def __exit__(self,*args):
+            calls.append('owner')
+            if failure=='owner': raise error_type('owner')
+    class Closer:
+        def __init__(self,label): self.label=label
+        async def close(self): await invoke(self.label)
+    class Voice:
+        async def shutdown(self,*,timeout_s): await invoke('voice')
+    async def sidecar(proc): await invoke('sidecar')
+    monkeypatch.setattr(instance,'_close_sidecar_process',sidecar)
+    instance._active_cover=object()
+    instance._outbox=Outbox()
+    instance._jobs=Jobs()
+    instance._scheduler_owner=Owner()
+    instance._local=Closer('local')
+    instance._voice_sender=Voice()
+    instance._music=Closer('music')
+    instance._mimo=Closer('mimo')
+    instance._rvc=Closer('rvc')
+    instance._sidecar_proc=object()
+    instance._pipeline=object()
+    instance._pending['stream']=([], 'qq', 0)
+    async def linger(): await asyncio.sleep(3600)
+    delivery=asyncio.create_task(linger())
+    login=asyncio.create_task(linger())
+    instance._delivery_task=delivery
+    instance._qq_login_task=login
+    return calls,delivery,login
+
+
 @pytest.mark.asyncio
 async def test_lifecycle_restarts_durable_service_without_deleting_offer(plugin):
     instance, sends = plugin
@@ -113,6 +154,82 @@ async def test_lifecycle_restarts_durable_service_without_deleting_offer(plugin)
     assert instance._jobs is not first
     assert instance._jobs.store.get(job_id, 'stream-1').state == 'needs_selection'
     await instance.on_unload()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure',[
+    'outbox','jobs','owner','local','voice','music','mimo','rvc','sidecar'])
+async def test_cleanup_attempts_every_resource_after_one_failure(plugin,monkeypatch,failure):
+    instance,_=plugin
+    calls,delivery,login=install_cleanup_fakes(instance,monkeypatch,failure)
+    with pytest.raises(OSError,match=failure):
+        await instance._close_resources()
+    assert calls==['outbox','jobs','owner','local','voice','music','mimo','rvc','sidecar']
+    assert delivery.cancelled() and login.cancelled()
+    assert instance._active_cover is None and instance._outbox is None
+    assert instance._jobs is None and instance._scheduler_owner is None
+    assert instance._local is None and instance._voice_sender is None
+    assert instance._music is None and instance._mimo is None and instance._rvc is None
+    assert instance._sidecar_proc is None and instance._pipeline is None
+    assert instance._pending=={}
+
+
+@pytest.mark.asyncio
+async def test_cleanup_aggregates_multiple_failures_after_all_attempts(plugin,monkeypatch):
+    instance,_=plugin
+    calls,delivery,login=install_cleanup_fakes(instance,monkeypatch,'outbox')
+    class BadJobs:
+        async def close(self):
+            calls.append('jobs')
+            raise OSError('jobs')
+    instance._jobs=BadJobs()
+    with pytest.raises(ExceptionGroup) as grouped:
+        await instance._close_resources()
+    messages=' '.join(str(error) for error in grouped.value.exceptions)
+    assert 'outbox' in messages and 'jobs' in messages
+    assert calls==['outbox','jobs','owner','local','voice','music','mimo','rvc','sidecar']
+    assert delivery.cancelled() and login.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_preserves_cancellation_after_other_resources(plugin,monkeypatch):
+    instance,_=plugin
+    calls,delivery,login=install_cleanup_fakes(
+        instance,monkeypatch,'music',asyncio.CancelledError)
+    with pytest.raises(asyncio.CancelledError):
+        await instance._close_resources()
+    assert calls==['outbox','jobs','owner','local','voice','music','mimo','rvc','sidecar']
+    assert delivery.cancelled() and login.cancelled()
+    assert instance._jobs is None and instance._scheduler_owner is None
+
+
+@pytest.mark.asyncio
+async def test_startup_error_remains_primary_when_cleanup_also_fails(plugin,monkeypatch):
+    instance,_=plugin
+    async def failed_load():
+        raise ValueError('original startup failure')
+    async def failed_cleanup():
+        raise OSError('cleanup failure')
+    monkeypatch.setattr(instance,'_load_resources',failed_load)
+    monkeypatch.setattr(instance,'_close_resources',failed_cleanup)
+    with pytest.raises(ValueError,match='original startup failure') as error:
+        await instance.on_load()
+    assert isinstance(error.value.__cause__,OSError)
+    assert 'cleanup failure' in str(error.value.__cause__)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_cancellation_remains_primary_over_startup_error(plugin,monkeypatch):
+    instance,_=plugin
+    async def failed_load():
+        raise ValueError('startup before cancellation')
+    async def cancelled_cleanup():
+        raise asyncio.CancelledError('cleanup cancelled')
+    monkeypatch.setattr(instance,'_load_resources',failed_load)
+    monkeypatch.setattr(instance,'_close_resources',cancelled_cleanup)
+    with pytest.raises(asyncio.CancelledError) as error:
+        await instance.on_load()
+    assert isinstance(error.value.__cause__,ValueError)
 
 
 @pytest.mark.asyncio
