@@ -1,14 +1,15 @@
 """Hash the real render inputs and record the isolated runtime versions.
 
-The inventory is deliberately built only after the exact selected source has
-been downloaded.  It never accepts declared digests and never stores playback
-URLs, credentials, chat identities, or private filesystem paths in the recipe.
+Reusable runtime content can be inventoried before a source exists; the full
+inventory adds only the exact downloaded source bytes. It never accepts declared
+digests or exposes playback URLs, credentials, chat identities, or private paths.
 """
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Mapping
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -40,10 +41,124 @@ class AssetPaths:
         return {name: Path(getattr(self, name)) for name in HASH_NAMES if name != 'source'}
 
 
+RUNTIME_HASH_NAMES = tuple(name for name in HASH_NAMES if name != 'source')
+RUNTIME_EXECUTION_PATH_NAMES = (
+    'model', 'index', 'hubert', 'demucs_repo', 'rvc_script', 'rvc_upstream',
+    'media_stage', 'worker', 'render_plan', 'stage_executor', 'worker_python',
+    'worker_script', 'inference_lock',
+)
+RUNTIME_CONTEXT_NAMES = ('execution_paths', 'artifact_root', 'limits', 'parameter_policy')
+RUNTIME_LIMIT_NAMES = ('max_duration_s', 'max_download_bytes')
+
+
+@dataclass(frozen=True)
+class RuntimeInventory:
+    hashes: Dict[str, str]
+    versions: Dict[str, str]
+
+
 @dataclass(frozen=True)
 class Inventory:
     hashes: Dict[str, str]
     versions: Dict[str, str]
+
+
+def _generation_path(value: object, label: str) -> str:
+    try:
+        normalized = os.fspath(value)
+    except TypeError as exc:
+        raise InventoryError('runtime_context_invalid', label + ' must be an absolute path') from exc
+    if (not isinstance(normalized, str) or not Path(normalized).is_absolute()
+            or not 1 <= len(normalized) <= 4096 or '://' in normalized
+            or any(ord(character) < 32 for character in normalized)):
+        raise InventoryError('runtime_context_invalid', label + ' must be a bounded absolute path')
+    return normalized
+
+
+def _normalize_policy(value: object, *, depth: int = 0):
+    if depth > 8:
+        raise InventoryError('runtime_context_invalid', 'Parameter policy nesting is too deep')
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if not -(2**63) <= value < 2**63:
+            raise InventoryError('runtime_context_invalid', 'Parameter policy integer is out of range')
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise InventoryError('runtime_context_invalid', 'Parameter policy numbers must be finite')
+        return value
+    if isinstance(value, str):
+        if len(value) > 2048 or any(ord(character) < 32 for character in value):
+            raise InventoryError('runtime_context_invalid', 'Parameter policy string is invalid or oversized')
+        return value
+    if isinstance(value, Mapping):
+        if len(value) > 256:
+            raise InventoryError('runtime_context_invalid', 'Parameter policy object is oversized')
+        normalized = {}
+        for key, child in value.items():
+            if (not isinstance(key, str) or
+                    not re.fullmatch(r'[A-Za-z][A-Za-z0-9_.-]{0,127}', key)):
+                raise InventoryError('runtime_context_invalid', 'Parameter policy key is invalid')
+            normalized[key] = _normalize_policy(child, depth=depth + 1)
+        return normalized
+    if isinstance(value, (list, tuple)):
+        if len(value) > 256:
+            raise InventoryError('runtime_context_invalid', 'Parameter policy list is oversized')
+        return [_normalize_policy(child, depth=depth + 1) for child in value]
+    raise InventoryError('runtime_context_invalid', 'Parameter policy contains an unsupported value')
+
+
+def runtime_generation(runtime_inventory: RuntimeInventory, context: Mapping[str, object]) -> str:
+    """Return one canonical generation for reusable non-source render state."""
+    if not isinstance(runtime_inventory, RuntimeInventory):
+        raise InventoryError('runtime_inventory_invalid', 'A non-source runtime inventory is required')
+    if (not isinstance(runtime_inventory.hashes, dict)
+            or set(runtime_inventory.hashes) != set(RUNTIME_HASH_NAMES)
+            or any(not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{64}', value)
+                   for value in runtime_inventory.hashes.values())):
+        raise InventoryError('runtime_inventory_invalid', 'Runtime content inventory is incomplete')
+    if (not isinstance(runtime_inventory.versions, dict)
+            or set(runtime_inventory.versions) != set(VERSION_NAMES)
+            or any(not isinstance(value, str) or not re.fullmatch(r'[0-9A-Za-z.+_~!-]{1,80}', value)
+                   for value in runtime_inventory.versions.values())):
+        raise InventoryError('runtime_inventory_invalid', 'Runtime version inventory is incomplete')
+    if not isinstance(context, Mapping) or set(context) != set(RUNTIME_CONTEXT_NAMES):
+        raise InventoryError('runtime_context_invalid', 'Runtime generation context is incomplete')
+    execution = context['execution_paths']
+    if not isinstance(execution, Mapping) or set(execution) != set(RUNTIME_EXECUTION_PATH_NAMES):
+        raise InventoryError('runtime_context_invalid', 'Runtime execution paths are incomplete')
+    normalized_execution = {
+        name: _generation_path(execution[name], 'execution_paths.' + name)
+        for name in RUNTIME_EXECUTION_PATH_NAMES
+    }
+    limits = context['limits']
+    if not isinstance(limits, Mapping) or set(limits) != set(RUNTIME_LIMIT_NAMES):
+        raise InventoryError('runtime_context_invalid', 'Runtime limits are incomplete')
+    max_duration = limits['max_duration_s']
+    max_download = limits['max_download_bytes']
+    if (type(max_duration) is not int or not 30 <= max_duration <= 300
+            or type(max_download) is not int or not 1024 <= max_download <= 64 * 1024 * 1024):
+        raise InventoryError('runtime_context_invalid', 'Runtime duration/download limits are invalid')
+    policy = context['parameter_policy']
+    if not isinstance(policy, Mapping) or not policy:
+        raise InventoryError('runtime_context_invalid', 'Parameter policy must be a non-empty object')
+    document = {
+        'schema': 'sing-runtime-generation-v1',
+        'hashes': {name: runtime_inventory.hashes[name] for name in RUNTIME_HASH_NAMES},
+        'versions': {name: runtime_inventory.versions[name] for name in VERSION_NAMES},
+        'context': {
+            'execution_paths': normalized_execution,
+            'artifact_root': _generation_path(context['artifact_root'], 'artifact_root'),
+            'limits': {'max_duration_s': max_duration, 'max_download_bytes': max_download},
+            'parameter_policy': _normalize_policy(policy),
+        },
+    }
+    raw = json.dumps(document, sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+                     allow_nan=False).encode('utf-8')
+    if len(raw) > 65536:
+        raise InventoryError('runtime_context_oversized', 'Runtime generation context exceeds 64KiB')
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _safe_path(path: Path) -> None:
@@ -222,15 +337,7 @@ class AssetInventory:
         if not callable(version_provider):
             raise ValueError('A runtime version provider is required')
 
-    def build(self, source: Path) -> Inventory:
-        assets = {'source': Path(source), **self.paths.documents()}
-        if set(assets) != set(HASH_NAMES):
-            raise InventoryError('asset_inventory_invalid', 'Render asset inventory is incomplete')
-        if self.paths.rvc_upstream != self.paths.rvc_script.parent / 'upstream':
-            raise InventoryError('rvc_upstream_mismatch', 'Inventoried RVC upstream is not the wrapper-imported sibling')
-        validate_demucs_repo(self.paths.demucs_repo)
-        hashes = {name: sha256_asset(path, source_tree=name == 'rvc_upstream')
-                  for name, path in assets.items()}
+    def _versions(self) -> Dict[str, str]:
         try:
             supplied = dict(self.version_provider())
         except InventoryError:
@@ -239,5 +346,23 @@ class AssetInventory:
             raise InventoryError('runtime_probe_failed', 'Runtime version inventory failed') from exc
         if set(supplied) != set(VERSION_NAMES):
             raise InventoryError('runtime_version_missing', 'Runtime inventory is incomplete')
-        versions = {name: _version_token(supplied[name]) for name in VERSION_NAMES}
-        return Inventory(hashes=hashes, versions=versions)
+        return {name: _version_token(supplied[name]) for name in VERSION_NAMES}
+
+    def build_runtime(self) -> RuntimeInventory:
+        """Hash every reusable non-source input without inventing a fake source."""
+        assets = self.paths.documents()
+        if set(assets) != set(RUNTIME_HASH_NAMES):
+            raise InventoryError('asset_inventory_invalid', 'Runtime asset inventory is incomplete')
+        if self.paths.rvc_upstream != self.paths.rvc_script.parent / 'upstream':
+            raise InventoryError('rvc_upstream_mismatch', 'Inventoried RVC upstream is not the wrapper-imported sibling')
+        validate_demucs_repo(self.paths.demucs_repo)
+        hashes = {name: sha256_asset(assets[name], source_tree=name == 'rvc_upstream')
+                  for name in RUNTIME_HASH_NAMES}
+        return RuntimeInventory(hashes=hashes, versions=self._versions())
+
+    def build(self, source: Path) -> Inventory:
+        runtime = self.build_runtime()
+        hashes = {'source': sha256_asset(Path(source)), **runtime.hashes}
+        if set(hashes) != set(HASH_NAMES):
+            raise InventoryError('asset_inventory_invalid', 'Render asset inventory is incomplete')
+        return Inventory(hashes=hashes, versions=dict(runtime.versions))
