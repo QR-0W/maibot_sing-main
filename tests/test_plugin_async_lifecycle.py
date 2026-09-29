@@ -431,6 +431,40 @@ async def test_speak_preserves_single_sender_receipt(plugin,outcome,message_id,e
 
 
 @pytest.mark.asyncio
+async def test_model_list_uses_active_snapshot_and_never_sidecar(plugin):
+    instance,sends=plugin
+    await instance.on_load()
+    try:
+        class ForbiddenSidecar:
+            async def list_models(self):
+                raise AssertionError('disabled sidecar model listing must not be used')
+            async def close(self):
+                pass
+        instance._rvc=ForbiddenSidecar()
+        active_name=Path(instance._active_cover.model_path).name
+        data=instance.get_plugin_config_data()
+        data['local']['model_path']=str(Path(instance.ctx.paths.data_dir)/'changed-after-await.pth')
+        instance.set_plugin_config(data)
+        result=await instance.handle_list_models(stream_id='stream-1')
+        assert result[0] is True and active_name in sends[-1][0]
+        assert 'changed-after-await.pth' not in sends[-1][0]
+        assert '不代表角色身份、训练来源或使用权已经验证' in sends[-1][0]
+    finally:
+        await instance.on_unload()
+
+
+@pytest.mark.asyncio
+async def test_model_list_reports_not_ready_without_sidecar(plugin):
+    instance,sends=plugin
+    class ForbiddenSidecar:
+        async def list_models(self):
+            raise AssertionError('unready model listing must not access sidecar')
+    instance._rvc=ForbiddenSidecar()
+    result=await instance.handle_list_models(stream_id='stream-1')
+    assert result[0] is False and '尚未就绪或正在重载' in sends[-1][0]
+
+
+@pytest.mark.asyncio
 async def test_missing_demucs_bundle_fails_before_scheduler_or_qq(plugin):
     instance, _ = plugin
     repo = Path(instance.config.local.demucs_repo_path)

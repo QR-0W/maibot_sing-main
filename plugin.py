@@ -1115,24 +1115,17 @@ class SingPlugin(MaiBotPlugin):
         pattern=r"^(?P<pfx>\S)音色列表$",
     )
     async def handle_list_models(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
-        if self._local is not None:
-            await self.ctx.send.text(f"本地固定音色：{self._local.model.name}（Natsume Iroha）", stream_id)
-            return True, "本地音色列表", True
-        if self._rvc is None:
-            await self.ctx.send.text("RVC 客户端未初始化", stream_id)
-            return False, "RVC 客户端未初始化", True
-        try:
-            models = await self._rvc.list_models()
-        except Exception as exc:
-            self.ctx.logger.exception("获取音色列表失败")
-            await self.ctx.send.text(f"获取音色列表失败：{exc}", stream_id)
-            return False, str(exc), True
-        if not models:
-            await self.ctx.send.text("未找到音色模型（请检查 rvc_root 下的 assets/weights）", stream_id)
-            return False, "无模型", True
-        lines = ["可用音色模型："] + [f"  {name}" for name in models]
-        await self.ctx.send.text("\n".join(lines), stream_id)
-        return True, f"列出 {len(models)} 个模型", True
+        del kwargs
+        active=self._active_cover
+        if active is None:
+            message='持久化音色服务尚未就绪或正在重载。'
+            await self.ctx.send.text(message,stream_id)
+            return False,message,True
+        name=Path(active.model_path).name
+        message=(f'管理员固定音色模型文件：{name}。'
+                 '该文件名不代表角色身份、训练来源或使用权已经验证。')
+        await self.ctx.send.text(message,stream_id)
+        return True,message,True
 
     @Command(
         "qq音乐登录",
