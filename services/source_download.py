@@ -33,19 +33,31 @@ _HOST_SUFFIXES = {
 
 
 def _safe_url(raw, provider):
-    """Reject credentials, private hosts, non-TLS and non-provider redirects."""
-    if provider not in _HOST_SUFFIXES or not isinstance(raw, str) or len(raw) > 4096:
+    """Validate provider authority before a same-resource, one-way TLS upgrade.
+
+    Some official resolvers advertise HTTP CDN URLs even though the exact host,
+    path and signed query support HTTPS. Only the scheme may change: never use
+    cleartext, rewrite an authority/port, or substitute another recording.
+    The same rule applies to every redirect, not only the initial source URL.
+    """
+    if (provider not in _HOST_SUFFIXES or not isinstance(raw, str) or len(raw) > 4096
+            or any(ord(char) <= 32 or ord(char) == 127 for char in raw)):
         raise DownloadError('source_url_rejected', 'Untrusted playback location')
     try:
         parsed = urlsplit(raw)
         host = parsed.hostname
-        if (parsed.scheme != 'https' or not host or parsed.username or parsed.password or
-                parsed.port not in (None, 443) or not any(host.endswith(suffix) and host != suffix[1:]
-                for suffix in _HOST_SUFFIXES[provider]) or parsed.fragment):
+        allowed_port = (parsed.port is None if parsed.scheme == 'http'
+                        else parsed.port in (None, 443))
+        if (parsed.scheme not in ('http', 'https') or not host or parsed.username is not None
+                or parsed.password is not None or not allowed_port
+                or not any(host.endswith(suffix) and host != suffix[1:]
+                           for suffix in _HOST_SUFFIXES[provider]) or parsed.fragment):
             raise DownloadError('source_url_rejected', 'Playback host is outside the configured provider')
     except ValueError as exc:
         raise DownloadError('source_url_rejected','Invalid playback location') from exc
-    return raw
+    # Preserve every byte after the scheme, including percent escapes and an
+    # empty query delimiter. Explicit HTTP ports are refused rather than edited.
+    return 'https' + raw[raw.index(':'):] if parsed.scheme == 'http' else raw
 
 
 def _prepare_destination(workspace, target, max_bytes):

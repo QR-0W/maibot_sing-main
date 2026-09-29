@@ -65,8 +65,11 @@ async def test_exact_id_and_stream_saves_hash_without_url_in_metadata(tmp_path,g
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('bad',[
- 'file:///etc/passwd','http://cdn.music.126.net/a','https://cdn.music.126.net.evil.example/a',
- 'https://localhost/a','https://cdn.music.126.net:8080/a','https://user:password@cdn.music.126.net/a'])
+ 'file:///etc/passwd','http://cdn.music.126.net:80/a','https://cdn.music.126.net.evil.example/a',
+ 'https://localhost/a','https://cdn.music.126.net:8080/a','https://user:password@cdn.music.126.net/a',
+ 'http://cdn.music.126.net:443/a','http://cdn.music.126.net.evil.example/a',
+ 'http://user:password@cdn.music.126.net/a','http://cdn.music.126.net/a#fragment',
+ 'http://localhost/a'])
 async def test_bad_source_url_never_downloaded(tmp_path,gateway,bad):
     client,catalogue=gateway
     calls=[]
@@ -79,6 +82,67 @@ async def test_bad_source_url_never_downloaded(tmp_path,gateway,bad):
     assert exc.value.code in ('source_url_rejected','source_protocol_error') and len(calls)==1
     assert not (tmp_path/'source.audio').exists()
     assert not list(tmp_path.glob('*.part'))
+
+
+@pytest.mark.parametrize('provider,raw',[
+    ('163','http://cdn.music.126.net/track%2F1.mp3?sig=a%2Fb%3D&track=1'),
+    ('qq','http://dl.stream.qqmusic.qq.com/track.m4a?sig=a%2Fb%3D'),
+    ('163','http://cdn.music.126.net/track.mp3?'),
+])
+def test_tls_upgrade_changes_only_scheme(provider,raw):
+    assert source._safe_url(raw,provider)=='https'+raw[len('http'):]
+    assert source._safe_url('https'+raw[len('http'):],provider)=='https'+raw[len('http'):]
+
+
+@pytest.mark.parametrize('raw',[
+    ' http://cdn.music.126.net/a','http://cdn.music.126.net/\tfile',
+    'http://cdn.music.126.net/a\r\nheader','http://@cdn.music.126.net/a',
+])
+def test_malformed_url_is_rejected_before_tls_upgrade(raw):
+    with pytest.raises(source.DownloadError):
+        source._safe_url(raw,'163')
+
+
+@pytest.mark.asyncio
+async def test_http_cdn_and_redirect_use_only_same_resource_https(tmp_path,gateway):
+    client,catalogue=gateway; calls=[]
+    first='http://cdn.music.126.net/track.mp3?sig=private%2F1'
+    redirected='http://node.music.126.net/track.mp3?sig=private%2F2'
+    def handler(request):
+        calls.append(str(request.url))
+        if request.url.host=='music.163.com':
+            assert request.url.params['ids']=='[1]'
+            return httpx.Response(200,json={'code':200,'data':[{'id':1,'url':first,'size':2048}]})
+        assert request.url.scheme=='https'
+        if request.url.host=='cdn.music.126.net':
+            assert str(request.url)=='https'+first[len('http'):]
+            return httpx.Response(302,headers={'location':redirected})
+        assert str(request.url)=='https'+redirected[len('http'):]
+        return httpx.Response(200,content=b'T'*2048)
+    mock(client,handler)
+    path,digest,amount=await source.download_selected(catalogue,chosen(),tmp_path)
+    assert amount==2048 and digest==hashlib.sha256(b'T'*2048).hexdigest()
+    assert path.read_bytes()==b'T'*2048 and len(calls)==3
+    assert all(url.startswith('https://') for url in calls)
+    assert not list(tmp_path.glob('*.json'))  # signed locations stay ephemeral
+
+
+@pytest.mark.asyncio
+async def test_tls_failure_never_retries_cleartext_or_another_track(tmp_path,gateway):
+    client,catalogue=gateway; calls=[]
+    def handler(request):
+        calls.append(request)
+        if request.url.host=='music.163.com':
+            return httpx.Response(200,json={'code':200,'data':[
+                {'id':1,'url':'http://cdn.music.126.net/track.mp3?sig=private'}]})
+        assert request.url.scheme=='https'
+        raise httpx.ConnectError('TLS unavailable',request=request)
+    mock(client,handler)
+    with pytest.raises(source.DownloadError) as exc:
+        await source.download_selected(catalogue,chosen(),tmp_path)
+    assert exc.value.code=='source_network_error'
+    assert len(calls)==2 and all(request.url.scheme=='https' for request in calls)
+    assert not (tmp_path/'source.audio').exists()
 
 
 @pytest.mark.asyncio
