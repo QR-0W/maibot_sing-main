@@ -80,7 +80,8 @@ def execute(root, recipe, stage, argv, inputs, outputs, *, timeout_s, lock_path,
     started = time.monotonic()
 
     def report(state, **extra):
-        value = {'stage': stage, 'state': state,
+        value = {'stage': stage, 'state': state, 'recipe': recipe,
+                 'unit': os.environ.get('MAIBOT_SING_UNIT'),
                  'elapsed_s': round(time.monotonic()-started, 3), **extra}
         atomic_status(status, value)
         return value

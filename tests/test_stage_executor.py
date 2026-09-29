@@ -55,6 +55,7 @@ def test_failure_retains_output_and_structured_state(tmp_path):
     assert not (tmp_path/'.receipts/convert_000.json').exists()
     status=json.loads((tmp_path/'.receipts/convert_000.status.json').read_text())
     assert status['state']=='failed' and status['code']=='stage_exit'
+    assert status['recipe']=='a'*64 and status['unit'] is None
     with pytest.raises(module.StageFailure,match='Existing unsealed output'):
         execute(tmp_path, [sys.executable, '-c', program])
 
@@ -68,6 +69,7 @@ def test_timeout_terminates_and_does_not_seal(tmp_path):
     assert not (tmp_path/'.receipts/convert_000.json').exists()
     status=json.loads((tmp_path/'.receipts/convert_000.status.json').read_text())
     assert status['state']=='failed' and status['code']=='stage_timeout'
+    assert status['recipe']=='a'*64 and status['unit'] is None
 
 
 def test_unknown_output_contract_is_not_reused(tmp_path):

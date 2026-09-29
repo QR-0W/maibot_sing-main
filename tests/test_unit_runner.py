@@ -42,6 +42,22 @@ class FakeProcess:
     async def communicate(self): return self.raw,b''
 
 
+def test_launch_witness_is_versioned_and_bounded(tmp_path):
+    unit=module.UnitRunner.name('a'*32,'convert_000')
+    logs=tmp_path/'unit-logs';logs.mkdir()
+    path=logs/(unit+'.exit.json')
+    assert module.UnitRunner.launch_witness(tmp_path,unit) is None
+    witness={'schema':2,'completed':True,'returncode':1,
+             'service':{'Result':'oom-kill','ExecMainStatus':'9'}}
+    path.write_text(json.dumps(witness))
+    assert module.UnitRunner.launch_witness(tmp_path,unit)==witness
+    assert module.UnitRunner.launch_finished(tmp_path,unit)
+    path.write_text(json.dumps({**witness,'schema':1}))
+    with pytest.raises(module.UnitError) as exc:
+        module.UnitRunner.launch_witness(tmp_path,unit)
+    assert exc.value.code=='launch_witness_invalid'
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('raw,code,result',[
     (b'LoadState=not-found\nActiveState=inactive\n',0,'absent'),

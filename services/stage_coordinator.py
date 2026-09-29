@@ -7,11 +7,13 @@ retain the slot while active/unknown, and never silently retry partial media.
 from pathlib import Path
 from typing import Dict
 import asyncio
+import json
 import re
 
 from ..runtime.stage_receipts import CheckpointError, StageReceipts
 from .job_store import JobConflict, JobStore
 from .ownership import exclusive, OwnershipBusy
+from .stage_errors import classify_failure, failure_document, INTERRUPTED_CODES
 from .unit_runner import UnitError, UnitRunner
 
 
@@ -40,17 +42,36 @@ class StageCoordinator:
             expected_unit=job.unit_name,expected_revision=job.revision)
         return {'unit':job.unit_name,'state':result.state}
 
-    async def _settle(self, owner, workspace, recipe, step):
+    def _failure(self, workspace, owner, recipe, step, fallback_code=None):
+        witness=UnitRunner.launch_witness(workspace,owner.unit_name)
+        path=workspace/'.receipts'/(step.name+'.status.json')
+        status=None
+        try:
+            if path.is_file() and not path.is_symlink() and path.stat().st_size<=4096:
+                status=json.loads(path.read_text(encoding='utf-8'))
+        except (OSError,ValueError,TypeError):
+            status=None
+        error=classify_failure(stage=step.name,unit=owner.unit_name,recipe=recipe,
+                               witness=witness,status=status)
+        if error['code'] in ('unit_result_missing','unit_result_invalid') and fallback_code:
+            error=failure_document(fallback_code,step.name)
+        return error
+
+    async def _settle(self, owner, workspace, recipe, step, fallback_code=None):
         try:
             valid=await self._verified(workspace,recipe,step)
         except (CheckpointError,OSError):
             valid=False
+        error=None if valid else self._failure(workspace,owner,recipe,step,fallback_code)
         settled=await asyncio.to_thread(self.store.settle_step,owner.id,owner.run_token,
                                         owner.unit_name,completed=valid)
         if settled.state=='cancel_requested':
             return await self._cancelled(settled)
         if not valid:
-            raise UnitError('stage_interrupted','Worker ended without a verified receipt; no automatic retry')
+            await asyncio.to_thread(self.store.finish_failure,owner.id,owner.run_token,error,
+                expected_unit=settled.unit_name,expected_revision=settled.revision,
+                interrupted=error['code'] in INTERRUPTED_CODES)
+            raise UnitError(error['code'],error['message'])
         return {'unit':owner.unit_name,'state':'completed','reused':True}
 
     async def run_step(self, job_id: str, stream_id: str, run_token: str,
@@ -113,10 +134,10 @@ class StageCoordinator:
             raise UnitError('unit_status_unknown','Existing unit lacks a launch record')
         try:
             result=await self.runner.run(unit,plan,step,workspace,ownership_fd=ownership_fd)
-        except UnitError:
+        except UnitError as exc:
             state=await self.runner.state(unit)
             if state=='stopped' or (state=='absent' and UnitRunner.launch_finished(workspace,unit)):
-                return await self._settle(owner,workspace,recipe,step)
+                return await self._settle(owner,workspace,recipe,step,exc.code)
             raise
         state=await self.runner.state(unit)
         if state not in ('absent','stopped') or not UnitRunner.launch_finished(workspace,unit):

@@ -65,14 +65,71 @@ async def test_stopped_unit_with_missing_receipt_becomes_interrupted(work):
     (logdir/(result['unit']+'.log')).write_text('synthetic stopped worker')
     (folder/'output.bin').write_bytes(b'partial, preserve me')
     (logdir/(result['unit']+'.exit.json')).write_text(json.dumps(
-        {'schema':1,'completed':True,'returncode':0}))
+        {'schema':2,'completed':True,'returncode':0,'service':{'Result':'success'}}))
     runner.current='absent'
-    with pytest.raises(runner_module.UnitError,match='no automatic retry'):
+    with pytest.raises(runner_module.UnitError) as exc:
         await coordinator.StageCoordinator(store,runner).run_step(
             run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
+    assert exc.value.code=='unit_result_missing'
     assert store.stage_attempts(run.id,run.stream_id)[0]['status']=='interrupted'
+    terminal=store.get(run.id,run.stream_id)
+    assert terminal.state=='interrupted' and terminal.error['code']=='unit_result_missing'
     assert (folder/'output.bin').read_bytes()==b'partial, preserve me'
     assert runner.starts==0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('systemd_result,worker_code,expected,state',[
+    ('exit-code','stage_timeout','stage_timeout','interrupted'),
+    ('exit-code','stage_exit','stage_exit','failed'),
+    ('oom-kill','stage_exit','unit_oom','failed'),
+    ('timeout','stage_exit','unit_timeout','interrupted'),
+    ('signal','stage_exit','unit_signal','interrupted')])
+async def test_specific_failure_survives_reconciliation(work,systemd_result,worker_code,expected,state):
+    store,run,folder,step=work
+    runner=StubUnitRunner('active')
+    claimed=await coordinator.StageCoordinator(store,runner).run_step(
+        run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
+    logs=folder/'unit-logs';logs.mkdir()
+    (logs/(claimed['unit']+'.log')).write_text('private diagnostics')
+    (logs/(claimed['unit']+'.exit.json')).write_text(json.dumps(
+        {'schema':2,'completed':True,'returncode':1,'service':{'Result':systemd_result}}))
+    status={'stage':step.name,'state':'failed','recipe':'a'*64,'unit':claimed['unit'],
+            'elapsed_s':1.0,'code':worker_code,'message':'private raw failure detail'}
+    receipt_dir=folder/'.receipts';receipt_dir.mkdir(exist_ok=True)
+    (receipt_dir/(step.name+'.status.json')).write_text(json.dumps(status))
+    runner.current='absent'
+    with pytest.raises(runner_module.UnitError) as exc:
+        await coordinator.StageCoordinator(store,runner).run_step(
+            run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
+    assert exc.value.code==expected
+    terminal=store.get(run.id,run.stream_id)
+    assert terminal.state==state and terminal.error['code']==expected
+    assert terminal.error['stage']==step.name
+    assert terminal.error['message'] and 'private raw failure detail' not in terminal.error['message']
+    assert store.claim_next() is None
+
+
+@pytest.mark.asyncio
+async def test_stale_status_from_prior_unit_never_supplies_failure_cause(work):
+    store,run,folder,step=work
+    runner=StubUnitRunner('active')
+    claimed=await coordinator.StageCoordinator(store,runner).run_step(
+        run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
+    logs=folder/'unit-logs';logs.mkdir()
+    (logs/(claimed['unit']+'.log')).write_text('private diagnostics')
+    (logs/(claimed['unit']+'.exit.json')).write_text(json.dumps(
+        {'schema':2,'completed':True,'returncode':1,'service':{'Result':'exit-code'}}))
+    receipt_dir=folder/'.receipts';receipt_dir.mkdir(exist_ok=True)
+    (receipt_dir/(step.name+'.status.json')).write_text(json.dumps(
+        {'stage':step.name,'state':'failed','recipe':'a'*64,'unit':'maibot-sing-'+('f'*32)+'-convert_000',
+         'code':'stage_timeout','message':'stale','elapsed_s':1.0}))
+    runner.current='absent'
+    with pytest.raises(runner_module.UnitError) as exc:
+        await coordinator.StageCoordinator(store,runner).run_step(
+            run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
+    assert exc.value.code=='unit_exit'
+    assert store.get(run.id,run.stream_id).error['code']=='unit_exit'
 
 
 @pytest.mark.asyncio
@@ -87,7 +144,7 @@ async def test_receipt_committed_before_crash_is_recognized(work):
     inp=receipts.sha256(folder/'input.bin')
     receipts.StageReceipts(folder,'a'*64).seal(step.name,{'input.bin':inp},['output.bin'])
     (logdir/(result['unit']+'.exit.json')).write_text(json.dumps(
-        {'schema':1,'completed':True,'returncode':0}))
+        {'schema':2,'completed':True,'returncode':0,'service':{'Result':'success'}}))
     runner.current='absent'
     closed=await coordinator.StageCoordinator(ledger.JobStore(store.path),runner).run_step(
         run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
@@ -109,7 +166,7 @@ async def test_launch_gap_is_owned_not_interrupted(work):
             (workspace/'output.bin').write_bytes(b'completed')
             inp=receipts.sha256(workspace/'input.bin')
             receipts.StageReceipts(workspace,'a'*64).seal(step.name,{'input.bin':inp},['output.bin'])
-            (logs/(unit+'.exit.json')).write_text(json.dumps({'schema':1,'completed':True,'returncode':0}))
+            (logs/(unit+'.exit.json')).write_text(json.dumps({'schema':2,'completed':True,'returncode':0,'service':{'Result':'success'}}))
             return {'status':{'reused':False}}
     runner=PausedLauncher('absent')
     first=coordinator.StageCoordinator(store,runner)
@@ -163,7 +220,7 @@ async def test_cancel_reopen_reconciles_old_unit_without_new_launch(work):
     with pytest.raises(runner_module.UnitError,match='witness'):
         await restarted.run_step(run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
     assert store.claim_next() is None
-    (logs/(owner.unit_name+'.exit.json')).write_text(json.dumps({'schema':1,'completed':True,'returncode':1}))
+    (logs/(owner.unit_name+'.exit.json')).write_text(json.dumps({'schema':2,'completed':True,'returncode':1,'service':{'Result':'exit-code'}}))
     result=await restarted.run_step(run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
     assert result['state']=='cancelled' and runner.starts==0
     assert store.claim_next().id==next_job.id

@@ -107,22 +107,32 @@ class UnitRunner:
         raise UnitError('unit_status_unknown','Unexpected systemd service state')
 
     @staticmethod
-    def launch_finished(workspace: Path, unit: str) -> bool:
+    def launch_witness(workspace: Path, unit: str):
         _safe_unit(unit)
         path=workspace/'unit-logs'/(unit+'.exit.json')
         StageReceipts._safe(path)
         if not path.exists():
-            return False
-        if not path.is_file() or path.stat().st_size>1024:
+            return None
+        if not path.is_file() or path.stat().st_size>4096:
             raise UnitError('launch_witness_invalid','Invalid launch witness')
         try:
             data=json.loads(path.read_text(encoding='utf-8'))
-            if (not isinstance(data,dict) or set(data)!={'schema','completed','returncode'}
-                    or data['schema']!=1 or type(data['completed']) is not bool):
+            if (not isinstance(data,dict) or set(data)!={'schema','completed','returncode','service'}
+                    or data['schema']!=2 or type(data['completed']) is not bool
+                    or not isinstance(data['service'],dict)
+                    or set(data['service'])-{'LoadState','ActiveState','Result','ExecMainCode','ExecMainStatus'}
+                    or any(not isinstance(value,str) or len(value)>80 for value in data['service'].values())):
                 raise ValueError('Bad witness schema')
-            return data['completed'] and type(data['returncode']) is int
+            if data['completed'] is not (type(data['returncode']) is int):
+                raise ValueError('Inconsistent witness completion')
+            return data
         except (OSError,ValueError,TypeError) as exc:
             raise UnitError('launch_witness_invalid','Invalid launch witness') from exc
+
+    @staticmethod
+    def launch_finished(workspace: Path, unit: str) -> bool:
+        witness=UnitRunner.launch_witness(workspace,unit)
+        return witness is not None and witness['completed']
 
     async def run(self, unit: str, plan_path: Path, step, workspace: Path, *,
                   ownership_fd: int) -> Dict[str, Any]:
@@ -147,10 +157,11 @@ class UnitRunner:
         logfile=logs/(unit+'.log')
         fd=os.open(logfile,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
         try:
-            argv=['systemd-run','--user','--wait','--pipe','--collect','--unit',unit,
+            argv=['systemd-run','--user','--wait','--pipe','--unit',unit,
                 '-p','MemoryMax=4G','-p','MemoryHigh=3G','-p','MemorySwapMax=0',
                 '-p','CPUQuota=150%','-p','TasksMax=64','-p','TimeoutStopSec=15',
                 '-p','RuntimeMaxSec='+str(step.unit_limit_s),
+                '-p','Environment=MAIBOT_SING_UNIT='+unit,
                 str(self.python),str(self.executor),'--plan',str(plan_path),'--stage',step.name]
             launcher=self.executor.with_name('unit_launcher.py')
             if not launcher.is_file() or launcher.is_symlink():
@@ -174,15 +185,16 @@ class UnitRunner:
             raise UnitError('unit_result_missing','Unit ended but did not write a valid stage result')
         try:
             data=json.loads(status.read_text(encoding='utf-8'))
+            document=json.loads(plan_path.read_text(encoding='utf-8'))
         except (OSError,ValueError) as exc:
-            raise UnitError('unit_result_invalid','Stage result could not be decoded') from exc
-        if code or data.get('state')!='completed' or data.get('stage')!=step.name:
+            raise UnitError('unit_result_invalid','Stage result or plan could not be decoded') from exc
+        if (document.get('workspace')!=str(workspace) or data.get('stage')!=step.name
+                or data.get('recipe')!=document.get('recipe') or data.get('unit')!=unit):
+            raise UnitError('unit_result_invalid','Stage result is not bound to this unit and recipe')
+        if code or data.get('state')!='completed':
             raise UnitError(str(data.get('code') or 'unit_failed'),
                 'Stage %s failed; detail is in its bounded local job status' % step.name)
         try:
-            document=json.loads(plan_path.read_text(encoding='utf-8'))
-            if document.get('workspace')!=str(workspace):
-                raise UnitError('plan_mismatch','Plan workspace changed during execution')
             receipts=StageReceipts(workspace,document['recipe'])
             current=receipts._files(list(step.inputs)) if step.inputs else {}
             inputs={name:record['sha256'] for name,record in current.items()}
