@@ -92,8 +92,17 @@ def make_service(tmp_path, *, store=None, catalogue=None, coordinator=None,
     catalogue = catalogue or FakeCatalogue()
     files = {}
     for number, name in enumerate(name for name in recipes.HASH_NAMES if name != 'source'):
-        path = tmp_path / ('asset-' + name)
-        if not path.exists():
+        path = tmp_path / ('upstream' if name == 'rvc_upstream' else 'asset-' + name)
+        if name == 'rvc_upstream':
+            if not path.exists():
+                path.mkdir()
+                (path / 'infer.py').write_text('synthetic wrapper source')
+        elif name == 'demucs_repo':
+            if not path.exists():
+                path.mkdir()
+                (path / 'htdemucs.yaml').write_text("models: ['955717e8']\n")
+                (path / '955717e8-8726e21a.th').write_bytes(b'no actual model import')
+        elif not path.exists():
             path.write_bytes(('real-' + name + '-' + str(number)).encode())
         files[name] = path
     python = tmp_path / 'worker-python'
@@ -107,7 +116,7 @@ def make_service(tmp_path, *, store=None, catalogue=None, coordinator=None,
         work_root=work_root, worker_python=python,
         worker_script=paths.media_stage, rvc_script=paths.rvc_script,
         model=paths.model, index=paths.index, hubert=paths.hubert,
-        inference_lock=inference_lock, poll_interval_s=.05)
+        demucs_repo=paths.demucs_repo, inference_lock=inference_lock, poll_interval_s=.05)
     coordinator = coordinator or FakeCoordinator(store, pause_first=pause_first)
     calls = []
 

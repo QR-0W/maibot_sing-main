@@ -26,7 +26,8 @@ def prepared(tmp_path):
     root=tmp_path/'library';root.mkdir()
     (work/'source.audio').write_bytes(b'fixed synthetic source bytes')
     paths=dict(workspace=str(work),worker_python='/python',worker_script='/media.py',
-               rvc_script='/rvc.py',model='/model.pth',index='/index',hubert='/hubert.pt')
+               rvc_script='/rvc.py',model='/model.pth',index='/index',hubert='/hubert.pt',
+                demucs_repo='/offline-model-repo')
     plan=plan_module.build_plan(**paths,frames=31*44100,instrumental=True)
     hashes={k:format(i+1,'064x') for i,k in enumerate(recipes.HASH_NAMES)}
     hashes['source']=receipts.sha256(work/'source.audio')

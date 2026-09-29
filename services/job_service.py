@@ -47,6 +47,7 @@ class RenderRuntime:
     model: Path
     index: Path
     hubert: Path
+    demucs_repo: Path
     inference_lock: Path
     max_download_bytes: int = 64 * 1024 * 1024
     max_duration_s: int = 300
@@ -55,7 +56,7 @@ class RenderRuntime:
     def __post_init__(self):
         paths = (self.work_root, self.worker_python, self.worker_script,
                  self.rvc_script, self.model, self.index, self.hubert,
-                 self.inference_lock)
+                 self.demucs_repo, self.inference_lock)
         if any(not Path(path).is_absolute() for path in paths):
             raise ValueError('Job runtime paths must be absolute')
         if (type(self.max_download_bytes) is not int
@@ -404,7 +405,8 @@ class JobService:
         return {'workspace': workspace, 'worker_python': self.runtime.worker_python,
                 'worker_script': self.runtime.worker_script,
                 'rvc_script': self.runtime.rvc_script, 'model': self.runtime.model,
-                'index': self.runtime.index, 'hubert': self.runtime.hubert}
+                'index': self.runtime.index, 'hubert': self.runtime.hubert,
+                'demucs_repo': self.runtime.demucs_repo}
 
     def _read_frozen(self, workspace: Path, selected: CatalogueItem):
         recipe_path, plan_path = workspace / 'recipe.json', workspace / 'plan.json'

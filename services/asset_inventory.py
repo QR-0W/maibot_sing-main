@@ -28,7 +28,7 @@ class AssetPaths:
     model: Path
     index: Path
     hubert: Path
-    demucs_weights: Path
+    demucs_repo: Path
     rvc_script: Path
     rvc_upstream: Path
     media_stage: Path
@@ -69,7 +69,36 @@ def _hash_file(path: Path, digest) -> int:
     return count
 
 
-def sha256_asset(path: Path, *, max_files: int = 20000) -> str:
+def validate_demucs_repo(root: Path) -> Path:
+    """Check Demucs 4 LocalRepo+BagOnlyRepo's exact htdemucs lookup.
+
+    Its bag references signature 955717e8 and LocalRepo resolves the signed
+    checkpoint filename 955717e8-8726e21a.th.  No torch import or deserialization
+    occurs during this bounded structural check; Demucs verifies checksum on load.
+    """
+    root = Path(root)
+    _safe_path(root)
+    if not root.is_dir():
+        raise InventoryError('demucs_repo_missing', 'Configured local Demucs repo is not a directory')
+    expected = {'htdemucs.yaml', '955717e8-8726e21a.th'}
+    try:
+        entries = list(root.iterdir())
+        if {path.name for path in entries} != expected:
+            raise InventoryError('demucs_repo_invalid', 'Demucs repo must contain only the htdemucs bag and referenced checkpoint')
+        if any(path.is_symlink() or not path.is_file() for path in entries):
+            raise InventoryError('demucs_repo_invalid', 'Demucs repo requires regular non-symlink files')
+        bag, checkpoint = root / 'htdemucs.yaml', root / '955717e8-8726e21a.th'
+        if not 0 < bag.stat().st_size <= 512 or checkpoint.stat().st_size <= 0:
+            raise InventoryError('demucs_repo_invalid', 'Demucs bag or checkpoint is empty/oversized')
+        document = bag.read_text(encoding='utf-8')
+        if not re.fullmatch(r'''\s*models:\s*\[\s*(?:'955717e8'|"955717e8"|955717e8)\s*\]\s*''', document):
+            raise InventoryError('demucs_repo_invalid', 'htdemucs bag must reference exactly the local 955717e8 checkpoint')
+    except (OSError, UnicodeError) as exc:
+        raise InventoryError('demucs_repo_invalid', 'Local Demucs repo could not be inspected') from exc
+    return root
+
+
+def sha256_asset(path: Path, *, max_files: int = 20000, source_tree: bool = False) -> str:
     """Hash one regular file or a deterministic, symlink-free directory tree."""
     path = Path(path)
     _safe_path(path)
@@ -87,8 +116,12 @@ def sha256_asset(path: Path, *, max_files: int = 20000) -> str:
         entries = sorted(path.rglob('*'), key=lambda item: item.relative_to(path).as_posix())
         for item in entries:
             relative = item.relative_to(path).as_posix()
+            # Python imports regenerate bytecode and git updates housekeeping;
+            # these are not source dependencies. Never exclude actual .py bytes.
             if item.is_symlink():
                 raise InventoryError('asset_symlink', 'Symlinked render assets are refused')
+            if source_tree and any(part in ('__pycache__', '.git') for part in item.relative_to(path).parts):
+                continue
             encoded = relative.encode('utf-8')
             if item.is_dir():
                 digest.update(b'D\0' + encoded + b'\0')
@@ -144,7 +177,9 @@ names = {
  "numpy": ("numpy",), "torch": ("torch",), "torchaudio": ("torchaudio",),
  "demucs": ("demucs",), "soundfile": ("soundfile",), "librosa": ("librosa",),
  "pyworld": ("pyworld",), "faiss": ("faiss-cpu", "faiss-gpu", "faiss"),
- "fairseq": ("fairseq",),
+ "fairseq": ("fairseq",), "scipy": ("scipy",),
+  "praat-parselmouth": ("praat-parselmouth",), "torchcrepe": ("torchcrepe",),
+  "omegaconf": ("omegaconf",), "numba": ("numba",),
 }
 out = {"python": ".".join(map(str, sys.version_info[:3]))}
 for key, candidates in names.items():
@@ -191,7 +226,11 @@ class AssetInventory:
         assets = {'source': Path(source), **self.paths.documents()}
         if set(assets) != set(HASH_NAMES):
             raise InventoryError('asset_inventory_invalid', 'Render asset inventory is incomplete')
-        hashes = {name: sha256_asset(path) for name, path in assets.items()}
+        if self.paths.rvc_upstream != self.paths.rvc_script.parent / 'upstream':
+            raise InventoryError('rvc_upstream_mismatch', 'Inventoried RVC upstream is not the wrapper-imported sibling')
+        validate_demucs_repo(self.paths.demucs_repo)
+        hashes = {name: sha256_asset(path, source_tree=name == 'rvc_upstream')
+                  for name, path in assets.items()}
         try:
             supplied = dict(self.version_provider())
         except InventoryError:

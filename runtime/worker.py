@@ -146,6 +146,13 @@ def chunk_bounds(frames: int, rate: int) -> list[tuple[int, int]]:
 
 
 def separate(args: argparse.Namespace) -> None:
+    # The dedicated durable CLI requires a local repo; the old worker CLI
+    # retains its legacy behavior only for explicitly invoked old workflows.
+    repo = getattr(args, 'demucs_repo', None)
+    if repo is not None:
+        repo = Path(repo)
+        if not repo.is_absolute() or not repo.is_dir() or repo.is_symlink():
+            raise ValueError('显式 Demucs repo 缺失或无效，拒绝默认缓存/联网')
     import numpy as np
     import soundfile as sf
     import torch
@@ -157,7 +164,7 @@ def separate(args: argparse.Namespace) -> None:
     if rate != 44100 or data.shape[1] != 2 or not np.isfinite(data).all():
         raise ValueError('无效的输入音频')
     wave = torch.from_numpy(data.T.copy())
-    model = get_model('htdemucs').cpu().eval()
+    model = get_model('htdemucs', repo=repo).cpu().eval()
     ref = wave.mean(0)
     scale, center = ref.std(), ref.mean()
     if float(scale) < 1e-6:

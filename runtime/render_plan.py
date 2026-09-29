@@ -22,15 +22,15 @@ class Step:
 
 
 def build_plan(workspace, worker_python, worker_script, rvc_script, model, index,
-               hubert, frames, rate=44100, instrumental=False):
-    paths = [Path(p) for p in (workspace,worker_python,worker_script,rvc_script,model,index,hubert)]
+               hubert, frames, *, demucs_repo, rate=44100, instrumental=False):
+    paths = [Path(p) for p in (workspace,worker_python,worker_script,rvc_script,model,index,hubert,demucs_repo)]
     if any(not p.is_absolute() for p in paths):
         raise ValueError('Runtime paths must be absolute')
     if type(frames) is not int or rate != 44100 or not 30*rate <= frames <= 300*rate:
         raise ValueError('Plan requires decoded full-source length within 30–300 seconds')
     if type(instrumental) is not bool:
         raise ValueError('Instrumental must be explicit bool')
-    work, python, worker, rvc, model, index, hubert = map(str,paths)
+    work, python, worker, rvc, model, index, hubert, demucs_repo = map(str,paths)
     # Match worker.chunk_bounds: fold tails shorter than five seconds.
     starts=list(range(0,frames,20*rate))
     if len(starts)>1 and frames-starts[-1]<5*rate:
@@ -42,7 +42,7 @@ def build_plan(workspace, worker_python, worker_script, rvc_script, model, index
     steps=[Step('decode',('ffmpeg','-nostdin','-v','error','-xerror','-threads','1',
         '-i',work+'/source.audio','-map','0:a:0','-ar','44100','-ac','2','-c:a','pcm_f32le',
         work+'/original.wav'),120,('source.audio',),('original.wav',)),
-        Step('separate',(python,worker,'separate',*opts),600,('original.wav',),
+        Step('separate',(python,worker,'separate',*opts,'--demucs-repo',demucs_repo),600,('original.wav',),
              ('vocals.wav','backing.wav',*chunks))]
     for number,(original,output) in enumerate(zip(chunks,converted)):
         steps.append(Step('convert_%03d'%number,(python,rvc,'--model',model,'--index',index,

@@ -8,12 +8,13 @@ import hashlib
 import json
 import re
 
-SCHEMA = 'sing-render-v1'
-HASH_NAMES = ('source', 'model', 'index', 'hubert', 'demucs_weights',
+SCHEMA = 'sing-render-v2'
+HASH_NAMES = ('source', 'model', 'index', 'hubert', 'demucs_repo',
               'rvc_script', 'rvc_upstream', 'media_stage', 'worker',
               'render_plan', 'stage_executor')
 VERSION_NAMES = ('python','numpy','torch','torchaudio','demucs','soundfile',
-                 'librosa','pyworld','faiss','fairseq','ffmpeg','libmp3lame')
+                 'librosa','pyworld','faiss','fairseq','scipy','praat-parselmouth',
+                  'torchcrepe','omegaconf','numba','ffmpeg','libmp3lame')
 
 
 class RecipeError(ValueError):
@@ -22,7 +23,7 @@ class RecipeError(ValueError):
 
 def recipe_document(*, provider, track_id, hashes, versions, steps,
                     workspace, worker_python, worker_script, rvc_script,
-                    model, index, hubert):
+                    model, index, hubert, demucs_repo):
     """Canonical identity, with local filesystem paths replaced by placeholders.
 
     Settings are sourced from exactly the argv tuples later executed, so chunk
@@ -41,7 +42,8 @@ def recipe_document(*, provider, track_id, hashes, versions, steps,
         raise RecipeError('Runtime versions must be short plain identifiers')
     placeholders={}
     for label, raw in (('WORK',workspace),('PYTHON',worker_python),('MEDIA_STAGE',worker_script),
-                       ('RVC',rvc_script),('MODEL',model),('INDEX',index),('HUBERT',hubert)):
+                       ('RVC',rvc_script),('MODEL',model),('INDEX',index),('HUBERT',hubert),
+                        ('DEMUCS_REPO',demucs_repo)):
         value=str(raw)
         if not Path(value).is_absolute() or value in placeholders or '://' in value:
             raise RecipeError('Private absolute paths must be distinct')
@@ -122,6 +124,12 @@ def validate_document(document):
         if not set(step['inputs'])<=produced:
             raise RecipeError('Stage input has no preceding producer')
         produced.update(step['outputs'])
+    separate = next((step for step in steps if step['name'] == 'separate'), None)
+    if separate is None or separate['argv'].count('--demucs-repo') != 1:
+        raise RecipeError('Separation stage lacks an explicit local Demucs repo')
+    option = separate['argv'].index('--demucs-repo')
+    if option + 1 >= len(separate['argv']) or separate['argv'][option + 1] != '${DEMUCS_REPO}':
+        raise RecipeError('Separation stage must bind the inventoried Demucs repo')
     return document
 
 

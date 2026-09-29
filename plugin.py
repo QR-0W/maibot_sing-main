@@ -30,7 +30,7 @@ from .services.mimo_tts import MiMoTTSService
 from .services.pipeline import Pipeline
 from .services.local_backend import LocalBackend
 from .services.artifact_store import ArtifactStore
-from .services.asset_inventory import AssetInventory, AssetPaths, RuntimeVersionProbe
+from .services.asset_inventory import AssetInventory, AssetPaths, RuntimeVersionProbe, validate_demucs_repo
 from .services.catalogue_service import CatalogueService, CatalogueError
 from .services.delivery_outbox import CustomVoiceSender, DeliveryOutbox
 from .services.job_service import JobService, RenderRuntime
@@ -176,7 +176,7 @@ class LocalConfig(PluginConfigBase):
     model_path: str = Field(default="", description="管理员提供的固定 RVC 模型绝对路径，未配置时禁止渲染")
     index_path: str = Field(default="", description="管理员提供的索引绝对路径，未配置时禁止渲染")
     hubert_path: str = Field(default="", description="管理员提供的 HuBERT 模型绝对路径，不使用开发者本地默认值")
-    demucs_weights_path: str = Field(default="", description="管理员提供的 Demucs 权重文件/目录绝对路径")
+    demucs_repo_path: str = Field(default="", description="固定本地 Demucs 模型 repo 绝对目录：htdemucs.yaml 与对应 .th")
     rvc_upstream_path: str = Field(default="", description="固定 RVC 上游代码文件/目录绝对路径")
     worker_python: str = Field(default="", description="安装 Demucs/RVC 的隔离 Python 绝对路径（建议 3.9）")
     musicdl_python: str = Field(default="", description="安装 musicdl 的隔离 Python 绝对路径")
@@ -354,7 +354,7 @@ class SingPlugin(MaiBotPlugin):
         cfg = self.config.local
         if cfg.backend != 'local':
             raise RuntimeError('旧 sidecar 不支持持久化受限翻唱')
-        names = ('model_path', 'index_path', 'hubert_path', 'demucs_weights_path',
+        names = ('model_path', 'index_path', 'hubert_path', 'demucs_repo_path',
                  'rvc_upstream_path', 'worker_python', 'rvc_script', 'inference_lock')
         paths = {}
         for name in names:
@@ -362,10 +362,15 @@ class SingPlugin(MaiBotPlugin):
             if not raw or not Path(raw).is_absolute():
                 raise ValueError(f'local.{name} 必须显式配置为绝对路径')
             paths[name] = Path(raw)
+        # The restricted wrapper imports its own fixed upstream sibling; a
+        # separate administrator path must not claim unrelated hashed code.
+        if paths['rvc_upstream_path'] != paths['rvc_script'].parent / 'upstream':
+            raise ValueError('local.rvc_upstream_path 必须等于 rvc_script 所在目录下的 upstream')
         return paths
 
     async def _start_durable_services(self) -> None:
         paths = self._render_paths()
+        await asyncio.to_thread(validate_demucs_repo, paths['demucs_repo_path'])
         root = Path(self.ctx.paths.data_dir).resolve()
         runtime_dir = Path(__file__).resolve().parent / 'runtime'
         output = Path(self.config.local.output_dir) if self.config.local.output_dir.strip() else root / 'covers'
@@ -383,7 +388,7 @@ class SingPlugin(MaiBotPlugin):
         runner = UnitRunner(runtime_dir / 'stage_executor.py', paths['worker_python'])
         inventory = AssetInventory(AssetPaths(
             model=paths['model_path'], index=paths['index_path'], hubert=paths['hubert_path'],
-            demucs_weights=paths['demucs_weights_path'], rvc_script=paths['rvc_script'],
+            demucs_repo=paths['demucs_repo_path'], rvc_script=paths['rvc_script'],
             rvc_upstream=paths['rvc_upstream_path'], media_stage=runtime_dir / 'media_stage.py',
             worker=runtime_dir / 'worker.py', render_plan=runtime_dir / 'render_plan.py',
             stage_executor=runtime_dir / 'stage_executor.py',
@@ -391,7 +396,7 @@ class SingPlugin(MaiBotPlugin):
         runtime = RenderRuntime(work_root=root / 'jobs', worker_python=paths['worker_python'],
             worker_script=runtime_dir / 'media_stage.py', rvc_script=paths['rvc_script'],
             model=paths['model_path'], index=paths['index_path'], hubert=paths['hubert_path'],
-            inference_lock=paths['inference_lock'], max_download_bytes=self.config.local.max_download_bytes,
+            demucs_repo=paths['demucs_repo_path'], inference_lock=paths['inference_lock'], max_download_bytes=self.config.local.max_download_bytes,
             max_duration_s=self.config.local.max_duration_s)
         jobs = JobService(store, CatalogueService(self._music,
             max_duration_s=self.config.local.max_duration_s), StageCoordinator(store, runner),

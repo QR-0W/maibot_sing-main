@@ -14,8 +14,11 @@ def main():
     parser.add_argument('--scratch',type=Path,required=True)
     parser.add_argument('--model',type=Path,required=True)
     parser.add_argument('--index',type=Path,required=True)
+    parser.add_argument('--demucs-repo',type=Path)
     parser.add_argument('--instrumental',action='store_true')
     args=parser.parse_args()
+    if args.stage=='separate' and args.demucs_repo is None:
+        parser.error('separate requires explicit --demucs-repo; default cache is forbidden')
     verify_limits()
     {'separate':separate,'mix':mix}[args.stage](args)
 

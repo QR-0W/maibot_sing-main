@@ -12,7 +12,8 @@ model_path = ""
 index_path = ""
 # 所有渲染输入必须显式指定；不从开发机路径或缓存隐式回退。
 hubert_path = ""
-demucs_weights_path = ""
+# 必须为包含 htdemucs.yaml 与本地签名 .th 的专用目录，不读默认缓存。
+demucs_repo_path = ""
 rvc_upstream_path = ""
 worker_python = ""
 musicdl_python = ""

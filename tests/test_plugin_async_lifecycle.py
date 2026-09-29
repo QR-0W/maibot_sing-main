@@ -24,10 +24,19 @@ def plugin(tmp_path, monkeypatch):
     logger.propagate = False
     instance = plugin_module.create_plugin()
     config = tomllib.loads((ROOT / 'config.example.toml').read_text())
-    for name in ('model_path', 'index_path', 'hubert_path', 'demucs_weights_path', 'rvc_upstream_path', 'rvc_script'):
+    for name in ('model_path', 'index_path', 'hubert_path', 'rvc_script'):
         path = tmp_path / name
         path.write_bytes(name.encode())
         config['local'][name] = str(path)
+    upstream = tmp_path / 'upstream'
+    upstream.mkdir()
+    (upstream / 'infer.py').write_text('# fake upstream')
+    config['local']['rvc_upstream_path'] = str(upstream)
+    repo = tmp_path / 'htdemucs-repo'
+    repo.mkdir()
+    (repo / 'htdemucs.yaml').write_text("models: ['955717e8']\n")
+    (repo / '955717e8-8726e21a.th').write_bytes(b'fake checkpoint - no torch import')
+    config['local']['demucs_repo_path'] = str(repo)
     config['local'].update(worker_python=sys.executable, musicdl_python=sys.executable,
                            inference_lock=str(tmp_path / '.inference.lock'))
     instance.set_plugin_config(config)
@@ -172,16 +181,39 @@ async def test_real_plan_uses_media_stage_cli_and_reaches_sandbox_guard(plugin):
         from sing_async_test.runtime.render_plan import build_plan
         plan = build_plan(workspace=runtime.work_root / 'example', worker_python=runtime.worker_python,
             worker_script=runtime.worker_script, rvc_script=runtime.rvc_script,
-            model=runtime.model, index=runtime.index, hubert=runtime.hubert, frames=44_100 * 45)
+            model=runtime.model, index=runtime.index, hubert=runtime.hubert,
+            demucs_repo=runtime.demucs_repo, frames=44_100 * 45)
         for stage in ('separate', 'mix'):
             argv = next(item.argv for item in plan if item.name == stage)
             assert argv[:3] == (str(runtime.worker_python), str(runtime.worker_script), stage)
+            if stage == 'separate':
+                assert argv[argv.index('--demucs-repo') + 1] == str(runtime.demucs_repo)
             probe = subprocess.run(argv, capture_output=True, text=True, timeout=5, check=False)
             assert probe.returncode != 0
             assert '必须在 systemd user service 内运行' in probe.stderr
             assert 'the following arguments are required' not in probe.stderr
     finally:
         await instance.on_unload()
+
+
+@pytest.mark.asyncio
+async def test_missing_demucs_bundle_fails_before_scheduler_or_qq(plugin):
+    instance, _ = plugin
+    repo = Path(instance.config.local.demucs_repo_path)
+    (repo / 'htdemucs.yaml').unlink()
+    from sing_async_test.services.asset_inventory import InventoryError
+    with pytest.raises(InventoryError, match='Demucs'):
+        await instance.on_load()
+    assert instance._jobs is None and instance._scheduler_owner is None
+
+
+def test_rvc_wrapper_must_match_inventoried_upstream(plugin):
+    instance, _ = plugin
+    data = instance.get_plugin_config_data()
+    data['local']['rvc_upstream_path'] = str(Path(data['local']['rvc_script']).parent / 'elsewhere')
+    instance.set_plugin_config(data)
+    with pytest.raises(ValueError, match='upstream'):
+        instance._render_paths()
 
 
 def test_missing_hubert_rejected_before_any_render(plugin):
