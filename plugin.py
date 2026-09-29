@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+from dataclasses import dataclass
 import json
 import os
 import re
-import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -30,28 +30,18 @@ from .services.mimo_tts import MiMoTTSService
 from .services.pipeline import Pipeline
 from .services.local_backend import LocalBackend
 from .services.artifact_store import ArtifactStore
-from .services.asset_inventory import AssetInventory, AssetPaths, RuntimeVersionProbe, validate_demucs_repo
+from .services.asset_inventory import AssetInventory, AssetPaths, RuntimeVersionProbe
 from .services.catalogue_service import CatalogueService, CatalogueError
 from .services.delivery_outbox import CustomVoiceSender, DeliveryOutbox
-from .services.job_service import JobService, RenderRuntime
+from .services.job_service import JobService, RenderRuntime, RENDER_PARAMETER_POLICY
 from .services.job_store import JobConflict, JobNotFound, JobStore
 from .services.ownership import OwnershipBusy, exclusive
 from .services.source_offer import normalized
 from .services.stage_coordinator import StageCoordinator
 from .services.unit_runner import UnitRunner
+from .services.voice_sender import SingleVoiceSender
 
 
-# 语音发送的软截止：超过该时长仍未返回，先按失败上报（bot 会说"发不出去"），
-# 但发送请求不会被取消，交由后台观察任务继续等待最终结果
-_VOICE_SEND_DEADLINE_S = 180
-# 语音发送底层 RPC 的真实等待上限（仅在后台观察时生效，需远大于软截止）
-_VOICE_SEND_RPC_TIMEOUT_MS = 3_600_000
-# 后台观察一次"结果未知"语音发送的最长时间
-_LATE_VOICE_WATCH_S = 1_800
-# base64 兜底受 16MB 传输帧上限约束（base64 膨胀 4/3），超限文件跳过兜底
-_B64_FALLBACK_MAX_BYTES = 8 * 1024 * 1024
-# 翻唱去重窗口：同一会话同一首歌在该时间内只执行一次管线、只发一条语音
-_COVER_DEDUP_WINDOW_S = 600
 # 期望的 sidecar 代码版本；sidecar/server.py 的 SIDECAR_VERSION 递增时同步修改。
 # 端口上已有服务版本不匹配（残留旧代码进程）时，插件会终止它并重新拉起
 EXPECTED_SIDECAR_VERSION = "4"
@@ -200,6 +190,33 @@ class SingPluginConfig(PluginConfigBase):
     components: ComponentConfig = Field(default_factory=ComponentConfig)
 
 
+@dataclass(frozen=True)
+class ActiveCoverService:
+    jobs: JobService
+    provider: str
+    search_limit: int
+    default_model: str
+    model_path: str
+    model_aliases: tuple[str,...]
+
+
+@dataclass(frozen=True)
+class DurableCoverSettings:
+    root: Path
+    output: Path
+    runtime_dir: Path
+    paths: tuple[tuple[str,Path],...]
+    max_queue: int
+    max_duration_s: int
+    max_download_bytes: int
+    provider: str
+    search_limit: int
+    default_model: str
+
+    def path(self,name: str) -> Path:
+        return dict(self.paths)[name]
+
+
 class SingPlugin(MaiBotPlugin):
     """翻唱 + 语音插件。"""
 
@@ -216,8 +233,10 @@ class SingPlugin(MaiBotPlugin):
         # 待选歌曲状态: stream_id -> (结果列表, 平台, 时间戳)
         self._pending: dict[str, tuple[list[SongInfo], str, float]] = {}
         self._pending_lock = asyncio.Lock()
-        # 结果未知的语音发送的后台观察任务
-        self._late_voice_watchers: set[asyncio.Task[None]] = set()
+        self._voice_sender: SingleVoiceSender | None = None
+        self._active_cover: ActiveCoverService | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._startup_tasks: set[asyncio.Task[Any]] = set()
         # QQ 扫码登录后台任务
         self._qq_login_task: asyncio.Task[None] | None = None
         # 网易云扫码登录后台任务
@@ -231,122 +250,149 @@ class SingPlugin(MaiBotPlugin):
 
     # ===== 生命周期 =====
 
-    async def on_load(self) -> None:
+    def _track_startup_task(self, task: asyncio.Task[Any]) -> None:
+        self._startup_tasks.add(task)
+        def finished(done: asyncio.Task[Any]) -> None:
+            self._startup_tasks.discard(done)
+            if not done.cancelled():
+                try:
+                    done.exception()
+                except BaseException:
+                    pass
+        task.add_done_callback(finished)
+
+    async def _acquire_scheduler_owner(self, lock_path: Path) -> int:
+        owner=exclusive(lock_path)
+        enter=asyncio.create_task(
+            asyncio.to_thread(owner.__enter__),name='sing-scheduler-owner-acquire')
         try:
-            await self._load()
-        except BaseException:
-            await self.on_unload()
+            fd=await asyncio.shield(enter)
+        except asyncio.CancelledError:
+            async def close_late_owner() -> None:
+                try:
+                    await enter
+                except BaseException:
+                    return
+                owner.__exit__(None,None,None)
+            cleanup=asyncio.create_task(
+                close_late_owner(),name='sing-scheduler-owner-late-close')
+            self._track_startup_task(cleanup)
             raise
+        self._scheduler_owner=owner
+        return fd
 
-    async def _load(self) -> None:
+    async def _startup_owned_call(self, ownership_fd: int, function, /, *args):
+        try:
+            lease_fd=os.dup(ownership_fd)
+        except OSError as exc:
+            raise RuntimeError('持久化调度所有权已丢失') from exc
+        def owned_call():
+            try:
+                return function(*args)
+            finally:
+                os.close(lease_fd)
+        task=asyncio.create_task(
+            asyncio.to_thread(owned_call),name='sing-owned-startup-call')
+        self._track_startup_task(task)
+        return await asyncio.shield(task)
+
+    async def on_load(self) -> None:
+        async with self._lifecycle_lock:
+            try:
+                await self._load_resources()
+            except BaseException:
+                await self._close_resources()
+                raise
+
+    async def _load_resources(self) -> None:
         self.ctx.logger.info("翻唱插件加载中...")
-
-        # Legacy LocalBackend 不再启动；持久化队列独立于宿主 RPC 生命周期。
-        self._cache_cleanup_task = asyncio.create_task(self._voice_cache_cleanup_loop())
-
-        # 初始化 RVC sidecar 客户端
-        port = self.config.rvc.port
-        self._rvc = RVCClient(f"http://127.0.0.1:{port}", logger=self.ctx.logger)
-
-        # 自动拉起 sidecar（或复用已有服务）
-        if self.config.local.backend == "legacy" and self.config.rvc.auto_start:
+        # Copy every scalar needed below before the first await. A Host config
+        # callback can replace self.config later, but this lifecycle owns one snapshot.
+        port=self.config.rvc.port
+        legacy=(self.config.local.backend,self.config.rvc.auto_start)
+        mimo_key=self.config.mimo.api_key
+        mimo_base=self.config.mimo.api_base_url
+        durable=self._capture_durable_settings()
+        self._cache_cleanup_task=asyncio.create_task(
+            self._voice_cache_cleanup_loop(),name='sing-voice-cache-cleanup')
+        self._voice_sender=SingleVoiceSender(self.ctx.send.custom)
+        self._rvc=RVCClient(f"http://127.0.0.1:{port}",logger=self.ctx.logger)
+        if legacy==('legacy',True):
             self.ctx.logger.warning("旧 sidecar 不具备 Linux 资源隔离，拒绝自动拉起")
-
-        # 初始化音乐搜索与 MiMo TTS
-        self._music = self._build_music_client()
+        self._music=self._build_music_client()
         await self._restore_music_logins()
-        self._mimo = MiMoTTSService(
-            api_key=self.config.mimo.api_key,
-            api_base_url=self.config.mimo.api_base_url,
-            logger=self.ctx.logger,
-        )
-        self._pipeline = Pipeline(self._music, self._rvc, self._mimo, self.ctx.logger)
-        await self._start_durable_services()
+        self._mimo=MiMoTTSService(api_key=mimo_key,api_base_url=mimo_base,
+                                  logger=self.ctx.logger)
+        self._pipeline=Pipeline(self._music,self._rvc,self._mimo,self.ctx.logger)
+        await self._start_durable_services(durable)
         self.ctx.logger.info("翻唱插件加载完成")
 
     async def _stop_durable_services(self) -> None:
-        task, self._delivery_task = self._delivery_task, None
+        self._active_cover=None
+        task,self._delivery_task=self._delivery_task,None
         if task is not None:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        jobs, self._jobs = self._jobs, None
-        if jobs is not None:
-            await jobs.close()  # durable ledger and named units are never deleted
+            await asyncio.gather(task,return_exceptions=True)
         # An in-flight platform send is fenced unknown on next startup. Never
         # launch a replacement send for pending/dispatching/unknown automatically.
-        outbox, self._outbox = self._outbox, None
+        outbox,self._outbox=self._outbox,None
         if outbox is not None:
             await outbox.shutdown(timeout_s=1.0)
-        owner, self._scheduler_owner = self._scheduler_owner, None
+        jobs,self._jobs=self._jobs,None
+        if jobs is not None:
+            await jobs.close()
+        owner,self._scheduler_owner=self._scheduler_owner,None
         if owner is not None:
-            await asyncio.to_thread(owner.__exit__, None, None, None)
+            owner.__exit__(None,None,None)
+        pending=tuple(self._startup_tasks)
+        if pending:
+            await asyncio.wait(pending,timeout=1.0)
 
-    async def on_unload(self) -> None:
+    async def _close_resources(self) -> None:
         await self._stop_durable_services()
         if self._local is not None:
             await self._local.close()
-            self._local = None
-        current_tasks = [task for task in (*self._late_voice_watchers, self._qq_login_task,
-                                             self._netease_login_task, self._cache_cleanup_task) if task is not None]
+            self._local=None
+        current_tasks=[task for task in (self._qq_login_task,self._netease_login_task,
+                                         self._cache_cleanup_task) if task is not None]
         for task in current_tasks:
             task.cancel()
         if current_tasks:
-            await asyncio.gather(*current_tasks, return_exceptions=True)
-        self._late_voice_watchers.clear()
-        self._qq_login_task = self._netease_login_task = self._cache_cleanup_task = None
+            await asyncio.gather(*current_tasks,return_exceptions=True)
+        self._qq_login_task=self._netease_login_task=self._cache_cleanup_task=None
+        sender,self._voice_sender=self._voice_sender,None
+        if sender is not None:
+            await sender.shutdown(timeout_s=1.0)
         if self._music is not None:
             await self._music.close()
-            self._music = None
+            self._music=None
         if self._mimo is not None:
             await self._mimo.close()
-            self._mimo = None
+            self._mimo=None
         if self._rvc is not None:
             await self._rvc.close()
-            self._rvc = None
+            self._rvc=None
         await self._stop_sidecar()
         self._pending.clear()
-        self._pipeline = None
+        self._pipeline=None
         self.ctx.logger.info("翻唱插件已卸载")
 
-    async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
-        del config_data, version
-        if scope != CONFIG_RELOAD_SCOPE_SELF:
-            return
-        self.ctx.logger.info("翻唱插件配置已更新，重建客户端")
-        # Stop only the scheduler loops; named systemd units and ledger survive hot reload.
-        await self._stop_durable_services()
-        old_login = [task for task in (self._qq_login_task, self._netease_login_task) if task is not None]
-        for task in old_login:
-            task.cancel()
-        if old_login:
-            await asyncio.gather(*old_login, return_exceptions=True)
-        self._qq_login_task = self._netease_login_task = None
-        if self._music is not None:
-            await self._music.close()
-        if self._mimo is not None:
-            await self._mimo.close()
-        if self._rvc is not None:
-            await self._rvc.close()
-        await self._stop_sidecar()
+    async def on_unload(self) -> None:
+        async with self._lifecycle_lock:
+            await self._close_resources()
 
-        self._rvc = RVCClient(f"http://127.0.0.1:{self.config.rvc.port}", logger=self.ctx.logger)
-        if self.config.local.backend == "legacy" and self.config.rvc.auto_start:
-            self.ctx.logger.warning("旧 sidecar 不具备 Linux 资源隔离，拒绝自动拉起")
-        self._music = self._build_music_client()
-        await self._restore_music_logins()
-        self._mimo = MiMoTTSService(
-            api_key=self.config.mimo.api_key,
-            api_base_url=self.config.mimo.api_base_url,
-            logger=self.ctx.logger,
-        )
-        self._pipeline = Pipeline(self._music, self._rvc, self._mimo, self.ctx.logger)
-        try:
-            await self._start_durable_services()
-        except BaseException:
-            await self.on_unload()
-            raise
-        # 保留期等缓存配置可能已变化，立即按新配置清理一次
-        await asyncio.to_thread(self._cleanup_voice_cache)
+    async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
+        del config_data,version
+        if scope!=CONFIG_RELOAD_SCOPE_SELF:
+            return
+        async with self._lifecycle_lock:
+            self.ctx.logger.info("翻唱插件配置已更新，重建客户端")
+            await self._close_resources()
+            try:
+                await self._load_resources()
+            except BaseException:
+                await self._close_resources()
+                raise
 
     # ===== 持久化渲染与投递 =====
 
@@ -368,56 +414,98 @@ class SingPlugin(MaiBotPlugin):
             raise ValueError('local.rvc_upstream_path 必须等于 rvc_script 所在目录下的 upstream')
         return paths
 
-    async def _start_durable_services(self) -> None:
-        paths = self._render_paths()
-        await asyncio.to_thread(validate_demucs_repo, paths['demucs_repo_path'])
-        root = Path(self.ctx.paths.data_dir).resolve()
-        runtime_dir = Path(__file__).resolve().parent / 'runtime'
-        output = Path(self.config.local.output_dir) if self.config.local.output_dir.strip() else root / 'covers'
-        if not output.is_absolute() or output.is_symlink():
+    def _capture_durable_settings(self) -> DurableCoverSettings:
+        paths=self._render_paths()
+        root=Path(self.ctx.paths.data_dir).resolve()
+        runtime_dir=Path(__file__).resolve().parent/'runtime'
+        configured=self.config.local.output_dir.strip()
+        raw_output=Path(configured) if configured else root/'covers'
+        if (not raw_output.is_absolute()
+                or any(path.is_symlink() for path in (raw_output,*raw_output.parents))):
             raise ValueError('持久化产物目录必须是非符号链接绝对路径')
-        await asyncio.to_thread(output.mkdir, parents=True, exist_ok=True, mode=0o700)
-        # Hold one nonblocking cross-process host lease before touching the ledger.
-        # A second Runner must not recover another instance's dispatch or download.
-        await asyncio.to_thread(root.mkdir, parents=True, exist_ok=True, mode=0o700)
-        owner = exclusive(root / '.durable-scheduler.lock')
-        ownership_fd = await asyncio.to_thread(owner.__enter__)
-        self._scheduler_owner = owner
-        store = await asyncio.to_thread(JobStore, root / 'jobs.sqlite3', max(1, self.config.local.max_queue + 1))
-        artifacts = ArtifactStore(output)
-        runner = UnitRunner(runtime_dir / 'stage_executor.py', paths['worker_python'])
-        inventory = AssetInventory(AssetPaths(
-            model=paths['model_path'], index=paths['index_path'], hubert=paths['hubert_path'],
-            demucs_repo=paths['demucs_repo_path'], rvc_script=paths['rvc_script'],
-            rvc_upstream=paths['rvc_upstream_path'], media_stage=runtime_dir / 'media_stage.py',
-            worker=runtime_dir / 'worker.py', render_plan=runtime_dir / 'render_plan.py',
-            stage_executor=runtime_dir / 'stage_executor.py',
-        ), RuntimeVersionProbe(paths['worker_python']))
-        runtime = RenderRuntime(work_root=root / 'jobs', worker_python=paths['worker_python'],
-            worker_script=runtime_dir / 'media_stage.py', rvc_script=paths['rvc_script'],
-            model=paths['model_path'], index=paths['index_path'], hubert=paths['hubert_path'],
-            demucs_repo=paths['demucs_repo_path'], inference_lock=paths['inference_lock'], max_download_bytes=self.config.local.max_download_bytes,
-            max_duration_s=self.config.local.max_duration_s)
-        jobs = JobService(store, CatalogueService(self._music,
-            max_duration_s=self.config.local.max_duration_s), StageCoordinator(store, runner),
-            artifacts, inventory, runtime, ownership_fd=ownership_fd)
-        outbox = DeliveryOutbox(store, CustomVoiceSender(self.ctx.send.custom), artifacts.verify)
-        # Recovery fences pre-restart dispatches BEFORE discovering deliverable rows.
+        output=raw_output.resolve()
+        return DurableCoverSettings(
+            root=root,output=output,runtime_dir=runtime_dir,
+            paths=tuple(sorted(paths.items())),
+            max_queue=int(self.config.local.max_queue),
+            max_duration_s=int(self.config.local.max_duration_s),
+            max_download_bytes=int(self.config.local.max_download_bytes),
+            provider=self._resolve_platform(self.config.music.default_platform),
+            search_limit=min(10,max(1,int(self.config.music.search_limit))),
+            default_model=self.config.rvc.default_model.strip())
+
+    async def _start_durable_services(self, settings: DurableCoverSettings) -> None:
+        path=settings.path
+        root,output,runtime_dir=settings.root,settings.output,settings.runtime_dir
+        # The scheduler lock parent is the only pre-service directory creation.
+        # All durable binding, artifact validation, and hashing belong to jobs.prepare.
+        await asyncio.to_thread(root.mkdir,parents=True,exist_ok=True,mode=0o700)
+        ownership_fd=await self._acquire_scheduler_owner(
+            root/'.durable-scheduler.lock')
+        store=await self._startup_owned_call(
+            ownership_fd,JobStore,root/'jobs.sqlite3',max(1,settings.max_queue+1))
+        runner=UnitRunner(runtime_dir/'stage_executor.py',path('worker_python'))
+        asset_paths=AssetPaths(
+            model=path('model_path'),index=path('index_path'),hubert=path('hubert_path'),
+            demucs_repo=path('demucs_repo_path'),rvc_script=path('rvc_script'),
+            rvc_upstream=path('rvc_upstream_path'),media_stage=runtime_dir/'media_stage.py',
+            worker=runtime_dir/'worker.py',render_plan=runtime_dir/'render_plan.py',
+            stage_executor=runtime_dir/'stage_executor.py')
+        inventory=AssetInventory(asset_paths,RuntimeVersionProbe(path('worker_python')))
+        runtime=RenderRuntime(
+            work_root=root/'jobs',worker_python=path('worker_python'),
+            worker_script=runtime_dir/'media_stage.py',rvc_script=path('rvc_script'),
+            model=path('model_path'),index=path('index_path'),hubert=path('hubert_path'),
+            demucs_repo=path('demucs_repo_path'),inference_lock=path('inference_lock'),
+            max_download_bytes=settings.max_download_bytes,
+            max_duration_s=settings.max_duration_s)
+        execution_paths={
+            'model':path('model_path'),'index':path('index_path'),
+            'hubert':path('hubert_path'),'demucs_repo':path('demucs_repo_path'),
+            'rvc_script':path('rvc_script'),'rvc_upstream':path('rvc_upstream_path'),
+            'media_stage':runtime_dir/'media_stage.py','worker':runtime_dir/'worker.py',
+            'render_plan':runtime_dir/'render_plan.py',
+            'stage_executor':runtime_dir/'stage_executor.py',
+            'worker_python':path('worker_python'),'worker_script':runtime_dir/'media_stage.py',
+            'inference_lock':path('inference_lock')}
+        runtime_context={
+            'execution_paths':execution_paths,'artifact_root':output,
+            'limits':{'max_duration_s':settings.max_duration_s,
+                      'max_download_bytes':settings.max_download_bytes},
+            'parameter_policy':RENDER_PARAMETER_POLICY}
+        if self._music is None:
+            raise RuntimeError('音乐目录客户端尚未初始化')
+        jobs=JobService(
+            store,CatalogueService(self._music,max_duration_s=settings.max_duration_s),
+            StageCoordinator(store,runner),output,inventory,runtime,
+            runtime_context=runtime_context,ownership_fd=ownership_fd)
+        self._jobs=jobs
+        await jobs.prepare()
+        if not isinstance(jobs.artifacts,ArtifactStore):
+            raise RuntimeError('持久化产物存储未完成绑定')
+        outbox=DeliveryOutbox(
+            store,CustomVoiceSender(self.ctx.send.custom),jobs.artifacts.verify)
+        self._outbox=outbox
+        # Root is already validated and bound. Recovery must precede any worker
+        # claim or delivery discovery.
         await outbox.recover()
         await jobs.start()
-        self._jobs, self._outbox = jobs, outbox
-        self._delivery_task = asyncio.create_task(self._delivery_loop(), name='sing-delivery-outbox')
+        aliases=tuple(dict.fromkeys(value for value in (
+            settings.default_model,str(path('model_path')),path('model_path').name) if value))
+        self._active_cover=ActiveCoverService(
+            jobs=jobs,provider=settings.provider,search_limit=settings.search_limit,
+            default_model=settings.default_model,model_path=str(path('model_path')),
+            model_aliases=aliases)
+        self._delivery_task=asyncio.create_task(
+            self._delivery_loop(),name='sing-delivery-outbox')
 
     async def _delivery_loop(self) -> None:
         while True:
             try:
-                jobs, outbox = self._jobs, self._outbox
+                jobs,outbox=self._jobs,self._outbox
                 if jobs is not None and outbox is not None:
-                    def pending() -> list[tuple[str, str]]:
-                        with sqlite3.connect(jobs.store.path, timeout=5) as database:
-                            return database.execute("SELECT id,stream_id FROM jobs WHERE state='ready' AND delivery_state='pending' ORDER BY created_at LIMIT 8").fetchall()
-                    for job_id, stream_id in await asyncio.to_thread(pending):
-                        await outbox.dispatch(job_id, stream_id)
+                    for job_id,stream_id in await jobs.delivery_candidates(limit=8):
+                        await outbox.dispatch(job_id,stream_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -764,112 +852,21 @@ class SingPlugin(MaiBotPlugin):
                 self.ctx.logger.exception("清理翻唱语音缓存失败")
             await asyncio.sleep(24 * 3600)
 
-    async def _send_voice(self, audio: bytes | Path, stream_id: str) -> bool:
-        """发送语音条（wav bytes）。
-
-        翻唱整曲 wav 可达数十 MB，base64 后远超 16MB 传输帧上限，
-        因此落地为本地文件，通过 voiceurl（文件路径）交给 NapCat 读取。
-
-        兜底策略：仅当上一种方式明确返回 False（宿主确认未发出）才尝试下一种；
-        调用超软截止仍未返回说明结果未知——消息可能仍在宿主侧投递中，
-        此时严禁重发，否则语音条会发两遍；改为后台观察，若最终送达则补发
-        一条文字说明（bot 此前已说"发不出去"）。
-        """
-        if isinstance(audio, Path):
-            cache_path = audio
+    async def _send_voice(self, audio: bytes | Path, stream_id: str,
+                          sender: SingleVoiceSender | None = None):
+        """Make exactly one detailed ``voiceurl`` attempt and preserve ambiguity."""
+        sender=sender or self._voice_sender
+        if sender is None:
+            raise RuntimeError('语音发送服务尚未启动或正在重载')
+        if isinstance(audio,Path):
+            cache_path=audio
         else:
-            cache_dir = self._voice_cache_dir()
-            await asyncio.to_thread(cache_dir.mkdir, parents=True, exist_ok=True)
-            cache_path = cache_dir / f"sing_{uuid.uuid4().hex}.wav"
-            await asyncio.to_thread(cache_path.write_bytes, audio)
-
-        # 永久 MP3 直接以文件 URI 发送；绝不复制到五天缓存或因发送失败删除。
-        file_reference = cache_path.resolve().as_uri()
-
-        # 首选 voiceurl（文件路径，无大小限制）
-        outcome = await self._send_custom_voice("voiceurl", {"url": file_reference}, stream_id)
-        if outcome != "failed":
-            return outcome == "sent"
-
-        if isinstance(audio, Path):
-            return False  # 永久 MP3 不走 base64 重发或载入内存
-        if len(audio) > _B64_FALLBACK_MAX_BYTES:
-            self.ctx.logger.warning(
-                "voiceurl 发送失败且音频过大（%d bytes），base64 兜底必超传输帧上限，放弃",
-                len(audio),
-            )
-            return False
-
-        # 兜底：走 base64 语音段（仅小文件可行）
-        b64_url = "base64://" + base64.b64encode(audio).decode("ascii")
-        for custom_type in ("record", "voice"):
-            outcome = await self._send_custom_voice(custom_type, {"file": b64_url}, stream_id)
-            if outcome == "sent":
-                return True
-            if outcome == "unknown":
-                return False
-            # "failed" → 尝试下一种
-        return False
-
-    async def _send_custom_voice(self, custom_type: str, data: dict[str, Any], stream_id: str) -> str:
-        """发送一条语音消息，返回结果：``"sent"`` / ``"failed"`` / ``"unknown"``。
-
-        底层 RPC 的真实超时给得很长（``_VOICE_SEND_RPC_TIMEOUT_MS``），
-        插件侧用 ``asyncio.wait`` 做软截止——它不会取消发送任务；超软截止
-        后按 ``"unknown"`` 处理，发送任务留在后台由观察任务继续等待结果。
-
-        注意：宿主侧的发送一旦发出就无法撤回，所以 ``"unknown"`` 既可能
-        最终送达也可能失败，唯一正确的做法是绝不重发，只观察。
-        """
-        send_task = asyncio.create_task(
-            self.ctx.send.custom(
-                custom_type,
-                data,
-                stream_id,
-                timeout_ms=_VOICE_SEND_RPC_TIMEOUT_MS,
-            )
-        )
-        done, _ = await asyncio.wait({send_task}, timeout=_VOICE_SEND_DEADLINE_S)
-        if send_task not in done:
-            self.ctx.logger.warning(
-                "%s 语音发送超过 %ds 未返回，先按失败上报，后台继续确认结果",
-                custom_type,
-                _VOICE_SEND_DEADLINE_S,
-            )
-            self._spawn_late_voice_watcher(send_task, stream_id)
-            return "unknown"
-        try:
-            return "sent" if send_task.result() else "failed"
-        except Exception as exc:
-            self.ctx.logger.warning("%s 语音发送结果未知: %s", custom_type, exc)
-            return "unknown"
-
-    def _spawn_late_voice_watcher(self, send_task: "asyncio.Task[bool]", stream_id: str) -> None:
-        """后台观察一次结果未知的语音发送，确认送达后补发文字说明。"""
-
-        async def _watch() -> None:
-            try:
-                done, _ = await asyncio.wait({send_task}, timeout=_LATE_VOICE_WATCH_S)
-                if not done:
-                    self.ctx.logger.warning("语音发送观察超过 %ds 仍未返回，放弃确认", _LATE_VOICE_WATCH_S)
-                    return
-                try:
-                    sent = bool(send_task.result())
-                except Exception:
-                    return  # 最终确认失败，此前已如实上报，无需处理
-                if sent:
-                    self.ctx.logger.info("迟到确认：语音已送达 %s，补发提示", stream_id)
-                    try:
-                        await self.ctx.send.text("刚才那条语音其实发出去啦～", stream_id)
-                    except Exception as exc:
-                        self.ctx.logger.warning("补发语音送达提示失败: %s", exc)
-            except asyncio.CancelledError:
-                pass
-            finally:
-                self._late_voice_watchers.discard(asyncio.current_task())
-
-        watcher = asyncio.create_task(_watch())
-        self._late_voice_watchers.add(watcher)
+            cache_dir=self._voice_cache_dir()
+            await asyncio.to_thread(cache_dir.mkdir,parents=True,exist_ok=True)
+            cache_path=cache_dir/f"sing_{uuid.uuid4().hex}.wav"
+            await asyncio.to_thread(cache_path.write_bytes,audio)
+        absolute=await asyncio.to_thread(cache_path.resolve)
+        return await sender.send_file(absolute,stream_id)
 
     def _find_stream_id(self, stream_id: str, kwargs: dict[str, Any]) -> str:
         sid = str(stream_id or "").strip() or str(kwargs.get("stream_id", "") or "")
@@ -909,17 +906,14 @@ class SingPlugin(MaiBotPlugin):
                          ensure_ascii=False, separators=(',', ':')).encode('utf-8')
         return hashlib.sha256(b'sing-command-v1\0' + raw).hexdigest()
 
-    @staticmethod
-    def _find_request(store: JobStore, stream_id: str, token: str):
-        with sqlite3.connect(store.path, timeout=5) as database:
-            row = database.execute('SELECT id FROM jobs WHERE stream_id=? AND request_token=?',
-                                   (stream_id, token)).fetchone()
-        return store.get(row[0], stream_id) if row else None
+    def _require_active_cover(self) -> ActiveCoverService:
+        active=self._active_cover
+        if active is None:
+            raise RuntimeError('持久化调度服务尚未启动或正在重载')
+        return active
 
     def _require_jobs(self) -> JobService:
-        if self._jobs is None:
-            raise RuntimeError('持久化调度服务尚未启动')
-        return self._jobs
+        return self._require_active_cover().jobs
 
     @staticmethod
     def _job_status(job: Any) -> str:
@@ -936,10 +930,12 @@ class SingPlugin(MaiBotPlugin):
         failure = f"，阶段原因 {job.error.get('code')}" if job.error else ''
         return f'{job.state}/{job.stage}，进度 {job.chunk_done}/{job.chunk_total}{failure}，{delivery}'
 
-    async def _owned_job(self, stream_id: str, kwargs: dict[str, Any], job_id: str):
-        identity = self._command_identity(stream_id, kwargs)
-        job = await asyncio.to_thread(self._require_jobs().store.get, job_id, stream_id)
-        if job.request.get('platform') != identity['platform'] or job.request.get('user_id') != identity['user_id']:
+    async def _owned_job(self, active: ActiveCoverService, stream_id: str,
+                         kwargs: dict[str,Any], job_id: str):
+        identity=self._command_identity(stream_id,kwargs)
+        job=await active.jobs.get_job(job_id,stream_id)
+        if (job.request.get('platform')!=identity['platform']
+                or job.request.get('user_id')!=identity['user_id']):
             raise JobNotFound('无权访问此消息流中的其他用户任务')
         return job
 
@@ -947,12 +943,12 @@ class SingPlugin(MaiBotPlugin):
              pattern=r'^(?P<pfx>\S)翻唱选择\s+(?P<job_id>[0-9a-f]{32})\s+(?P<number>\d{1,2})$')
     async def handle_cover_select(self, stream_id: str = '', **kwargs: Any) -> tuple[bool, str, bool]:
         try:
-            groups = kwargs.get('matched_groups') or {}
-            job = await self._owned_job(stream_id, kwargs, groups.get('job_id', ''))
-            offer = await asyncio.to_thread(self._require_jobs().store.choices, job.id, stream_id)
-            job = await asyncio.to_thread(self._require_jobs().store.select, job.id, stream_id,
-                                          offer['offer_id'], int(groups.get('number', 0)))
-            self._require_jobs()._wake.set()
+            active=self._require_active_cover()
+            groups=kwargs.get('matched_groups') or {}
+            job=await self._owned_job(active,stream_id,kwargs,groups.get('job_id',''))
+            offer=await active.jobs.choices(job.id,stream_id)
+            job=await active.jobs.select(
+                job.id,stream_id,offer['offer_id'],int(groups.get('number',0)))
             await self.ctx.send.text(f'已选择曲目，任务 {job.id} 已入队。', stream_id)
             return True, job.id, True
         except (ValueError, JobConflict, JobNotFound, RuntimeError) as exc:
@@ -963,8 +959,14 @@ class SingPlugin(MaiBotPlugin):
              pattern=r'^(?P<pfx>\S)翻唱状态\s+(?P<job_id>[0-9a-f]{32})$')
     async def handle_cover_status(self, stream_id: str = '', **kwargs: Any) -> tuple[bool, str, bool]:
         try:
-            job = await self._owned_job(stream_id, kwargs, (kwargs.get('matched_groups') or {}).get('job_id', ''))
-            await self.ctx.send.text(f'翻唱任务 {job.id}：{self._job_status(job)}', stream_id)
+            active=self._require_active_cover()
+            job=await self._owned_job(
+                active,stream_id,kwargs,(kwargs.get('matched_groups') or {}).get('job_id',''))
+            fault=await active.jobs.coordinator_error(job.id,stream_id)
+            detail=(f"；协调器 {fault['code']}：{fault['message']}，约 {fault['retry_after_s']} 秒后重试"
+                    if fault is not None else '')
+            await self.ctx.send.text(
+                f'翻唱任务 {job.id}：{self._job_status(job)}{detail}',stream_id)
             return True, job.id, True
         except (ValueError, JobNotFound, RuntimeError) as exc:
             await self.ctx.send.text(f'查询失败：{exc}', stream_id)
@@ -974,8 +976,10 @@ class SingPlugin(MaiBotPlugin):
              pattern=r'^(?P<pfx>\S)翻唱取消\s+(?P<job_id>[0-9a-f]{32})$')
     async def handle_cover_cancel(self, stream_id: str = '', **kwargs: Any) -> tuple[bool, str, bool]:
         try:
-            job = await self._owned_job(stream_id, kwargs, (kwargs.get('matched_groups') or {}).get('job_id', ''))
-            job = await self._require_jobs().cancel(job.id, stream_id)
+            active=self._require_active_cover()
+            job=await self._owned_job(
+                active,stream_id,kwargs,(kwargs.get('matched_groups') or {}).get('job_id',''))
+            job=await active.jobs.cancel(job.id,stream_id)
             await self.ctx.send.text(f'取消请求已持久化：{job.id}，{self._job_status(job)}', stream_id)
             return True, job.id, True
         except (ValueError, JobNotFound, JobConflict, RuntimeError) as exc:
@@ -991,7 +995,8 @@ class SingPlugin(MaiBotPlugin):
     )
     async def handle_cover_command(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
         try:
-            identity = self._command_identity(stream_id, kwargs)
+            identity=self._command_identity(stream_id,kwargs)
+            active=self._require_active_cover()
             # Tool/kwargs groups cannot grant consent: parse the Host's original
             # Command text rather than trusting a separately supplied group.
             command_match = re.fullmatch(
@@ -1013,28 +1018,28 @@ class SingPlugin(MaiBotPlugin):
                 raise ValueError('命令参数顺序无效；--auto-reply 只能放在最后')
             if not query or ' - ' not in query or not query.rsplit(' - ', 1)[-1].strip():
                 raise ValueError('请用 /翻唱 准确歌名 - 艺人名；来源需在候选列表明确选定')
-            if model and model not in (self.config.rvc.default_model.strip(), self.config.local.model_path,
-                                      Path(self.config.local.model_path).name):
+            if model and model not in active.model_aliases:
                 raise ValueError('只能使用管理员固定配置的音色')
-            if identity['platform'] != 'qq':
+            if identity['platform']!='qq':
                 raise ValueError('目前仅支持 QQ 原始命令授权语音自动投递')
-            jobs = self._require_jobs()
-            provider = self._resolve_platform(self.config.music.default_platform)
-            request = {'query': query, 'provider': provider, 'platform': identity['platform'],
-                       'user_id': identity['user_id'], 'instrumental': matched.get('instrumental') == '--with-instrumental',
-                       'album': album, 'source_id': source_id, 'model_selector': model,
-                       'model': self.config.rvc.default_model.strip(),
-                       'model_path': self.config.local.model_path, 'auto_reply': auto_reply}
+            jobs=active.jobs
+            provider=active.provider
+            request={'query':query,'provider':provider,'platform':identity['platform'],
+                     'user_id':identity['user_id'],
+                     'instrumental':matched.get('instrumental')=='--with-instrumental',
+                     'album':album,'source_id':source_id,'model_selector':model,
+                     'model':active.default_model,'model_path':active.model_path,
+                     'auto_reply':auto_reply}
             token = self._request_token(identity)
             # Replayed Command RPCs reuse the exact persisted token; never repeat a
             # search or start a second worker when an offer/selection already exists.
-            existing = await asyncio.to_thread(self._find_request, jobs.store, stream_id, token)
+            existing=await jobs.find_request(
+                stream_id,token,request,auto_reply=auto_reply,consent_event=consent_event)
             if existing is not None:
-                if existing.request != request or existing.consent_event != consent_event:
-                    raise JobConflict('原消息身份与请求内容冲突，拒绝复用')
-                job = existing
+                job=existing
             else:
-                choices = await jobs.catalogue.search(query, provider, limit=min(10, max(1, self.config.music.search_limit)))
+                choices=await jobs.catalogue.search(
+                    query,provider,limit=active.search_limit)
                 title, artist = [part.strip() for part in query.rsplit(' - ', 1)]
                 if not title:
                     raise ValueError('缺少准确歌名')
@@ -1047,24 +1052,17 @@ class SingPlugin(MaiBotPlugin):
                     choices = [item for item in choices if item.track_id == source_id]
                 if not choices:
                     raise ValueError('未找到符合准确曲目/艺人/专辑/来源 ID 的候选；没有启动翻唱')
-                job, _ = await asyncio.to_thread(jobs.store.submit, stream_id, token, request,
-                    auto_reply=auto_reply, consent_event=consent_event)
-                if job.state == 'searching':
-                    job = await asyncio.to_thread(jobs.store.offer, job.id, stream_id, choices,
-                                                  expected_revision=job.revision)
-            if job.state == 'needs_selection':
-                offer = await asyncio.to_thread(jobs.store.choices, job.id, stream_id)
-                choices = offer['items']
-                # Multiple recordings cannot be guessed from rank, length or popularity.
-                if len(choices) == 1:
-                    job = await asyncio.to_thread(jobs.store.select, job.id, stream_id, offer['offer_id'], 1)
-                    jobs._wake.set()
-                else:
-                    lines = [f'任务 {job.id}：请选择明确版本，发送 /翻唱选择 {job.id} 序号：']
-                    lines += [f"{i}. {item['title']} - {item['artist']} · {item['album']} · ID {item['track_id']} · {item['availability']}"
-                              for i, item in enumerate(choices, 1)]
-                    await self.ctx.send.text('\n'.join(lines), stream_id)
-                    return True, f'待选择任务 {job.id}', True
+                job,_=await jobs.admit_offer(
+                    stream_id,token,request,choices,auto_reply=auto_reply,
+                    consent_event=consent_event,select_single=True)
+            if job.state=='needs_selection':
+                offer=await jobs.choices(job.id,stream_id)
+                choices=offer['items']
+                lines=[f'任务 {job.id}：请选择明确版本，发送 /翻唱选择 {job.id} 序号：']
+                lines += [f"{i}. {item['title']} - {item['artist']} · {item['album']} · ID {item['track_id']} · {item['availability']}"
+                          for i,item in enumerate(choices,1)]
+                await self.ctx.send.text('\n'.join(lines),stream_id)
+                return True,f'待选择任务 {job.id}',True
             await self.ctx.send.text(f'翻唱任务 {job.id}：{self._job_status(job)}；发送 /翻唱状态 {job.id} 查询。', stream_id)
             return True, f'翻唱任务 {job.id} 已持久化', True
         except (ValueError, JobConflict, CatalogueError, RuntimeError) as exc:
@@ -1087,6 +1085,9 @@ class SingPlugin(MaiBotPlugin):
             return False, "缺少文本", True
 
         try:
+            sender=self._voice_sender
+            if sender is None:
+                raise RuntimeError('语音发送服务尚未启动或正在重载')
             model = self._resolve_model("")
             audio = await self._run_speak(text, model, stream_id)
         except Exception as exc:
@@ -1094,8 +1095,19 @@ class SingPlugin(MaiBotPlugin):
             await self.ctx.send.text(f"说话失败：{exc}", stream_id)
             return False, str(exc), True
 
-        ok = await self._send_voice(audio, stream_id)
-        return ok, f"说: {text}", True
+        try:
+            receipt=await self._send_voice(audio,stream_id,sender)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.exception("语音发送失败")
+            await self.ctx.send.text(f"语音发送失败：{exc}",stream_id)
+            return False,str(exc),True
+        if receipt.outcome=='sent' and receipt.message_id:
+            return True,f"说: {text}（消息 {receipt.message_id}）",True
+        message='语音发送结果未知，可能已送达；不会自动重发。'
+        await self.ctx.send.text(message,stream_id)
+        return True,message,True
 
     @Command(
         "音色列表",

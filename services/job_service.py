@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 import asyncio
 import json
 import logging
@@ -25,7 +25,8 @@ import uuid
 from ..runtime.recipe_identity import fingerprint, recipe_document, validate_document
 from ..runtime.render_plan import Step, build_plan
 from .artifact_store import ArtifactError, ArtifactStore, publish_job
-from .asset_inventory import AssetInventory, InventoryError
+from .asset_inventory import (AssetInventory, InventoryError, RuntimeInventory,
+                              RUNTIME_HASH_NAMES, runtime_generation)
 from .catalogue_service import CatalogueError, CatalogueService
 from .job_store import Job, JobConflict, JobStore
 from .media_probe import probe_download
@@ -36,6 +37,24 @@ from .unit_runner import UnitError, save_plan
 
 
 LOGGER = logging.getLogger(__name__)
+RENDER_PARAMETER_POLICY = {
+    'schema': 'sing-render-policy-v1',
+    'source_binding': 'selected-provider-track-id',
+    'sample_rate_hz': 44100,
+    'chunk_seconds': 20,
+    'tail_fold_seconds': 5,
+    'pitch_semitones': 0,
+    'f0_method': 'harvest',
+    'index_rate': 0.5,
+    'filter_radius': 3,
+    'rms_mix_rate': 0.25,
+    'protect': 0.33,
+    'seed': 20260928,
+    'resample_hz': 44100,
+    'encode': {'codec': 'libmp3lame', 'bitrate': '192k'},
+    'instrumental_modes': [False, True],
+}
+
 _COORDINATOR_MESSAGES = {
     'unit_status_unknown': '无法确认当前计算单元是否已停止；任务槽位保留，未启动新阶段。',
     'launch_unknown': '无法确认当前阶段是否已完成启动或退出；任务槽位保留，未启动新阶段。',
@@ -162,6 +181,33 @@ def _replace_status(path: Path, document: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _freeze_runtime_context(context: Mapping[str, Any]) -> dict:
+    try:
+        execution = {str(name): os.fspath(path)
+                     for name, path in dict(context['execution_paths']).items()}
+        limits = dict(context['limits'])
+        policy = json.loads(json.dumps(context['parameter_policy'], ensure_ascii=False,
+                                       allow_nan=False))
+        return {'execution_paths': execution,
+                'artifact_root': os.fspath(context['artifact_root']),
+                'limits': limits, 'parameter_policy': policy}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError('Invalid immutable runtime context') from exc
+
+
+def _delivery_candidates(store: JobStore, limit: int) -> list[tuple[str, str]]:
+    if type(limit) is not int or not 1 <= limit <= 32:
+        raise ValueError('Invalid delivery scan limit')
+    try:
+        with sqlite3.connect(store.path, timeout=5) as database:
+            return [(str(job_id), str(stream_id)) for job_id, stream_id in database.execute(
+                "SELECT id,stream_id FROM jobs WHERE state='ready' "
+                "AND delivery_state='pending' ORDER BY created_at,id LIMIT ?", (limit,))]
+    except sqlite3.Error as exc:
+        raise JobServiceError('delivery_scan_failed',
+                              'Durable delivery scan failed') from exc
+
+
 def _read_status(path: Path):
     try:
         if not path.exists():
@@ -202,8 +248,9 @@ class JobService:
                  'converting', 'encoding', 'validating', 'publishing')
 
     def __init__(self, store: JobStore, catalogue: CatalogueService,
-                 coordinator: StageCoordinator, artifacts: ArtifactStore,
+                 coordinator: StageCoordinator, artifacts: Any,
                  inventory: AssetInventory, runtime: RenderRuntime, *,
+                 runtime_context: Optional[Mapping[str, Any]] = None,
                  downloader: Callable = download_selected,
                  probe: Callable = probe_download,
                  plan_builder: Callable = build_plan,
@@ -214,9 +261,20 @@ class JobService:
         self.store = store
         self.catalogue = catalogue
         self.coordinator = coordinator
-        self.artifacts = artifacts
+        self.artifacts = None if isinstance(artifacts, Path) else artifacts
+        if isinstance(artifacts, Path):
+            self._artifact_root = Path(artifacts)
+        elif isinstance(artifacts, ArtifactStore):
+            self._artifact_root = Path(artifacts.root)
+        else:
+            self._artifact_root = None
         self.inventory = inventory
         self.runtime = runtime
+        self._runtime_context = (_freeze_runtime_context(runtime_context)
+                                 if runtime_context is not None else None)
+        self._generation: Optional[str] = None
+        self._runtime_inventory: Optional[RuntimeInventory] = None
+        self._context_task: Optional[asyncio.Task] = None
         self.downloader = downloader
         self.probe = probe
         self.plan_builder = plan_builder
@@ -290,10 +348,73 @@ class JobService:
         future.add_done_callback(self._finish_offload)
         return await asyncio.shield(future)
 
+    def _prepare_context_sync(self) -> str:
+        if self._runtime_context is None or self._artifact_root is None:
+            raise JobServiceError('runtime_context_missing',
+                                  'Durable job service requires a runtime generation context')
+        self._ensure_work_root()
+        root = Path(self._runtime_context['artifact_root'])
+        if root != self._artifact_root or not root.is_absolute():
+            raise JobServiceError('artifact_root_mismatch',
+                                  'Runtime context and artifact store root differ')
+        if any(path.is_symlink() for path in (root, *root.parents)):
+            raise JobServiceError('artifact_root_invalid',
+                                  'Symlinked artifact storage root refused')
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not root.is_dir() or root.is_symlink():
+            raise JobServiceError('artifact_root_invalid',
+                                  'Artifact storage root is invalid')
+        os.chmod(root, 0o700)
+        if self.artifacts is None:
+            self.artifacts = ArtifactStore(root)
+        elif not isinstance(self.artifacts, ArtifactStore) or Path(self.artifacts.root) != root:
+            raise JobServiceError('artifact_root_mismatch',
+                                  'Artifact validator is not bound to the configured root')
+        self.store.bind_artifact_root(str(root))
+        runtime_inventory = self.inventory.build_runtime()
+        generation = runtime_generation(runtime_inventory, self._runtime_context)
+        self._runtime_inventory = runtime_inventory
+        self._generation = generation
+        return generation
+
+    def _finish_context_task(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            error=task.exception()
+        except BaseException as exc:
+            error=exc
+        if error is not None:
+            self._coordinator_failures.append(error)
+            del self._coordinator_failures[:-16]
+
+    async def prepare(self) -> str:
+        """Bind storage and freeze one real runtime generation without starting loops."""
+        if self._closed:
+            raise RuntimeError('Job service is closed')
+        if self._generation is not None:
+            return self._generation
+        if self._context_task is None:
+            task=asyncio.create_task(self._offload(self._prepare_context_sync),
+                                     name='sing-runtime-context')
+            task.add_done_callback(self._finish_context_task)
+            self._context_task=task
+        generation=await asyncio.shield(self._context_task)
+        if self._generation is None or generation!=self._generation:
+            raise JobServiceError('runtime_generation_missing',
+                                  'Runtime generation preparation did not complete')
+        return self._generation
+
+    @property
+    def generation(self) -> str:
+        if self._generation is None:
+            raise RuntimeError('Job service runtime context is not prepared')
+        return self._generation
+
     async def start(self) -> None:
         if self._closed:
             raise RuntimeError('Job service is closed')
-        await self._offload(self._ensure_work_root)
+        await self.prepare()
         if self._task is None:
             self._task = asyncio.create_task(self._loop(), name='sing-durable-job-service')
             self._wake.set()
@@ -324,45 +445,103 @@ class JobService:
             raise ValueError('Job workspace root is not a directory')
         os.chmod(root, 0o700)
 
+    def _request_document(self, request: dict, *, auto_reply: bool) -> dict:
+        if not isinstance(request,dict):
+            raise ValueError('Request metadata must be an object')
+        if 'service_generation' in request:
+            raise ValueError('Service generation is reserved for the durable coordinator')
+        _reject_credentials(request)
+        instrumental=request.get('instrumental',False)
+        if type(instrumental) is not bool:
+            raise ValueError('Instrumental must be explicit bool')
+        declared_auto_reply=request.get('auto_reply',False)
+        if type(auto_reply) is not bool or type(declared_auto_reply) is not bool:
+            raise ValueError('Auto reply must be explicit bool')
+        if declared_auto_reply!=auto_reply:
+            raise ValueError('Request auto reply selector differs from durable consent')
+        try:
+            document=json.loads(json.dumps(request,ensure_ascii=False,allow_nan=False))
+        except (TypeError,ValueError) as exc:
+            raise ValueError('Request metadata must be finite JSON') from exc
+        document['service_generation']=self.generation
+        return document
+
+    async def find_request(self, stream_id: str, request_token: str, request: dict, *,
+                           auto_reply: bool = False,
+                           consent_event: Optional[str] = None) -> Optional[Job]:
+        await self.prepare()
+        document=self._request_document(request,auto_reply=auto_reply)
+        await self._offload(self.store.expire_candidates)
+        job=await self._offload(self.store.find_request,stream_id,request_token)
+        if job is not None and (job.request!=document or job.consent_event!=consent_event):
+            raise JobConflict('Same request token has different contents, consent, or generation')
+        return job
+
+    async def admit_offer(self, stream_id: str, request_token: str, request: dict,
+                          candidates: list, *, auto_reply: bool = False,
+                          consent_event: Optional[str] = None,
+                          select_single: bool = True) -> tuple[Job,bool]:
+        await self.prepare()
+        document=self._request_document(request,auto_reply=auto_reply)
+        await self._offload(self.store.expire_candidates)
+        job,created=await self._offload(
+            self.store.admit_offer,stream_id,request_token,document,candidates,
+            auto_reply=auto_reply,consent_event=consent_event,
+            select_single=select_single)
+        if job.state=='queued':
+            self._wake.set()
+        return job,created
+
     async def submit_selected(self, stream_id: str, request_token: str, request: dict,
                               selected: CatalogueItem, *, auto_reply: bool = False,
                               consent_event: Optional[str] = None) -> tuple[Job, bool]:
-        """Persist one exact displayed row without resolving or downloading it."""
-        if not isinstance(selected, CatalogueItem):
+        """Atomically persist and select one exact displayed provider row."""
+        if not isinstance(selected,CatalogueItem):
             raise ValueError('A typed selected catalogue item is required')
-        if not isinstance(request, dict):
-            raise ValueError('Request metadata must be an object')
-        _reject_credentials(request)
-        instrumental = request.get('instrumental', False)
-        if type(instrumental) is not bool:
-            raise ValueError('Instrumental must be explicit bool')
-        job, created = await self._offload(
-            self.store.submit, stream_id, request_token, request,
-            auto_reply=auto_reply, consent_event=consent_event)
-        # Retry a host crash between submit/offer/select without a new search.
-        if job.state == 'searching':
-            job = await self._offload(self.store.offer, job.id, stream_id, [selected],
-                                          expected_revision=job.revision)
-        if job.state == 'needs_selection':
-            choices = await self._offload(self.store.choices, job.id, stream_id)
-            items = choices['items']
-            if len(items) != 1 or (items[0]['provider'], items[0]['track_id']) != (
-                    selected.provider, selected.track_id):
-                raise JobConflict('Persisted selection differs from this exact provider track')
-            job = await self._offload(self.store.select, job.id, stream_id,
-                                          choices['offer_id'], 1)
-        if (job.state not in (frozenset(('queued', 'running', 'cancel_requested')) | self._TERMINAL)
+        job,created=await self.admit_offer(
+            stream_id,request_token,request,[selected],auto_reply=auto_reply,
+            consent_event=consent_event,select_single=True)
+        if (job.state not in (frozenset(('queued','running','cancel_requested'))|self._TERMINAL)
                 or not job.selected_source
-                or (job.selected_source['provider'], job.selected_source['track_id']) !=
-                   (selected.provider, selected.track_id)):
+                or (job.selected_source['provider'],job.selected_source['track_id']) !=
+                   (selected.provider,selected.track_id)):
             raise JobConflict('Job is not bound to the requested provider track')
+        return job,created
+
+    async def get_job(self, job_id: str, stream_id: str) -> Job:
+        await self.prepare()
+        return await self._offload(self.store.get,job_id,stream_id)
+
+    async def choices(self, job_id: str, stream_id: str) -> dict:
+        await self.prepare()
+        return await self._offload(self.store.choices,job_id,stream_id)
+
+    async def select(self, job_id: str, stream_id: str, offer_id: str,
+                     number: int) -> Job:
+        await self.prepare()
+        current=await self._offload(self.store.get,job_id,stream_id)
+        if current.request.get('service_generation')!=self.generation:
+            if current.state=='needs_selection':
+                await self._offload(self.store.cancel,job_id,stream_id)
+            raise JobServiceError('configuration_changed',
+                                  '任务配置已变化；旧候选未启动，请重新发起请求。')
+        result=await self._offload(self.store.select,job_id,stream_id,offer_id,number)
         self._wake.set()
-        return job, created
+        return result
 
     async def cancel(self, job_id: str, stream_id: str) -> Job:
+        await self.prepare()
         result = await self._offload(self.store.cancel, job_id, stream_id)
         self._wake.set()
         return result
+
+    async def expire_candidates(self) -> int:
+        await self.prepare()
+        return await self._offload(self.store.expire_candidates)
+
+    async def delivery_candidates(self, limit: int = 8) -> list[tuple[str,str]]:
+        await self.prepare()
+        return await self._offload(_delivery_candidates,self.store,limit)
 
     @staticmethod
     def _coordinator_document(exc: Exception, retry_after_s: float) -> dict:
@@ -390,6 +569,7 @@ class JobService:
     async def coordinator_error(self, job_id: Optional[str] = None,
                                 stream_id: Optional[str] = None):
         """Return a bounded public-safe nonterminal coordinator status."""
+        await self.prepare()
         if (job_id is None)!=(stream_id is None):
             raise ValueError('Job and stream identities must be supplied together')
         if job_id is None:
@@ -401,6 +581,8 @@ class JobService:
 
     async def run_once(self) -> Optional[Job]:
         """Reconcile one owned run, or atomically claim and run one queued job."""
+        await self.prepare()
+        await self._offload(self.store.expire_candidates)
         active = await self._offload(self.scanner, self.store,
                                          ('running', 'cancel_requested'))
         if len(active) > 1:
@@ -565,12 +747,33 @@ class JobService:
             raise JobServiceError('frozen_plan_invalid', 'Frozen recipe or plan is invalid') from exc
         return recipe, steps, plan_path
 
-    async def _prepare(self, job: Job, workspace: Path, selected: CatalogueItem):
-        frozen = await self._offload(self._read_frozen, workspace, selected)
-        if frozen is not None:
+    def _inventory_generation(self, hashes: Mapping[str,str],
+                              versions: Mapping[str,str]) -> str:
+        if self._runtime_context is None:
+            raise JobServiceError('runtime_context_missing',
+                                  'Runtime generation context is unavailable')
+        runtime_inventory=RuntimeInventory(
+            hashes={name:hashes[name] for name in RUNTIME_HASH_NAMES},
+            versions=dict(versions))
+        return runtime_generation(runtime_inventory,self._runtime_context)
+
+    async def _verify_live_generation(self) -> None:
+        current=await self._offload(self.inventory.build_runtime)
+        if runtime_generation(current,self._runtime_context)!=self.generation:
+            raise JobServiceError('configuration_changed',
+                                  '任务配置资产已变化；未启动下载或媒体阶段，请重新加载配置。')
+
+    async def _prepare(self, job: Job, workspace: Path, selected: CatalogueItem,
+                       frozen=None):
+        if frozen is None:
+            await self._verify_live_generation()
+        else:
             return (*frozen, True)
         source, report = await self._source(job, workspace, selected)
         inventory = await self._offload(self.inventory.build, source)
+        if self._inventory_generation(inventory.hashes,inventory.versions)!=self.generation:
+            raise JobServiceError('configuration_changed',
+                                  '任务配置资产在冻结前发生变化；未启动媒体阶段。')
         duration = report.get('duration_s')
         frames = report.get('frames')
         if type(frames) is not int:
@@ -644,7 +847,13 @@ class JobService:
         await self._offload(self._ensure_workspace, workspace)
         if await self._cancel_without_unit(job):
             return
-        recipe, steps, plan_path, frozen = await self._prepare(job, workspace, selected)
+        frozen_plan=await self._offload(self._read_frozen,workspace,selected)
+        if (frozen_plan is None
+                and job.request.get('service_generation')!=self.generation):
+            raise JobServiceError('configuration_changed',
+                                  '任务配置代际已变化；未启动下载或媒体阶段，请重新发起。')
+        recipe, steps, plan_path, frozen = await self._prepare(
+            job,workspace,selected,frozen_plan)
         recipe_key = fingerprint(recipe)
         attempts = await self._offload(self.store.stage_attempts, job.id, job.stream_id)
         start = self._attempt_prefix(steps, attempts)

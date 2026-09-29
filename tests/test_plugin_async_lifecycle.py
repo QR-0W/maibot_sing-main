@@ -2,10 +2,12 @@
 from pathlib import Path
 from types import SimpleNamespace
 import asyncio
+import importlib
 import importlib.util
 import logging
 import subprocess
 import sys
+import threading
 import tomllib
 
 import pytest
@@ -60,6 +62,14 @@ def plugin(tmp_path, monkeypatch):
                     plugin_module.SongInfo('id-2', 'Song Live', 'Artist', 'Album Live', provider, duration_s=125)]
         async def close(self):
             pass
+    version_names=importlib.import_module(
+        'sing_async_test.runtime.recipe_identity').VERSION_NAMES
+    class FakeVersionProbe:
+        def __init__(self, worker_python):
+            self.worker_python=worker_python
+        def __call__(self):
+            return {name:'test-1' for name in version_names}
+    monkeypatch.setattr(plugin_module,'RuntimeVersionProbe',FakeVersionProbe)
     monkeypatch.setattr(instance, '_build_music_client', FakeCatalogue)
     monkeypatch.setattr(instance, '_restore_music_logins', no_login)
     return instance, sends
@@ -194,8 +204,13 @@ async def test_select_status_cancel_only_owner_and_no_render_rpc(plugin, monkeyp
         assert (await instance.handle_cover_select(**select))[0]
         state = instance._jobs.store.get(job_id, 'stream-1')
         assert state.state == 'queued' and state.selected_source['track_id'] == 'id-2'
+        async def safe_fault(*args):
+            return {'schema':1,'code':'unit_status_unknown','message':'无法确认计算单元；任务槽位保留。',
+                    'retry_after_s':4,'updated_at':1}
+        monkeypatch.setattr(instance._jobs,'coordinator_error',safe_fault)
         assert (await instance.handle_cover_status(**command(msg='platform-message-3', text='/翻唱状态 '+job_id,
             groups={'job_id': job_id})))[0]
+        assert 'unit_status_unknown' in sends[-1][0] and '无法确认计算单元' in sends[-1][0]
         assert (await instance.handle_cover_cancel(**command(msg='platform-message-4', text='/翻唱取消 '+job_id,
             groups={'job_id': job_id})))[0]
         assert instance._jobs.store.get(job_id, 'stream-1').state == 'cancelled'
@@ -209,8 +224,9 @@ async def test_duplicate_host_scheduler_owner_fails_closed(plugin):
     await instance.on_load()
     try:
         current = instance._jobs
+        settings=instance._capture_durable_settings()
         with pytest.raises(plugin_module.OwnershipBusy):
-            await instance._start_durable_services()
+            await instance._start_durable_services(settings)
         assert instance._jobs is current
     finally:
         await instance.on_unload()
@@ -242,6 +258,179 @@ async def test_real_plan_uses_media_stage_cli_and_reaches_sandbox_guard(plugin):
 
 
 @pytest.mark.asyncio
+async def test_reload_closes_old_search_before_atomic_admission(plugin):
+    instance,sends=plugin
+    await instance.on_load()
+    try:
+        old=instance._active_cover
+        entered,release=asyncio.Event(),asyncio.Event()
+        async def blocked_search(query,provider,*,limit):
+            assert limit==old.search_limit
+            entered.set()
+            await release.wait()
+            from sing_async_test.services.source_offer import CatalogueItem
+            return [CatalogueItem(
+                provider,'late-id','Song','Artist','Album',120,'available')]
+        old.jobs.catalogue.search=blocked_search
+        invocation=command(msg='reload-search')
+        request=asyncio.create_task(instance.handle_cover_command(**invocation))
+        await entered.wait()
+        data=instance.get_plugin_config_data()
+        data['music']['search_limit']=1
+        instance.set_plugin_config(data)
+        await instance.on_config_update(plugin_module.CONFIG_RELOAD_SCOPE_SELF,{},'next')
+        assert instance._active_cover is not old
+        assert instance._active_cover.search_limit==1
+        release.set()
+        result=await request
+        assert result[0] is False and ('closing' in result[1] or 'closed' in result[1])
+        identity=instance._command_identity('stream-1',invocation)
+        token=instance._request_token(identity)
+        assert old.jobs.store.find_request('stream-1',token) is None
+    finally:
+        release.set()
+        await instance.on_unload()
+
+
+@pytest.mark.asyncio
+async def test_output_root_reload_fails_closed_without_consuming_old_namespace(plugin):
+    instance,_=plugin
+    await instance.on_load()
+    old_root=str(instance._jobs.artifacts.root)
+    data=instance.get_plugin_config_data()
+    data['local']['output_dir']=str(Path(instance.ctx.paths.data_dir).parent/'new-covers')
+    instance.set_plugin_config(data)
+    with pytest.raises(plugin_module.JobConflict,match='root'):
+        await instance.on_config_update(plugin_module.CONFIG_RELOAD_SCOPE_SELF,{},'new-root')
+    assert instance._active_cover is None and instance._jobs is None
+    assert instance._scheduler_owner is None and instance._outbox is None
+    store=plugin_module.JobStore(Path(instance.ctx.paths.data_dir)/'jobs.sqlite3')
+    assert store.bind_artifact_root(old_root)==old_root
+
+
+@pytest.mark.asyncio
+async def test_root_is_bound_before_outbox_recovery(plugin,monkeypatch):
+    instance,_=plugin
+    original=plugin_module.DeliveryOutbox.recover
+    async def checked(outbox):
+        jobs=instance._jobs
+        assert jobs is not None and isinstance(jobs.artifacts,plugin_module.ArtifactStore)
+        root=str(jobs.artifacts.root)
+        assert outbox._store.bind_artifact_root(root)==root
+        return await original(outbox)
+    monkeypatch.setattr(plugin_module.DeliveryOutbox,'recover',checked)
+    await instance.on_load()
+    await instance.on_unload()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_owner_acquire_closes_late_lock_finitely(plugin,monkeypatch):
+    instance,_=plugin
+    acquired,release=threading.Event(),threading.Event()
+    original=plugin_module.exclusive
+    def delayed(path):
+        real=original(path)
+        class Context:
+            def __enter__(self):
+                fd=real.__enter__()
+                acquired.set()
+                assert release.wait(5)
+                return fd
+            def __exit__(self,*args):
+                return real.__exit__(*args)
+        return Context()
+    monkeypatch.setattr(plugin_module,'exclusive',delayed)
+    loading=asyncio.create_task(instance.on_load())
+    assert await asyncio.to_thread(acquired.wait,2)
+    loading.cancel()
+    started=asyncio.get_running_loop().time()
+    with pytest.raises(asyncio.CancelledError):
+        await loading
+    assert asyncio.get_running_loop().time()-started<1.5
+    lock=Path(instance.ctx.paths.data_dir).resolve()/'.durable-scheduler.lock'
+    with pytest.raises(plugin_module.OwnershipBusy):
+        with original(lock): pass
+    release.set()
+    for _ in range(200):
+        try:
+            with original(lock): pass
+            break
+        except plugin_module.OwnershipBusy:
+            await asyncio.sleep(.01)
+    else:
+        raise AssertionError('late scheduler owner was not released')
+    assert instance._scheduler_owner is None and instance._jobs is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_store_creation_retains_lease_until_schema_finishes(plugin,monkeypatch):
+    instance,_=plugin
+    entered,release=threading.Event(),threading.Event()
+    original_store=plugin_module.JobStore
+    def delayed_store(*args,**kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original_store(*args,**kwargs)
+    monkeypatch.setattr(plugin_module,'JobStore',delayed_store)
+    loading=asyncio.create_task(instance.on_load())
+    assert await asyncio.to_thread(entered.wait,2)
+    loading.cancel()
+    started=asyncio.get_running_loop().time()
+    with pytest.raises(asyncio.CancelledError):
+        await loading
+    assert asyncio.get_running_loop().time()-started<1.5
+    lock=Path(instance.ctx.paths.data_dir).resolve()/'.durable-scheduler.lock'
+    with pytest.raises(plugin_module.OwnershipBusy):
+        with plugin_module.exclusive(lock): pass
+    release.set()
+    for _ in range(200):
+        try:
+            with plugin_module.exclusive(lock): pass
+            break
+        except plugin_module.OwnershipBusy:
+            await asyncio.sleep(.01)
+    else:
+        raise AssertionError('startup database lease was not released')
+    assert (Path(instance.ctx.paths.data_dir)/'jobs.sqlite3').is_file()
+    assert instance._scheduler_owner is None and instance._jobs is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome,message_id,expected_text',[
+    ('sent','platform-positive-id',None),
+    ('unknown',None,'语音发送结果未知，可能已送达；不会自动重发。')])
+async def test_speak_preserves_single_sender_receipt(plugin,outcome,message_id,expected_text):
+    instance,sends=plugin
+    await instance.on_load()
+    try:
+        from sing_async_test.services.delivery_outbox import DeliveryReceipt
+        previous=instance._voice_sender
+        await previous.shutdown(timeout_s=0)
+        class Sender:
+            def __init__(self): self.calls=[]
+            async def send_file(self,path,stream_id):
+                self.calls.append((path,stream_id))
+                return DeliveryReceipt(outcome,message_id)
+            async def shutdown(self,*,timeout_s=1): pass
+        sender=Sender()
+        instance._voice_sender=sender
+        async def speech(text,model,stream_id):
+            return b'one synthetic wav attempt'
+        instance._run_speak=speech
+        instance._resolve_model=lambda selector: 'fixed-test-model'
+        before=len(sends)
+        result=await instance.handle_speak_command(
+            stream_id='stream-1',matched_groups={'text':'hello'})
+        assert len(sender.calls)==1 and result[0] is True
+        if expected_text is None:
+            assert 'platform-positive-id' in result[1] and len(sends)==before
+        else:
+            assert result[1]==expected_text and sends[-1][0]==expected_text
+    finally:
+        await instance.on_unload()
+
+
+@pytest.mark.asyncio
 async def test_missing_demucs_bundle_fails_before_scheduler_or_qq(plugin):
     instance, _ = plugin
     repo = Path(instance.config.local.demucs_repo_path)
@@ -250,6 +439,8 @@ async def test_missing_demucs_bundle_fails_before_scheduler_or_qq(plugin):
     with pytest.raises(InventoryError, match='Demucs'):
         await instance.on_load()
     assert instance._jobs is None and instance._scheduler_owner is None
+    assert instance._outbox is None and instance._active_cover is None
+    assert instance._voice_sender is None
 
 
 def test_rvc_wrapper_must_match_inventoried_upstream(plugin):

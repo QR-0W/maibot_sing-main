@@ -18,6 +18,7 @@ pkg = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = pkg
 spec.loader.exec_module(pkg)
 service_module = importlib.import_module('job_service_test_pkg.services.job_service')
+artifact_module = importlib.import_module('job_service_test_pkg.services.artifact_store')
 inventory_module = importlib.import_module('job_service_test_pkg.services.asset_inventory')
 ledger = importlib.import_module('job_service_test_pkg.services.job_store')
 offers = importlib.import_module('job_service_test_pkg.services.source_offer')
@@ -146,6 +147,19 @@ def make_service(tmp_path, *, store=None, catalogue=None, coordinator=None,
         model=paths.model, index=paths.index, hubert=paths.hubert,
         demucs_repo=paths.demucs_repo, inference_lock=inference_lock, poll_interval_s=.05)
     coordinator = coordinator or FakeCoordinator(store, pause_first=pause_first)
+    artifact_root=tmp_path/'artifacts'
+    runtime_context={
+        'execution_paths':{
+            'model':paths.model,'index':paths.index,'hubert':paths.hubert,
+            'demucs_repo':paths.demucs_repo,'rvc_script':paths.rvc_script,
+            'rvc_upstream':paths.rvc_upstream,'media_stage':paths.media_stage,
+            'worker':paths.worker,'render_plan':paths.render_plan,
+            'stage_executor':paths.stage_executor,'worker_python':python,
+            'worker_script':paths.media_stage,'inference_lock':inference_lock},
+        'artifact_root':artifact_root,
+        'limits':{'max_duration_s':runtime.max_duration_s,
+                  'max_download_bytes':runtime.max_download_bytes},
+        'parameter_policy':service_module.RENDER_PARAMETER_POLICY}
     calls = []
 
     async def exact_download(gateway, chosen, workspace, **kwargs):
@@ -171,7 +185,8 @@ def make_service(tmp_path, *, store=None, catalogue=None, coordinator=None,
         return {'job': job, 'artifact': SimpleNamespace(key=key), 'catalog_warnings': []}
 
     instance = service_module.JobService(
-        store, catalogue, coordinator, NoopArtifacts(), inventory, runtime,
+        store, catalogue, coordinator, artifact_root, inventory, runtime,
+        runtime_context=runtime_context,
         downloader=downloader or exact_download, probe=fake_probe,
         publisher=publisher or fake_publish, ownership_fd=ownership_fd,
         close_drain_s=close_drain_s)
@@ -182,7 +197,8 @@ def make_service(tmp_path, *, store=None, catalogue=None, coordinator=None,
 async def test_selected_job_returns_queued_then_runs_without_search_or_persisted_url(tmp_path):
     instance, store, catalogue, coordinator, downloads = make_service(tmp_path)
     queued, created = await instance.submit_selected(
-        'stream-a', 'rpc-message-1', {'instrumental': False, 'query_label': 'synthetic'},
+        'stream-a', 'rpc-message-1',
+        {'instrumental': False, 'query_label': 'synthetic', 'auto_reply': True},
         selected(), auto_reply=True, consent_event='rpc-message-1')
     assert created and queued.state == 'queued'
     assert downloads == [] and catalogue.searches == 0
@@ -204,6 +220,47 @@ async def test_selected_job_returns_queued_then_runs_without_search_or_persisted
     assert recipe['provider'] == '163' and recipe['track_id'] == 'track-42'
     assert recipe['hashes']['source'] == __import__('hashlib').sha256(b'S' * 4096).hexdigest()
     assert finished.artifact_key == recipes.fingerprint(recipe)
+
+
+@pytest.mark.asyncio
+async def test_prepare_binds_root_and_generation_without_starting_loop(tmp_path):
+    instance,store,catalogue,coordinator,downloads=make_service(tmp_path)
+    generation=await instance.prepare()
+    assert len(generation)==64 and instance.generation==generation
+    assert instance._task is None
+    assert isinstance(instance.artifacts,artifact_module.ArtifactStore)
+    assert instance.artifacts.root==tmp_path/'artifacts'
+    assert store.bind_artifact_root(str(tmp_path/'artifacts'))==str(tmp_path/'artifacts')
+
+
+@pytest.mark.asyncio
+async def test_old_queued_generation_fails_before_download_or_stage(tmp_path):
+    first,store,catalogue,coordinator,downloads=make_service(tmp_path)
+    queued,_=await first.submit_selected(
+        'stream-generation','rpc-generation',{'instrumental':False},selected('old-gen'))
+    first.runtime.model.write_bytes(b'administrator-replaced-model')
+    reopened=ledger.JobStore(store.path)
+    second_coordinator=FakeCoordinator(reopened)
+    second,_,_,_,resumed_downloads=make_service(
+        tmp_path,store=reopened,catalogue=catalogue,coordinator=second_coordinator)
+    failed=await second.run_once()
+    assert failed.id==queued.id and failed.state=='failed'
+    assert failed.error['code']=='configuration_changed'
+    assert resumed_downloads==[] and second_coordinator.calls==[]
+    assert not (second.runtime.work_root/queued.id/'source.audio').exists()
+
+
+@pytest.mark.asyncio
+async def test_in_place_runtime_change_after_prepare_fails_before_download(tmp_path):
+    instance,store,catalogue,coordinator,downloads=make_service(tmp_path)
+    await instance.prepare()
+    queued,_=await instance.submit_selected(
+        'stream-live-generation','rpc-live-generation',{'instrumental':False},
+        selected('live-change'))
+    instance.runtime.model.write_bytes(b'in-place-change-after-generation')
+    failed=await instance.run_once()
+    assert failed.id==queued.id and failed.error['code']=='configuration_changed'
+    assert downloads==[] and coordinator.calls==[]
 
 
 @pytest.mark.asyncio
@@ -474,17 +531,20 @@ async def test_close_leaves_flock_with_delayed_sqlite_rpc_until_thread_finishes(
     store = ledger.JobStore(tmp_path / 'jobs.sqlite3')
     instance, _, catalogue, coordinator, downloads = make_service(
         tmp_path, store=store, ownership_fd=owner_fd, close_drain_s=.02)
-    original_submit = store.submit
+    original_admit = store.admit_offer
 
-    def delayed_submit(*args, **kwargs):
+    def delayed_admit(*args, **kwargs):
         entered.set()
         assert release.wait(5)
-        return original_submit(*args, **kwargs)
+        return original_admit(*args, **kwargs)
 
-    store.submit = delayed_submit
+    store.admit_offer = delayed_admit
     request = asyncio.create_task(instance.submit_selected(
         'stream-sqlite', 'rpc-message-sqlite', {'instrumental': False}, selected('sqlite-rpc')))
     await wait_until(entered.is_set)
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
     try:
         await instance.close()
     finally:
@@ -495,9 +555,10 @@ async def test_close_leaves_flock_with_delayed_sqlite_rpc_until_thread_finishes(
                 pass
     finally:
         release.set()
-    with pytest.raises(RuntimeError, match='closing'):
-        await request
     await wait_until(lambda: not instance._offloads)
+    # One atomic admit has no post-cancellation submit→offer continuation that
+    # could observe closing or strand a searching row.
+    assert store.find_request('stream-sqlite','rpc-message-sqlite').state=='queued'
     with ownership.exclusive(lock):
         pass
 
