@@ -192,6 +192,45 @@ def test_failure_is_structured_and_never_deletes_checkpoint(store,tmp_path):
     assert store.claim_next() is None  # No hidden automatic retry.
 
 
+def test_stage_unit_is_claimed_before_launch_and_survives_restart(store):
+    job=queued(store)
+    run=store.claim_next()
+    first=store.claim_step(job.id,run.run_token,'convert_000')
+    assert first.active_step=='convert_000' and first.unit_name.startswith('maibot-sing-')
+    reopened=JobStore(store.path)
+    assert reopened.claim_step(job.id,run.run_token,'convert_000').unit_name==first.unit_name
+    with pytest.raises(JobConflict,match='reconciled'):
+        reopened.claim_step(job.id,run.run_token,'convert_001')
+    assert reopened.stage_attempts(job.id,job.stream_id)[0]['status']=='claimed'
+    settled=reopened.settle_step(job.id,run.run_token,first.unit_name,completed=True)
+    assert settled.unit_name==first.unit_name
+    second=reopened.claim_step(job.id,run.run_token,'convert_001')
+    assert second.unit_name!=first.unit_name
+    with pytest.raises(JobConflict,match='Stale'):
+        reopened.settle_step(job.id,run.run_token,first.unit_name,completed=False)
+    assert [entry['status'] for entry in reopened.stage_attempts(job.id,job.stream_id)]==['completed','claimed']
+
+
+def test_interrupted_stage_requires_explicit_reconciliation(store):
+    job=queued(store)
+    run=store.claim_next()
+    first=store.claim_step(job.id,run.run_token,'separate')
+    store.settle_step(job.id,run.run_token,first.unit_name,completed=False)
+    with pytest.raises(JobConflict,match='explicit retry'):
+        JobStore(store.path).claim_step(job.id,run.run_token,'convert_000')
+    stopped=store.finish_failure(job.id,run.run_token,
+        {'code':'stage_timeout','message':'Service stopped without full separation'},interrupted=True)
+    assert stopped.state=='interrupted' and store.claim_next() is None
+
+
+def test_cancelled_job_cannot_claim_new_stage(store):
+    job=queued(store)
+    run=store.claim_next()
+    store.cancel(job.id,job.stream_id)
+    with pytest.raises(JobConflict,match='Cancelled'):
+        store.claim_step(job.id,run.run_token,'convert_000')
+
+
 def test_queue_cap_applies_to_searching_and_history_is_monotonic(store):
     for number in range(3):
         store.submit('a',str(number),{})

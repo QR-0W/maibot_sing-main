@@ -38,6 +38,7 @@ class Job:
     revision: int
     run_token: Optional[str]
     unit_name: Optional[str]
+    active_step: Optional[str]
     chunk_done: int
     chunk_total: int
     artifact_key: Optional[str]
@@ -93,7 +94,7 @@ class JobStore:
                       ('searching','queued','running','needs_selection','ready','failed','cancel_requested','cancelled','interrupted')),
                     stage TEXT NOT NULL,
                     revision INTEGER NOT NULL DEFAULT 0,
-                    run_token TEXT, unit_name TEXT,
+                    run_token TEXT, unit_name TEXT, active_step TEXT,
                     chunk_done INTEGER NOT NULL DEFAULT 0,
                     chunk_total INTEGER NOT NULL DEFAULT 0,
                     artifact_key TEXT,
@@ -108,6 +109,12 @@ class JobStore:
                 CREATE TABLE IF NOT EXISTS offers (
                     id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
                     candidates_json TEXT NOT NULL, expires_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS stage_attempts (
+                    unit_name TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL, step TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('claimed','completed','interrupted')),
+                    created_at REAL NOT NULL, updated_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS events (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
@@ -154,7 +161,7 @@ class JobStore:
     def _change(db: sqlite3.Connection, row: sqlite3.Row, event: str, **values: Any) -> Job:
         # Field names are exclusively supplied by methods below, never user data.
         columns = ', '.join(name+'=?' for name in values)
-        db.execute('UPDATE jobs SET '+columns+', revision=revision+1, updated_at=? WHERE id=? AND revision=?',
+        db.execute('UPDATE jobs SET '+(columns+', ' if columns else '')+'revision=revision+1, updated_at=? WHERE id=? AND revision=?',
                    (*values.values(),time.time(),row['id'],row['revision']))
         db.execute('INSERT INTO events(job_id,event,revision,created_at) VALUES(?,?,?,?)',
                    (row['id'],event,row['revision']+1,time.time()))
@@ -255,7 +262,65 @@ class JobStore:
                 return None
             token = uuid.uuid4().hex
             return self._change(db,row,'run_claimed',state='running',stage='starting',
-                                run_token=token,unit_name='maibot-sing-'+token)
+                                run_token=token,unit_name=None,active_step=None)
+
+    def claim_step(self, job_id: str, run_token: str, step: str) -> Job:
+        """Durably name one stage unit BEFORE any subprocess starts.
+
+        An existing claimed unit is returned unchanged after reload. The caller
+        must query that exact unit; neither an unknown status nor a missing
+        receipt authorizes launching a replacement with a new identity.
+        """
+        if not re.fullmatch('[a-z][a-z0-9_-]{0,63}',step):
+            raise ValueError('Invalid stage identifier')
+        with self._transaction() as db:
+            row=self._runner(db,job_id,run_token)
+            if row['state']!='running':
+                raise JobConflict('Cancelled job cannot claim another stage')
+            previous=row['unit_name']
+            if previous:
+                status=db.execute('SELECT status FROM stage_attempts WHERE unit_name=? AND job_id=?',
+                                  (previous,job_id)).fetchone()
+                if status is None:
+                    raise JobConflict('Stage unit has no ownership record')
+                if status['status']=='claimed':
+                    if row['active_step']==step:
+                        return self._job(row)
+                    raise JobConflict('Previous stage must be reconciled before advancing')
+                if status['status']=='interrupted':
+                    raise JobConflict('Interrupted stage requires explicit retry decision')
+                if row['active_step']==step:
+                    return self._job(row)
+            # A distinct unit for each stage (and eventual explicitly approved retry).
+            unit='maibot-sing-'+uuid.uuid4().hex+'-'+step
+            now=time.time()
+            db.execute('INSERT INTO stage_attempts(unit_name,job_id,step,status,created_at,updated_at) VALUES(?,?,?,\'claimed\',?,?)',
+                       (unit,job_id,step,now,now))
+            return self._change(db,row,'stage_claimed',unit_name=unit,active_step=step)
+
+    def settle_step(self, job_id: str, run_token: str, unit: str, *, completed: bool) -> Job:
+        """Caller has verified both unit inactivity and a valid receipt if completed."""
+        if type(completed) is not bool:
+            raise ValueError('Stage result must be explicit')
+        with self._transaction() as db:
+            row=self._runner(db,job_id,run_token)
+            if row['unit_name']!=unit:
+                raise JobConflict('Stale unit cannot settle a newer stage')
+            attempt=db.execute('SELECT status FROM stage_attempts WHERE unit_name=? AND job_id=?',
+                               (unit,job_id)).fetchone()
+            desired='completed' if completed else 'interrupted'
+            if attempt is None or attempt['status'] not in ('claimed',desired):
+                raise JobConflict('Stage attempt has conflicting terminal result')
+            if attempt['status']==desired:
+                return self._job(row)
+            db.execute('UPDATE stage_attempts SET status=?, updated_at=? WHERE unit_name=?',
+                       (desired,time.time(),unit))
+            return self._change(db,row,'stage_'+desired)
+
+    def stage_attempts(self, job_id: str, stream_id: str) -> list:
+        with self._connect() as db:
+            self._owned(db,job_id,stream_id)
+            return [dict(item) for item in db.execute('SELECT unit_name,step,status,created_at,updated_at FROM stage_attempts WHERE job_id=? ORDER BY created_at,unit_name',(job_id,))]
 
     @staticmethod
     def _runner(db: sqlite3.Connection, job_id: str, run_token: str) -> sqlite3.Row:
