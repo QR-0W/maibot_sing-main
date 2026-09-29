@@ -148,6 +148,28 @@ def test_unmanaged_index_is_not_overwritten(tmp_path):
     assert (tmp_path / 'library-index.json').read_text() == '{"other": true}'
 
 
+def test_opt_in_corruption_isolation_preserves_four_legacy_covers(tmp_path):
+    originals={}
+    keys=[]
+    for number in range(4):
+        key,folder=make_cover(tmp_path,title='Legacy '+str(number),
+            source={'type':'local','sha256':str(number)*64},payload=('old '+str(number)).encode())
+        keys.append(key)
+        for path in (folder/'cover.mp3',folder/'metadata.json'):
+            originals[path]=(path.read_bytes(),path.stat().st_ino,path.stat().st_mode)
+    broken=tmp_path/('f'*64);broken.mkdir()
+    (broken/'metadata.json').write_text('{')
+    with pytest.raises(ValueError):rebuild_library(tmp_path)
+    warnings=[]
+    entries=rebuild_library(tmp_path,skip_corrupt=True,warnings=warnings)
+    assert {entry['key'] for entry in entries}==set(keys)
+    assert len(warnings)==1 and 'ffffffffffffffff' in warnings[0]
+    for path,expected in originals.items():
+        assert (path.read_bytes(),path.stat().st_ino,path.stat().st_mode)==expected
+    assert (broken/'metadata.json').read_text()=='{'
+    assert rebuild_library(tmp_path,skip_corrupt=True)==entries
+
+
 def test_unknown_duration_and_invalid_ranges(tmp_path):
     key, folder = make_cover(tmp_path, extra={'excerpt_provenance': {'clip': {'start_s': 20, 'end_s': 10}}})
     with pytest.raises(ValueError, match='boundaries'):

@@ -106,7 +106,26 @@ class UnitRunner:
             return 'stopped'
         raise UnitError('unit_status_unknown','Unexpected systemd service state')
 
-    async def run(self, unit: str, plan_path: Path, step, workspace: Path) -> Dict[str, Any]:
+    @staticmethod
+    def launch_finished(workspace: Path, unit: str) -> bool:
+        _safe_unit(unit)
+        path=workspace/'unit-logs'/(unit+'.exit.json')
+        StageReceipts._safe(path)
+        if not path.exists():
+            return False
+        if not path.is_file() or path.stat().st_size>1024:
+            raise UnitError('launch_witness_invalid','Invalid launch witness')
+        try:
+            data=json.loads(path.read_text(encoding='utf-8'))
+            if (not isinstance(data,dict) or set(data)!={'schema','completed','returncode'}
+                    or data['schema']!=1 or type(data['completed']) is not bool):
+                raise ValueError('Bad witness schema')
+            return data['completed'] and type(data['returncode']) is int
+        except (OSError,ValueError,TypeError) as exc:
+            raise UnitError('launch_witness_invalid','Invalid launch witness') from exc
+
+    async def run(self, unit: str, plan_path: Path, step, workspace: Path, *,
+                  ownership_fd: int) -> Dict[str, Any]:
         """A confirmed-success receipt is necessary even when systemd-run exits 0.
 
         The scheduler must persist (job,run_token,step,unit) BEFORE calling run.
@@ -133,11 +152,19 @@ class UnitRunner:
                 '-p','CPUQuota=150%','-p','TasksMax=64','-p','TimeoutStopSec=15',
                 '-p','RuntimeMaxSec='+str(step.unit_limit_s),
                 str(self.python),str(self.executor),'--plan',str(plan_path),'--stage',step.name]
-            proc=await asyncio.create_subprocess_exec(*argv,stdout=fd,stderr=fd)
+            launcher=self.executor.with_name('unit_launcher.py')
+            if not launcher.is_file() or launcher.is_symlink():
+                raise UnitError('launcher_missing','Configured launch witness helper is missing')
+            os.fstat(ownership_fd)
+            command=[str(self.python),str(launcher),'--lock-fd',str(ownership_fd),
+                '--result',str(logs/(unit+'.exit.json')),
+                '--timeout',str(step.unit_limit_s+25),'--',*argv]
+            proc=await asyncio.create_subprocess_exec(*command,stdout=fd,stderr=fd,
+                                                     pass_fds=(ownership_fd,))
         finally:
             os.close(fd)
         try:
-            code=await asyncio.wait_for(proc.wait(),step.unit_limit_s+25)
+            code=await asyncio.wait_for(proc.wait(),step.unit_limit_s+40)
         except asyncio.TimeoutError as exc:
             # The transient unit may still run; do not release ownership or
             # clean scratch. Query state in reconciliation, not via a guessed PID.

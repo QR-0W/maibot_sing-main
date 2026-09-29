@@ -41,7 +41,10 @@ def ready(store, consent=True):
     running = store.claim_next()
     assert running.id == job.id
     store.progress(job.id,running.run_token,stage='publishing',done=1,total=1)
-    return store.ready(job.id,running.run_token,'a'*64)
+    validation=store.claim_step(job.id,running.run_token,'validate')
+    settled=store.settle_step(job.id,running.run_token,validation.unit_name,completed=True)
+    return store.ready(job.id,running.run_token,'a'*64,
+                       expected_unit=settled.unit_name,expected_revision=settled.revision)
 
 
 def test_submission_returns_durable_search_job_not_a_render(store):
@@ -145,15 +148,19 @@ def test_cancel_does_not_release_worker_until_stop_confirmed(store):
     cancelled=store.cancel(job.id,job.stream_id)
     assert cancelled.state=='cancel_requested' and cancelled.delivery_state=='cancelled'
     assert store.claim_next() is None
-    stopped=store.finish_failure(job.id,run.run_token,{'code':'user_cancelled','message':'Stopped'})
+    stopped=store.finish_failure(job.id,run.run_token,{'code':'user_cancelled','message':'Stopped'},
+                                 expected_unit=None,expected_revision=cancelled.revision)
     assert stopped.state=='cancelled'
     assert store.claim_next() is not None
 
 
 def test_cancel_losing_race_to_commit_keeps_artifact_without_delivery(store):
     job=queued(store); run=store.claim_next()
-    store.cancel(job.id,job.stream_id)
-    finished=store.ready(job.id,run.run_token,'a'*64)
+    validation=store.claim_step(job.id,run.run_token,'validate')
+    store.settle_step(job.id,run.run_token,validation.unit_name,completed=True)
+    cancelled=store.cancel(job.id,job.stream_id)
+    finished=store.ready(job.id,run.run_token,'a'*64,
+                         expected_unit=validation.unit_name,expected_revision=cancelled.revision)
     assert finished.state=='ready' and finished.artifact_key=='a'*64
     assert store.claim_delivery(job.id,job.stream_id) is None
 
@@ -185,7 +192,8 @@ def test_failure_is_structured_and_never_deletes_checkpoint(store,tmp_path):
     checkpoint=tmp_path/'vocal-9.wav'; checkpoint.write_bytes(b'already-rendered')
     job=queued(store); run=store.claim_next()
     error={'code':'stage_deadline','stage':'converting','message':'Saved 9/12 chunks','done':9,'total':12}
-    failed=store.finish_failure(job.id,run.run_token,error,interrupted=True)
+    failed=store.finish_failure(job.id,run.run_token,error,interrupted=True,
+                                expected_unit=None,expected_revision=run.revision)
     assert failed.state=='interrupted' and failed.error==error
     assert checkpoint.read_bytes()==b'already-rendered'
     assert JobStore(store.path).get(job.id,job.stream_id).artifact_key is None
@@ -215,11 +223,12 @@ def test_interrupted_stage_requires_explicit_reconciliation(store):
     job=queued(store)
     run=store.claim_next()
     first=store.claim_step(job.id,run.run_token,'separate')
-    store.settle_step(job.id,run.run_token,first.unit_name,completed=False)
+    settled=store.settle_step(job.id,run.run_token,first.unit_name,completed=False)
     with pytest.raises(JobConflict,match='explicit retry'):
         JobStore(store.path).claim_step(job.id,run.run_token,'convert_000')
     stopped=store.finish_failure(job.id,run.run_token,
-        {'code':'stage_timeout','message':'Service stopped without full separation'},interrupted=True)
+        {'code':'stage_timeout','message':'Service stopped without full separation'},interrupted=True,
+        expected_unit=settled.unit_name,expected_revision=settled.revision)
     assert stopped.state=='interrupted' and store.claim_next() is None
 
 
@@ -229,6 +238,26 @@ def test_cancelled_job_cannot_claim_new_stage(store):
     store.cancel(job.id,job.stream_id)
     with pytest.raises(JobConflict,match='Cancelled'):
         store.claim_step(job.id,run.run_token,'convert_000')
+
+
+def test_stale_terminal_write_cannot_release_newer_stage(store):
+    job=queued(store); queued(store,'next')
+    run=store.claim_next()
+    first=store.claim_step(job.id,run.run_token,'convert_000')
+    observer=JobStore(store.path)
+    stopped=observer.settle_step(job.id,run.run_token,first.unit_name,completed=True)
+    second=store.claim_step(job.id,run.run_token,'convert_001')
+    with pytest.raises(JobConflict,match='Stale'):
+        observer.finish_failure(job.id,run.run_token,{'code':'failure','message':'late failure'},
+                                expected_unit=stopped.unit_name,expected_revision=stopped.revision)
+    with pytest.raises(JobConflict,match='Stale'):
+        observer.ready(job.id,run.run_token,'a'*64,
+                       expected_unit=stopped.unit_name,expected_revision=stopped.revision)
+    with pytest.raises(JobConflict,match='Unsettled'):
+        observer.finish_failure(job.id,run.run_token,{'code':'failure','message':'not yet stopped'},
+                                expected_unit=second.unit_name,expected_revision=second.revision)
+    assert store.claim_next() is None
+    assert store.get(job.id,job.stream_id).unit_name==second.unit_name
 
 
 def test_queue_cap_applies_to_searching_and_history_is_monotonic(store):

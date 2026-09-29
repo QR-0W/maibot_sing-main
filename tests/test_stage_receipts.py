@@ -64,6 +64,27 @@ def test_explicit_retry_archives_only_unsealed_outputs(tmp_path):
     assert (location/'failed.wav').read_bytes()==b'partial second chunk'
 
 
+def test_failed_validation_never_archives_completed_encode(tmp_path):
+    store=m.StageReceipts(tmp_path,'a'*64)
+    (tmp_path/'cover.mp3').write_bytes(b'completed encoded bytes')
+    encoded=store.seal('encode',{'mixed.wav':'b'*64},['cover.mp3'])
+    result=store.archive_incomplete('validate',['cover.mp3'],
+        unit_name='maibot-sing-'+('c'*32)+'-validate',confirmed_stopped=True)
+    assert result is None
+    assert store.verify('encode',{'mixed.wav':'b'*64})==encoded
+    assert not (tmp_path/'.incomplete').exists()
+
+
+def test_corrupt_prior_receipt_never_authorizes_archival(tmp_path):
+    store=m.StageReceipts(tmp_path,'a'*64)
+    (tmp_path/'output.wav').write_bytes(b'preserve this')
+    (tmp_path/'.receipts/encode.json').write_text('{')
+    with pytest.raises(m.CheckpointError):
+        store.archive_incomplete('convert_001',['output.wav'],
+            unit_name='maibot-sing-'+('c'*32)+'-convert_001',confirmed_stopped=True)
+    assert (tmp_path/'output.wav').read_bytes()==b'preserve this'
+
+
 def test_symlinks_and_budget(tmp_path):
     (tmp_path/'data').write_bytes(b'1234')
     (tmp_path/'link').symlink_to(tmp_path/'data')

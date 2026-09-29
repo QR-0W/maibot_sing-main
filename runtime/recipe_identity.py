@@ -74,8 +74,60 @@ def recipe_document(*, provider, track_id, hashes, versions, steps,
             'hashes':dict(hashes),'versions':dict(versions),'steps':normalized}
 
 
-def fingerprint(document):
+def validate_document(document):
+    """Validate persisted recipes too, not only documents built in this process."""
     if not isinstance(document,dict) or set(document)!= {'schema','provider','track_id','hashes','versions','steps'} or document['schema']!=SCHEMA:
         raise RecipeError('Unrecognized render recipe schema')
+    if (document['provider'] not in ('163','qq') or not isinstance(document['track_id'],str)
+            or not re.fullmatch('[A-Za-z0-9_-]{1,100}',document['track_id'])):
+        raise RecipeError('Invalid source identity')
+    for field,names,pattern in (('hashes',HASH_NAMES,'[0-9a-f]{64}'),
+                                 ('versions',VERSION_NAMES,'[0-9A-Za-z.+_~!-]{1,80}')):
+        values=document[field]
+        if (not isinstance(values,dict) or set(values)!=set(names) or
+                any(not isinstance(v,str) or not re.fullmatch(pattern,v) for v in values.values())):
+            raise RecipeError('Invalid '+field)
+    steps=document['steps']
+    if not isinstance(steps,list) or not 4<=len(steps)<=32:
+        raise RecipeError('Invalid bounded steps')
+    seen=set()
+    produced={'source.audio'}
+    for step in steps:
+        if not isinstance(step,dict) or set(step)!={'name','argv','timeout_s','inputs','outputs'}:
+            raise RecipeError('Invalid step schema')
+        name=step['name']
+        if not isinstance(name,str) or not re.fullmatch('[a-z][a-z0-9_-]{0,63}',name) or name in seen:
+            raise RecipeError('Invalid step name')
+        seen.add(name)
+        if type(step['timeout_s']) is not int or not 1<=step['timeout_s']<=600:
+            raise RecipeError('Invalid stage budget')
+        argv=step['argv']
+        if not isinstance(argv,list) or not 1<=len(argv)<=128:
+            raise RecipeError('Invalid arguments')
+        for token in argv:
+            if (not isinstance(token,str) or len(token)>2048 or '://' in token
+                    or any(ord(c)<32 for c in token) or token.startswith('/')):
+                raise RecipeError('Nonportable or private recipe argument')
+        for field in ('inputs','outputs'):
+            values=step[field]
+            if not isinstance(values,list) or not 1<=len(values)<=64:
+                raise RecipeError('Invalid stage paths')
+            for value in values:
+                if (not isinstance(value,str) or not re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_./-]{0,159}',value)
+                        or any(p in ('','.','..','.receipts','.incomplete') for p in value.split('/'))
+                        or value.endswith('.part')):
+                    raise RecipeError('Unsafe stage path')
+            if len(set(values))!=len(values):
+                raise RecipeError('Duplicated stage path')
+        if not set(step['inputs'])<=produced:
+            raise RecipeError('Stage input has no preceding producer')
+        produced.update(step['outputs'])
+    return document
+
+
+def fingerprint(document):
+    validate_document(document)
     data=json.dumps(document,sort_keys=True,separators=(',',':'),ensure_ascii=False,allow_nan=False).encode('utf-8')
+    if len(data)>65536:
+        raise RecipeError('Oversized recipe')
     return hashlib.sha256(data).hexdigest()

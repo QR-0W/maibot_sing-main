@@ -341,17 +341,32 @@ class JobStore:
                 raise JobConflict('Chunk count changed within frozen plan')
             return self._change(db,row,'progress',stage=stage,chunk_done=done,chunk_total=total)
 
-    def ready(self, job_id: str, run_token: str, artifact_key: str) -> Job:
+    @staticmethod
+    def _terminal_fence(db, row, expected_unit, expected_revision):
+        if row['unit_name']!=expected_unit or row['revision']!=expected_revision:
+            raise JobConflict('Stale terminal write cannot release newer ownership')
+        if db.execute("SELECT 1 FROM stage_attempts WHERE job_id=? AND status='claimed'",
+                      (row['id'],)).fetchone():
+            raise JobConflict('Unsettled stage still owns the media slot')
+
+    def ready(self, job_id: str, run_token: str, artifact_key: str, *,
+              expected_unit: str, expected_revision: int) -> Job:
         """Caller must validate immutable committed artifact bytes before this call."""
         if not isinstance(artifact_key,str) or not re.fullmatch('[0-9a-f]{64}',artifact_key):
             raise ValueError('Invalid committed artifact identity')
         with self._transaction() as db:
             row = self._runner(db,job_id,run_token)
+            self._terminal_fence(db,row,expected_unit,expected_revision)
+            validation=db.execute('SELECT status FROM stage_attempts WHERE job_id=? AND unit_name=?',
+                                  (job_id,expected_unit)).fetchone()
+            if row['active_step']!='validate' or validation is None or validation['status']!='completed':
+                raise JobConflict('Final validation must be settled before publication')
             # If cancel lost the race with media commit, keep the artifact but
             # preserve cancelled delivery: never send after cancellation.
             return self._change(db,row,'artifact_ready',state='ready',stage='completed',artifact_key=artifact_key)
 
     def finish_failure(self, job_id: str, run_token: str, error: Dict[str, Any], *,
+                       expected_unit: Optional[str], expected_revision: int,
                        interrupted: bool = False) -> Job:
         """Runner calls only after it proves the named unit has stopped.
 
@@ -362,6 +377,7 @@ class JobStore:
         document = _json(error)
         with self._transaction() as db:
             row = self._runner(db,job_id,run_token)
+            self._terminal_fence(db,row,expected_unit,expected_revision)
             state = 'cancelled' if row['state']=='cancel_requested' else 'interrupted' if interrupted else 'failed'
             return self._change(db,row,'worker_stopped',state=state,error_json=document)
 

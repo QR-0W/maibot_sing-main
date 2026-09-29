@@ -129,6 +129,25 @@ class StageReceipts:
             raise CheckpointError('Completed or corrupt receipt must not be archived')
         if not isinstance(outputs, (tuple, list)) or not outputs or len(set(outputs)) != len(outputs):
             raise CheckpointError('Invalid interrupted stage outputs')
+        # Validation may list a previous stage's product as both input and
+        # output. Never move ANY artifact protected by a completed receipt.
+        # Corrupt/unknown receipts fail closed rather than authorizing cleanup.
+        protected = set()
+        receipt_files = list(self.directory.glob('*.json'))
+        if len(receipt_files) > 128:
+            raise CheckpointError('Too many receipts for bounded retry preparation')
+        for candidate in receipt_files:
+            if candidate.name.endswith('.status.json'):
+                continue
+            self._safe(candidate)
+            try:
+                if candidate.stat().st_size > 32768:
+                    raise CheckpointError('Oversized prior receipt')
+                record = json.loads(candidate.read_text(encoding='utf-8'))
+                verified = self.verify(candidate.stem, record['inputs'])
+                protected.update(verified['outputs'])
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                raise CheckpointError('Cannot prove prior output ownership') from exc
         pending = []
         for name in outputs:
             if (not isinstance(name, str) or not re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_./-]{0,159}', name)
@@ -137,6 +156,8 @@ class StageReceipts:
                 raise CheckpointError('Unsafe interrupted output')
             path = self.root / name
             self._safe(path)
+            if name in protected:
+                continue
             if path.exists():
                 if not stat.S_ISREG(path.stat().st_mode):
                     raise CheckpointError('Interrupted output is not a regular file')

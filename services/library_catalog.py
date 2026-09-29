@@ -47,13 +47,16 @@ def _sha256(path: Path) -> str:
 def _read_metadata(path: Path) -> dict[str, Any]:
     if not _regular(path) or path.stat().st_size > 1024 * 1024:
         raise ValueError(f'Unsafe or oversized metadata: {path}')
-    data = json.loads(path.read_text(encoding='utf-8'))
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except RecursionError as exc:
+        raise ValueError('Excessively nested metadata') from exc
     if not isinstance(data, dict):
         raise ValueError(f'Invalid metadata: {path}')
     return data
 
 
-def _verify(root: Path, key: str) -> tuple[dict[str, Any], Path]:
+def _verify(root: Path, key: str, *, max_bytes: int = 64*1024**2) -> tuple[dict[str, Any], Path]:
     if not isinstance(key, str) or not KEY.fullmatch(key):
         raise ValueError('Invalid cache key')
     folder = root / key
@@ -63,6 +66,9 @@ def _verify(root: Path, key: str) -> tuple[dict[str, Any], Path]:
     mp3 = folder / 'cover.mp3'
     if not _regular(mp3):
         raise ValueError(f'Unsafe or missing cover: {key}')
+    size = mp3.stat().st_size
+    if type(max_bytes) is not int or not 0 < size <= max_bytes <= 64*1024**2:
+        raise ValueError('Cover exceeds the bounded verification size')
     sha = data.get('sha256')
     if data.get('status') != 'completed' or data.get('key') != key or not isinstance(sha, str) or not KEY.fullmatch(sha):
         raise ValueError(f'Uncommitted or invalid cover: {key}')
@@ -78,9 +84,16 @@ def _verify(root: Path, key: str) -> tuple[dict[str, Any], Path]:
                 or not isinstance(instrumental, bool) or not all(isinstance(v, str) and KEY.fullmatch(v)
                     for v in (model, index))):
             raise ValueError('Invalid cache identity fields')
-        identity = {'source': source, 'model_sha256': model, 'index_sha256': index,
-                    'parameters': parameters, 'instrumental': instrumental}
-        serialized = json.dumps(identity, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        if 'recipe_schema' in data and data['recipe_schema'] != 'sing-render-v1':
+            raise ValueError('Unknown render recipe schema')
+        if data.get('recipe_schema') == 'sing-render-v1':
+            from ..runtime.artifact_manifest import validate_manifest
+            validate_manifest(data, key, size)
+            return data, mp3
+        else:
+            identity = {'source': source, 'model_sha256': model, 'index_sha256': index,
+                        'parameters': parameters, 'instrumental': instrumental}
+            serialized = json.dumps(identity, sort_keys=True, ensure_ascii=False, allow_nan=False)
         if hashlib.sha256(serialized.encode('utf-8')).hexdigest() != key:
             raise ValueError('Cache identity mismatch')
     except (KeyError, TypeError, ValueError) as exc:
@@ -197,7 +210,8 @@ def _locked(root: Path) -> Iterator[Path]:
         yield root
 
 
-def _rebuild_locked(root: Path) -> list[dict[str, str]]:
+def _rebuild_locked(root: Path, *, skip_corrupt: bool = False,
+                    warnings: list[str] | None = None) -> list[dict[str, str]]:
     songs = root / 'songs'
     if songs.is_symlink() or (songs.exists() and not _directory(songs)):
         raise ValueError('Unsafe songs directory')
@@ -207,8 +221,15 @@ def _rebuild_locked(root: Path) -> list[dict[str, str]]:
     for folder in sorted(root.iterdir()):
         if not KEY.fullmatch(folder.name):
             continue
-        data, source = _verify(root, folder.name)
-        entry = _entry(data)
+        try:
+            data, source = _verify(root, folder.name)
+            entry = _entry(data)
+        except (ValueError, KeyError, TypeError) as exc:
+            if not skip_corrupt:
+                raise
+            if warnings is not None:
+                warnings.append('跳过损坏或不兼容的成品 ' + folder.name[:16] + ': ' + type(exc).__name__)
+            continue
         name = _name(entry, entry['key'][:16])
         if name.casefold() in occupied and occupied[name.casefold()] != name:
             name = _name(entry, entry['key'])
@@ -242,14 +263,16 @@ def _rebuild_locked(root: Path) -> list[dict[str, str]]:
     return entries
 
 
-def rebuild_library(root: Path) -> list[dict[str, str]]:
-    """Reconcile every committed cache cover into songs/ and regenerate safe summaries.
+def rebuild_library(root: Path, *, skip_corrupt: bool = False,
+                    warnings: list[str] | None = None) -> list[dict[str, str]]:
+    """Reconcile verified covers into songs/ without overwriting unrelated files.
 
-    Raises on corrupt committed entries and never removes existing files. Idempotent;
-    run via asyncio.to_thread from async code. Does not acquire the backend owner lock.
+    Legacy default stays strict. With skip_corrupt=True, individually invalid
+    artifact metadata is reported and skipped; unsafe songs/ or summary files
+    still fail closed. Run from async code via asyncio.to_thread.
     """
     with _locked(Path(root)) as library:
-        return _rebuild_locked(library)
+        return _rebuild_locked(library, skip_corrupt=skip_corrupt, warnings=warnings)
 
 
 def index_cover(root: Path, key: str) -> dict[str, str]:

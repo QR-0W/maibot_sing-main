@@ -3,6 +3,8 @@ from pathlib import Path
 import importlib
 import importlib.util
 import sys
+import asyncio
+import json
 
 import pytest
 
@@ -62,6 +64,8 @@ async def test_stopped_unit_with_missing_receipt_becomes_interrupted(work):
     logdir=folder/'unit-logs';logdir.mkdir()
     (logdir/(result['unit']+'.log')).write_text('synthetic stopped worker')
     (folder/'output.bin').write_bytes(b'partial, preserve me')
+    (logdir/(result['unit']+'.exit.json')).write_text(json.dumps(
+        {'schema':1,'completed':True,'returncode':0}))
     runner.current='absent'
     with pytest.raises(runner_module.UnitError,match='no automatic retry'):
         await coordinator.StageCoordinator(store,runner).run_step(
@@ -82,8 +86,106 @@ async def test_receipt_committed_before_crash_is_recognized(work):
     (folder/'output.bin').write_bytes(b'valid output')
     inp=receipts.sha256(folder/'input.bin')
     receipts.StageReceipts(folder,'a'*64).seal(step.name,{'input.bin':inp},['output.bin'])
+    (logdir/(result['unit']+'.exit.json')).write_text(json.dumps(
+        {'schema':1,'completed':True,'returncode':0}))
     runner.current='absent'
     closed=await coordinator.StageCoordinator(ledger.JobStore(store.path),runner).run_step(
         run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
     assert closed['reused'] and closed['state']=='completed' and runner.starts==0
     assert store.stage_attempts(run.id,run.stream_id)[0]['status']=='completed'
+
+
+@pytest.mark.asyncio
+async def test_launch_gap_is_owned_not_interrupted(work):
+    store,run,folder,step=work
+    entered,release=asyncio.Event(),asyncio.Event()
+    class PausedLauncher(StubUnitRunner):
+        async def run(self,unit,plan,step,workspace,*,ownership_fd):
+            self.starts+=1
+            logs=workspace/'unit-logs';logs.mkdir()
+            (logs/(unit+'.log')).write_text('created before actual submission')
+            entered.set()
+            await release.wait()
+            (workspace/'output.bin').write_bytes(b'completed')
+            inp=receipts.sha256(workspace/'input.bin')
+            receipts.StageReceipts(workspace,'a'*64).seal(step.name,{'input.bin':inp},['output.bin'])
+            (logs/(unit+'.exit.json')).write_text(json.dumps({'schema':1,'completed':True,'returncode':0}))
+            return {'status':{'reused':False}}
+    runner=PausedLauncher('absent')
+    first=coordinator.StageCoordinator(store,runner)
+    task=asyncio.create_task(first.run_step(run.id,run.stream_id,run.run_token,
+                                          step,folder,folder/'plan.json','a'*64))
+    try:
+        await asyncio.wait_for(entered.wait(),2)
+        competing=coordinator.StageCoordinator(ledger.JobStore(store.path),runner)
+        result=await competing.run_step(run.id,run.stream_id,run.run_token,
+                                       step,folder,folder/'plan.json','a'*64)
+        assert result['state']=='owned'
+        assert store.stage_attempts(run.id,run.stream_id)[0]['status']=='claimed'
+        assert store.claim_next() is None
+    finally:
+        release.set()
+        settled=await asyncio.wait_for(task,2)
+    assert settled['state']=='completed' and runner.starts==1
+
+
+@pytest.mark.asyncio
+async def test_absent_unit_without_launch_witness_stays_unknown(work):
+    store,run,folder,step=work
+    owner=store.claim_step(run.id,run.run_token,step.name)
+    logs=folder/'unit-logs';logs.mkdir()
+    (logs/(owner.unit_name+'.log')).write_text('crash before launch ack')
+    runner=StubUnitRunner('absent')
+    with pytest.raises(runner_module.UnitError) as err:
+        await coordinator.StageCoordinator(store,runner).run_step(
+            run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
+    assert err.value.code=='launch_unknown'
+    assert store.stage_attempts(run.id,run.stream_id)[0]['status']=='claimed'
+    assert runner.starts==0 and store.claim_next() is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_reopen_reconciles_old_unit_without_new_launch(work):
+    store,run,folder,step=work
+    owner=store.claim_step(run.id,run.run_token,step.name)
+    logs=folder/'unit-logs';logs.mkdir()
+    (logs/(owner.unit_name+'.log')).write_text('launched previously')
+    store.cancel(run.id,run.stream_id)
+    next_job,_=store.submit(run.stream_id,'next-message',{'query':'next'})
+    offered=store.offer(next_job.id,next_job.stream_id,[source.CatalogueItem('163','2','S','A','B')],
+                        expected_revision=next_job.revision)
+    store.select(next_job.id,next_job.stream_id,offered.offer_id,1)
+    runner=StubUnitRunner('active')
+    restarted=coordinator.StageCoordinator(ledger.JobStore(store.path),runner)
+    result=await restarted.run_step(run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
+    assert result['state']=='running' and store.claim_next() is None
+    runner.current='absent'
+    with pytest.raises(runner_module.UnitError,match='witness'):
+        await restarted.run_step(run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
+    assert store.claim_next() is None
+    (logs/(owner.unit_name+'.exit.json')).write_text(json.dumps({'schema':1,'completed':True,'returncode':1}))
+    result=await restarted.run_step(run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
+    assert result['state']=='cancelled' and runner.starts==0
+    assert store.claim_next().id==next_job.id
+
+
+@pytest.mark.asyncio
+async def test_inherited_flock_survives_parent_close(tmp_path):
+    ownership=importlib.import_module('coord_test_pkg.services.ownership')
+    path=tmp_path/'job.lock'
+    child=None
+    try:
+        with ownership.exclusive(path) as fd:
+            child=await asyncio.create_subprocess_exec(sys.executable,'-c',
+                "import sys; print('ready',flush=True); sys.stdin.buffer.read(1)",
+                pass_fds=(fd,),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE)
+            assert await asyncio.wait_for(child.stdout.readline(),2)==b'ready\n'
+        with pytest.raises(ownership.OwnershipBusy):
+            with ownership.exclusive(path):
+                pass
+    finally:
+        if child:
+            await asyncio.wait_for(child.communicate(b'x'),2)
+            assert child.returncode==0
+    with ownership.exclusive(path):
+        pass
