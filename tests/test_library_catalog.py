@@ -1,15 +1,21 @@
 from pathlib import Path
 import hashlib
+import importlib
 import importlib.util
 import json
 import os
+import sys
 
 import pytest
 
-MODULE = Path(__file__).resolve().parents[1] / 'services/library_catalog.py'
-spec = importlib.util.spec_from_file_location('sing_library_catalog', MODULE)
-catalog = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(catalog)
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('sing_library_catalog_pkg', ROOT / '__init__.py',
+                                            submodule_search_locations=[str(ROOT)])
+package = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = package
+spec.loader.exec_module(package)
+catalog = importlib.import_module(spec.name + '.services.library_catalog')
+manifest = importlib.import_module(spec.name + '.runtime.artifact_manifest')
 IROHA_MODEL_SHA256 = catalog.IROHA_MODEL_SHA256
 index_cover = catalog.index_cover
 rebuild_library = catalog.rebuild_library
@@ -57,6 +63,28 @@ def test_rebuild_is_idempotent_and_clips_are_honest(tmp_path):
     public = b' '.join(previous).decode()
     assert 'token=secret' not in public and '/private/audio' not in public
     assert 'source' not in json.loads((tmp_path / 'library-index.json').read_text())['entries'][0]
+
+
+def test_versioned_metadata_always_uses_shared_manifest_validator(tmp_path, monkeypatch):
+    # This checks routing only. ArtifactStore tests exercise full real-schema
+    # metadata, receipt and provenance validation during publication/indexing.
+    key, folder = make_cover(tmp_path, extra={'recipe_schema': 'test-new-schema'})
+    calls = []
+    def validate(data, expected_key, size):
+        calls.append((data['recipe_schema'], expected_key, size))
+        return data
+    monkeypatch.setattr(manifest, 'validate_manifest', validate)
+    assert index_cover(tmp_path, key)['key'] == key
+    assert calls and set(calls) == {('test-new-schema', key, (folder / 'cover.mp3').stat().st_size)}
+
+
+def test_unknown_recipe_cannot_fall_back_to_valid_legacy_identity(tmp_path):
+    key, folder = make_cover(tmp_path, extra={'recipe_schema': 'unknown-schema', 'recipe': {}})
+    before = (folder / 'cover.mp3').read_bytes()
+    with pytest.raises(ValueError, match='Invalid cache identity'):
+        index_cover(tmp_path, key)
+    assert (folder / 'cover.mp3').read_bytes() == before
+    assert not (tmp_path / 'library-index.json').exists()
 
 
 def test_remote_does_not_claim_verified_full_song(tmp_path):

@@ -84,9 +84,10 @@ def _verify(root: Path, key: str, *, max_bytes: int = 64*1024**2) -> tuple[dict[
                 or not isinstance(instrumental, bool) or not all(isinstance(v, str) and KEY.fullmatch(v)
                     for v in (model, index))):
             raise ValueError('Invalid cache identity fields')
-        if 'recipe_schema' in data and data['recipe_schema'] != 'sing-render-v1':
-            raise ValueError('Unknown render recipe schema')
-        if data.get('recipe_schema') == 'sing-render-v1':
+        if 'recipe_schema' in data:
+            # One shared validator owns the current recipe schema and full
+            # provenance checks. Unknown schemas must never fall through to
+            # the legacy cache identity path or a second hardcoded version.
             from ..runtime.artifact_manifest import validate_manifest
             validate_manifest(data, key, size)
             return data, mp3
