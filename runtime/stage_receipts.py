@@ -112,6 +112,56 @@ class StageReceipts:
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise CheckpointError('Unreadable or corrupt stage receipt') from exc
 
+    def archive_incomplete(self, stage, outputs, *, unit_name, confirmed_stopped):
+        """Explicit retry preparation; never silently replace an unsealed output.
+
+        Caller must hold exclusive job ownership and its inference lock, query
+        the exact prior systemd unit, and pass True only for a proven stopped
+        unit. Unknown/active is not permission to move anything. Previous
+        completed receipts are never archived or invalidated.
+        """
+        receipt = self._receipt(stage)
+        if not isinstance(unit_name, str) or not re.fullmatch('maibot-sing-[a-z0-9_-]{12,110}', unit_name):
+            raise CheckpointError('Invalid previous unit identity')
+        if confirmed_stopped is not True:
+            raise CheckpointError('Prior worker inactivity has not been proven')
+        if receipt.exists() or receipt.is_symlink():
+            raise CheckpointError('Completed or corrupt receipt must not be archived')
+        if not isinstance(outputs, (tuple, list)) or not outputs or len(set(outputs)) != len(outputs):
+            raise CheckpointError('Invalid interrupted stage outputs')
+        pending = []
+        for name in outputs:
+            if (not isinstance(name, str) or not re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_./-]{0,159}', name)
+                    or any(part in ('', '.', '..', '.receipts', '.incomplete') for part in name.split('/'))
+                    or name.endswith('.part')):
+                raise CheckpointError('Unsafe interrupted output')
+            path = self.root / name
+            self._safe(path)
+            if path.exists():
+                if not stat.S_ISREG(path.stat().st_mode):
+                    raise CheckpointError('Interrupted output is not a regular file')
+                pending.append((name, path))
+        if not pending:
+            return None
+        folder = self.root / '.incomplete' / stage / uuid.uuid4().hex
+        self._safe(folder)
+        folder.mkdir(parents=True, mode=0o700, exist_ok=False)
+        archived = []
+        # os.rename never overwrites in a unique private folder. If a crash
+        # interrupts this move, both already-archived and remaining outputs
+        # remain available for an administrator to reconcile by byte hash.
+        for name, path in pending:
+            dest = folder / name
+            dest.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            os.rename(path, dest)
+            archived.append(name)
+        fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return folder
+
     def seal(self, stage, inputs, outputs):
         destination = self._receipt(stage)
         document = {'schema':1, 'recipe':self.recipe, 'stage':stage,

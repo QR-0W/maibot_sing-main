@@ -43,6 +43,27 @@ def test_unsealed_partial_does_not_resume(tmp_path):
     assert m.StageReceipts(tmp_path,'a'*64).verify('convert',{}) is None
 
 
+def test_explicit_retry_archives_only_unsealed_outputs(tmp_path):
+    store=m.StageReceipts(tmp_path,'a'*64)
+    (tmp_path/'first.wav').write_bytes(b'completed first chunk')
+    store.seal('convert_000',{'input':'b'*64},['first.wav'])
+    (tmp_path/'failed.wav').write_bytes(b'partial second chunk')
+    unit='maibot-sing-'+('a'*32)
+    with pytest.raises(m.CheckpointError,match='not been proven'):
+        store.archive_incomplete('convert_001',['failed.wav'],unit_name=unit,confirmed_stopped=False)
+    assert (tmp_path/'failed.wav').exists()
+    location=store.archive_incomplete('convert_001',['failed.wav'],unit_name=unit,confirmed_stopped=True)
+    assert location is not None and (location/'failed.wav').read_bytes()==b'partial second chunk'
+    assert not (tmp_path/'failed.wav').exists()
+    assert store.verify('convert_000',{'input':'b'*64}) is not None
+    (tmp_path/'failed.wav').write_bytes(b'finished second chunk')
+    store.seal('convert_001',{'input':'c'*64},['failed.wav'])
+    assert store.verify('convert_001',{'input':'c'*64}) is not None
+    with pytest.raises(m.CheckpointError,match='receipt'):
+        store.archive_incomplete('convert_001',['failed.wav'],unit_name=unit,confirmed_stopped=True)
+    assert (location/'failed.wav').read_bytes()==b'partial second chunk'
+
+
 def test_symlinks_and_budget(tmp_path):
     (tmp_path/'data').write_bytes(b'1234')
     (tmp_path/'link').symlink_to(tmp_path/'data')
