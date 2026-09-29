@@ -26,7 +26,7 @@ from .music.search import MusicSearchClient, MusicSearchError, SongInfo
 from .rvc_client import RVCClient, RVCSidecarError
 from .services.mimo_tts import MiMoTTSService
 from .services.pipeline import Pipeline
-from .services.local_backend import INDEX, MODEL, LocalBackend
+from .services.local_backend import CoverStageError, LocalBackend
 
 
 # 语音发送的软截止：超过该时长仍未返回，先按失败上报（bot 会说"发不出去"），
@@ -55,7 +55,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="默认禁用；管理员审查后明确启用")
-    config_version: str = Field(default="0.3.1", description="配置版本")
+    config_version: str = Field(default="0.4.0", description="配置版本")
 
 
 class RVCConfig(PluginConfigBase):
@@ -161,8 +161,12 @@ class ComponentConfig(PluginConfigBase):
 class LocalConfig(PluginConfigBase):
     backend: str = Field(default="local", description="只支持受限 Linux 本地后端；legacy 禁止不受限推理")
     output_dir: str = Field(default="", description="永久输出绝对路径；留空使用插件 data_dir/covers")
-    model_path: str = Field(default=str(MODEL), description="管理员配置的固定 RVC 模型绝对路径")
-    index_path: str = Field(default=str(INDEX), description="管理员配置的固定索引绝对路径")
+    model_path: str = Field(default="", description="管理员提供的固定 RVC 模型绝对路径，未配置时禁止渲染")
+    index_path: str = Field(default="", description="管理员提供的索引绝对路径，未配置时禁止渲染")
+    worker_python: str = Field(default="", description="安装 Demucs/RVC 的隔离 Python 绝对路径（建议 3.9）")
+    musicdl_python: str = Field(default="", description="安装 musicdl 的隔离 Python 绝对路径")
+    rvc_script: str = Field(default="", description="受限 RVC 脚本绝对路径；不执行未隔离 WebUI")
+    inference_lock: str = Field(default="", description="与本机其他推理共享的绝对锁文件路径，父目录须存在")
     max_queue: int = Field(default=2, ge=0, le=8)
     timeout_s: int = Field(default=900, ge=60, le=900)
     max_duration_s: int = Field(default=300, ge=30, le=300)
@@ -204,7 +208,7 @@ class SingPlugin(MaiBotPlugin):
         # 网易云扫码登录后台任务
         self._netease_login_task: asyncio.Task[None] | None = None
         # 翻唱去重：进行中/刚完成的任务 (stream, query, model, 带伴奏) -> 运行信息
-        self._cover_runs: dict[tuple[str, str, str, bool], dict[str, Any]] = {}
+        self._cover_runs: dict[tuple[str, str, str, bool, str, str], dict[str, Any]] = {}
         # 翻唱语音缓存定期清理任务
         self._cache_cleanup_task: asyncio.Task[None] | None = None
 
@@ -328,7 +332,14 @@ class SingPlugin(MaiBotPlugin):
                 raise ValueError('local.output_dir 必须是绝对路径')
         else:
             output = Path(self.ctx.paths.data_dir).resolve() / 'covers'
-        return LocalBackend(output, model=Path(cfg.model_path), index=Path(cfg.index_path),
+        path_fields = ('model_path', 'index_path', 'worker_python', 'musicdl_python',
+                       'rvc_script', 'inference_lock')
+        paths = {field: Path(getattr(cfg, field)) for field in path_fields if getattr(cfg, field).strip()}
+        if len(paths) != len(path_fields) or any(not path.is_absolute() for path in paths.values()):
+            raise ValueError('local 的模型、索引、隔离 Python、RVC 脚本、推理锁须全部配置为绝对路径')
+        return LocalBackend(output, model=paths['model_path'], index=paths['index_path'],
+                            worker_python=paths['worker_python'], musicdl_python=paths['musicdl_python'],
+                            rvc_script=paths['rvc_script'], inference_lock=paths['inference_lock'],
                             max_queue=cfg.max_queue, timeout_s=cfg.timeout_s,
                             max_duration_s=cfg.max_duration_s,
                             max_download_bytes=cfg.max_download_bytes,
@@ -787,7 +798,7 @@ class SingPlugin(MaiBotPlugin):
     @Command(
         "翻唱",
         description="用克隆音色翻唱歌曲（搜歌 → 人声分离 → 换音色）",
-        pattern=r"^(?P<pfx>\S)翻唱\s+(?P<query>.+?)(?:\s+-v\s+(?P<model>\S+))?$",
+        pattern=r"^(?P<pfx>\S)翻唱\s+(?P<query>.+?)(?:\s+--album\s+(?P<album>.+?))?(?:\s+--source-id\s+(?P<source_id>[A-Za-z0-9_-]+))?(?:\s+-v\s+(?P<model>\S+))?$",
         # 完整流程（搜歌+下载+分离+转换+发送）远超宿主默认 60s RPC 超时，
         # 超时会导致宿主判定失败而插件仍在后台把语音发出（bot 说失败但语音照发）
         timeout_ms=3_000_000,
@@ -802,21 +813,27 @@ class SingPlugin(MaiBotPlugin):
         model = re.sub(r"^-v\s*", "", model).strip()
 
         if not query:
-            await self.ctx.send.text("用法：/翻唱 准确歌名 - 艺人名（可选 -v 已配置模型名）", stream_id)
+            await self.ctx.send.text("用法：/翻唱 准确歌名 - 艺人名（可选 --album 专辑名 或 --source-id 曲目ID；-v 只指定音色，不控制伴奏）", stream_id)
             return False, "缺少歌名", True
 
         try:
             model = self._resolve_model(model)
-            song, audio, outcome, reused = await self._run_cover_dedup(query, model, stream_id)
+            song, audio, outcome, reused = await self._run_cover_dedup(query, model, stream_id,
+                album=matched.get("album"), source_id=matched.get("source_id"))
             if reused and outcome == 'sent':
                 return True, f"已发送过: {song.display()}", True
+        except CoverStageError as exc:
+            content = self._cover_failure(exc)["content"]
+            await self.ctx.send.text(content, stream_id)
+            return False, exc.code, True
         except Exception as exc:
             self.ctx.logger.exception("翻唱失败: %s", query)
             await self.ctx.send.text(f"翻唱失败：{exc}", stream_id)
             return False, str(exc), True
 
         if outcome == 'sent':
-            await self.ctx.send.text(f"已用克隆音色翻唱「{song.display()}」", stream_id)
+            release = f"（来源专辑《{song.album}》）" if song.album else ''
+            await self.ctx.send.text(f"已用克隆音色翻唱「{song.display()}」{release}", stream_id)
         elif outcome == 'unknown':
             await self.ctx.send.text(f"翻唱已保存，发送结果尚未确认，请勿重复发送：「{song.display()}」", stream_id)
         else:
@@ -1126,9 +1143,11 @@ class SingPlugin(MaiBotPlugin):
             "调用前可先自然回应一句（如「我试试」「好呀」）。"
             "若工具返回成功，说明语音条已发出，无需再补充任何文字。"
             "若工具返回失败，必须按返回的具体原因如实简短说明，不要一律说「发不出去」："
-            "返回内容以「翻唱失败：」开头时，是歌曲没做出来（例如官方源没有可下载的完整版本、"
-            "歌名与艺人不匹配），此时应说明原因并建议换一首或核对「歌名 - 艺人」，与发送无关；"
+            "返回内容报告来源查询或渲染失败时，是歌曲没做出来：可能没有匹配、授权受限、"
+            "返回的元数据不足或服务暂时不可用，不能断言歌曲不存在，更与 QQ 发送无关；"
             "返回内容提到「保存」与「发送」时，才是成品已生成但语音条没发出去。"
+            "多个候选表示需要用户选择版本，不表示无法下载；请列出专辑/ID并询问，不得凭时长、排序或人气猜录音室版本。"
+            "album/source_id 仅用于用户明确指定的发行，不得自行编造来源ID或暗中更换歌曲。"
             "with_instrumental 参数控制是否混入伴奏：用户只说歌名默认纯人声；"
             "当用户明确要求带伴奏、加上伴奏、有伴奏、跟着伴奏唱时传 true。"
         ),
@@ -1139,21 +1158,27 @@ class SingPlugin(MaiBotPlugin):
         parameters=[
             ToolParameterInfo(name="query", param_type=ToolParamType.STRING, description="准确歌名 - 艺人名；必须包含艺人，不能仅用关键词", required=True),
             ToolParameterInfo(name="with_instrumental", param_type=ToolParamType.BOOLEAN, description="是否混入伴奏（默认 false）", required=False),
+            ToolParameterInfo(name="album", param_type=ToolParamType.STRING, description="用户明确选择的专辑，可选；不得根据时长猜测", required=False),
+            ToolParameterInfo(name="source_id", param_type=ToolParamType.STRING, description="用户明确选择的返回候选曲目ID，可选；不得编造", required=False),
         ],
     )
-    async def handle_cover_tool(self, query: str = "", with_instrumental: bool = False, stream_id: str = "", **kwargs: Any) -> dict[str, Any]:
+    async def handle_cover_tool(self, query: str = "", with_instrumental: bool = False, stream_id: str = "", album: str | None = None, source_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
         if not query.strip():
             return {"content": "请提供歌曲名"}
         sid = self._find_stream_id(stream_id, kwargs)
         try:
             model = self._resolve_model("")
-            song, audio, outcome, reused = await self._run_cover_dedup(query, model, sid, with_instrumental=with_instrumental)
+            song, audio, outcome, reused = await self._run_cover_dedup(query, model, sid,
+                with_instrumental=with_instrumental, album=album, source_id=source_id)
             if outcome == 'sent':
                 # 语音条已发出，本工具不再输出文本，避免 MaiBot 额外说"我不会唱"
                 return {"content": "", "stop_after_execution": True}
             if outcome == 'unknown':
                 return {"content": "翻唱已保存，但发送结果尚未确认；不要自动重试"}
             return {"content": "翻唱已保存但语音发送失败，用户可重新请求；成品不会丢失"}
+        except CoverStageError as exc:
+            self.ctx.logger.warning("翻唱阶段失败 [%s]: %s", exc.code, query)
+            return self._cover_failure(exc)
         except Exception as exc:
             self.ctx.logger.exception("翻唱工具失败: %s", query)
             return {"content": f"翻唱失败：{exc}"}
@@ -1185,8 +1210,18 @@ class SingPlugin(MaiBotPlugin):
 
     # ===== 编排调用 =====
 
+    @staticmethod
+    def _cover_failure(exc: CoverStageError) -> dict[str, Any]:
+        lines = [str(exc)]
+        for choice in exc.candidates[:10]:
+            lines.append(f"ID {choice['identifier']} · 专辑《{choice['album']}》 · {choice['duration_s']} 秒")
+        if exc.candidates:
+            lines.append('请确认其中一个版本，再带 album 或 source_id 请求；这次没有发送语音。')
+        return {'content': '\n'.join(lines), 'error_code': exc.code, 'candidates': exc.candidates}
+
     async def _run_cover_dedup(
-        self, query: str, sid: str, stream_id: str, *, with_instrumental: bool = False
+        self, query: str, sid: str, stream_id: str, *, with_instrumental: bool = False,
+        album: str | None = None, source_id: str | None = None
     ) -> tuple[SongInfo, Path, str, bool]:
         """Deduplicate the complete render-and-send operation, not just rendering.
 
@@ -1196,7 +1231,9 @@ class SingPlugin(MaiBotPlugin):
         """
         if not stream_id:
             raise ValueError('缺少当前会话，拒绝发送到未知目标')
-        key = (stream_id, query.strip().lower(), sid, bool(with_instrumental))
+        album = album.strip() or None if album is not None else None
+        source_id = source_id.strip() or None if source_id is not None else None
+        key = (stream_id, query.strip().lower(), sid, bool(with_instrumental), album or "", source_id or "")
         now = time.time()
         for stale in [k for k, v in self._cover_runs.items()
                       if v['task'].done() and now >= v.get('expires_at', float('inf'))]:
@@ -1205,7 +1242,8 @@ class SingPlugin(MaiBotPlugin):
         reused = entry is not None
         if entry is None:
             async def render_and_send() -> tuple[SongInfo, Path, str]:
-                song, audio = await self._run_cover(query, sid, stream_id, with_instrumental=with_instrumental)
+                song, audio = await self._run_cover(query, sid, stream_id, with_instrumental=with_instrumental,
+                                                     album=album, source_id=source_id)
                 # LocalBackend has already committed the permanent MP3. Never
                 # load it as base64 or delete it after a delivery error.
                 outcome = await self._send_custom_voice('voiceurl', {'url': audio.resolve().as_uri()}, stream_id)
@@ -1229,7 +1267,8 @@ class SingPlugin(MaiBotPlugin):
         song, audio, outcome = await asyncio.shield(entry['task'])
         return song, audio, outcome, reused
 
-    async def _run_cover(self, query: str, sid: str, stream_id: str, *, with_instrumental: bool = False) -> tuple[SongInfo, Path]:
+    async def _run_cover(self, query: str, sid: str, stream_id: str, *, with_instrumental: bool = False,
+                         album: str | None = None, source_id: str | None = None) -> tuple[SongInfo, Path]:
         if self._local is None:
             raise RuntimeError('本地后端未初始化')
         if sid not in (self.config.rvc.default_model.strip(), self._local.model.name, str(self._local.model)):
@@ -1237,8 +1276,11 @@ class SingPlugin(MaiBotPlugin):
         if ' - ' not in query:
             raise ValueError('为避免误选曲目，请用「准确歌名 - 艺人」指定歌曲')
         title, artist = query.rsplit(' - ', 1)
-        result = await self._local.cover(title, artist, instrumental=with_instrumental)
-        return SongInfo(result.key, result.title, result.artist, '', 'local'), result.path
+        result = await self._local.cover(title, artist, instrumental=with_instrumental, album=album, source_id=source_id)
+        if result.catalog_warning:
+            self.ctx.logger.warning(result.catalog_warning)
+        return SongInfo(result.key, result.title, result.artist, result.album, 'local',
+                        result.source_id), result.path
 
     async def _run_speak(self, text: str, sid: str, stream_id: str) -> bytes:
         if self._pipeline is None:

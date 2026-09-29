@@ -18,9 +18,9 @@
 
 ## 资源与外部组件
 
-本机受限于 8 GiB 容器内存。任何安装、模型加载或推理均必须由维护者在专用 systemd 用户服务中运行，并满足：`MemoryMax=4G`、`MemoryHigh=3G`、`MemorySwapMax=0`、`CPUQuota` 不超过 150%、明确的运行时上限；共享互斥锁 `/home/qr0w/audio-lab/inference.lock` 必须在服务内部取得。无法建立并验证约束时不得继续，也不得改用不受限执行。使用已有 `/home/qr0w/audio-lab/tools/rvc/rvc.sh` 时不要在外层重复套用其锁定调用；资源执行细节须由维护者核验。
+管理员先核对实际容器 cgroup 内存，而非主机 RAM；**容器至少应能为 4 GiB worker 与其他常驻服务留出余量**。每个推理 worker 使用独立 systemd 用户服务并验证 `MemoryMax=4G`、`MemoryHigh=3G`、`MemorySwapMax=0`、`CPUQuota≤150%` 和运行时上限；共享锁路径由 `local.inference_lock` 指定，须在 worker 内部取得。隔离不可用时不回退无约束推理。插件不会启动一个替代 QQ 进程；NapCat 应由管理员另行管理长期服务。
 
-不要修改既有 `svc-bench/.venv39`、musicdl 环境或 MaiBot 依赖；不要把大文件放在 `/tmp`。模型、索引、HubERT 和引擎不是插件包内容。不要下载/训练新模型以满足本部署说明。
+管理员须准备并在 `local` 配置六个实际绝对路径：模型、索引、隔离 worker Python、隔离 musicdl Python、受限 RVC 脚本和共享推理锁；不能指向实验目录的固定用户名。模型、索引、HuBERT、外部引擎和独立 Python 环境不包含在插件包内；不可因此声称一键安装，且不要为迁移而私自下载权重或训练素材。参见 [部署边界](DEPLOYMENT_BOUNDARY.md)。
 
 ## 歌曲来源与模型表达
 
@@ -30,6 +30,6 @@ Natsume Iroha 候选模型推定以日语素材为主，但训练清单不公开
 
 ## 配置示例与实现边界
 
-`config.example.toml` 按插件 `SingPluginConfig` schema 给出无凭证示例，`[plugin].enabled=false` 且 `config_version="0.3.1"`。本地配置包括 schema 实际声明的队列、时长、下载上限和 allowlist；没有 `min_duration_s` 字段，也没有可配置 scratch、分离器或 musicdl 路径。固定模型/index 默认路径来自后端常量。
+`config.example.toml` 按插件 `SingPluginConfig` schema 给出无凭证示例，`[plugin].enabled=false` 且 `config_version="0.4.0"`（离线修复分支待单独升级版本）。`local` 包含队列、时长、下载上限、allowlist 和六个**必须手工配置**的外部运行时路径；没有 `min_duration_s`、可配置 scratch 或通用分离器字段。模型/index 不再采用维护者机器的默认路径，缺失时拒绝启动本地后端。
 
 历史 `[rvc].auto_start` 默认关闭；本地后端不会启动旧 sidecar。当前 `mimo.rvc_after_tts=true` 会在说话 RVC 路径明确报错，因此示例设为 `false`，可使用原生 MiMo TTS。配置契约中与 schema/实现不一致的细节需由实现负责人修正，不能靠添加不存在的示例键掩盖。真实凭证配置留在本机，不要提交。

@@ -1,14 +1,19 @@
 # 示例仅展示无凭证配置；插件默认禁用，启用须经维护者审查。
 [plugin]
 enabled = false
-config_version = "0.3.1"
+config_version = "0.4.0"
 
 [local]
 backend = "local"
 # 留空使用 SDK 的 ctx.paths.data_dir/covers；覆盖值必须为绝对路径。
 output_dir = ""
-model_path = "/home/qr0w/audio-lab/models/natsume-iroha/extracted/NatsumeIroha/NatsumeIroha.pth"
-index_path = "/home/qr0w/audio-lab/models/natsume-iroha/extracted/NatsumeIroha/added_IVF186_Flat_nprobe_1_v1.index"
+# 管理员按本机实际安装填写，留空会拒绝启动本地翻唱后端；不捆绑权重、许可证或隔离环境。
+model_path = ""
+index_path = ""
+worker_python = ""
+musicdl_python = ""
+rvc_script = ""
+inference_lock = ""
 max_queue = 2
 timeout_s = 900
 max_duration_s = 300

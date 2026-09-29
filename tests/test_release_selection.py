@@ -1,61 +1,75 @@
-"""Release selection must pick a studio master and refuse ambiguous catalogues."""
+"""Do not label similarly timed releases as the same recording or a studio master."""
 from pathlib import Path
 from types import SimpleNamespace
 import importlib.util
+import json
+import subprocess
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('release_worker', ROOT / 'runtime/worker.py')
+worker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(worker)
 
 
-def load_worker():
-    spec = importlib.util.spec_from_file_location('release_worker', ROOT / 'runtime/worker.py')
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def song(identifier, duration, album):
+    return SimpleNamespace(identifier=str(identifier), song_name='Creep', singers='Radiohead',
+                           duration_s=duration, album=album, file_size_bytes=4000000)
 
 
-def song(identifier, duration, album=''):
-    return SimpleNamespace(identifier=identifier, duration_s=duration, album=album)
+def choose(matches, **kwargs):
+    return worker.select_release(matches, title='Creep', artist='Radiohead',
+                                 max_seconds=300, max_bytes=67108864, **kwargs)
 
 
-def test_creep_studio_cluster_beats_live_versions():
-    """Real catalogue shape: the studio master repeats, live takes do not."""
-    worker = load_worker()
-    matches = [song(3375291324, 235.891, 'RFM 90'), song(26928500, 239.0, '40 Jaar Pinkpop'),
-               song(27141620, 238.64, 'Greatest Hits of Modern Rock'), song(2158167564, 274.373, 'Summer Sonic'),
-               song(22558968, 237.923, 'The Best Of'), song(2725592755, 281.04, 'Dijon'),
-               song(2699873607, 280.386, "Glastonbury '97"), song(2715069705, 289.546, 'South Park'),
-               song(27011845, 241.76, 'Now British')]
-    chosen, selection = worker.select_release(matches)
-    assert selection['cluster_size'] == 5
-    assert selection['runner_up_size'] == 2
-    assert chosen.duration_s < 250  # Studio length, not a live take.
-    assert selection['chosen_album']
+def test_similar_duration_studio_and_live_remain_ambiguous():
+    matches = [song(1, 237.9, 'The Best Of'), song(2, 239., '40 Jaar Pinkpop'), song(3, 238.6, 'Compilation')]
+    with pytest.raises(worker.SourceSelectionError) as error:
+        choose(matches)
+    assert error.value.code == 'ambiguous'
+    assert len(error.value.candidates) == 3
 
 
-def test_single_candidate_is_accepted():
-    worker = load_worker()
-    chosen, selection = worker.select_release([song(1, 202.3, 'Album')])
-    assert chosen.identifier == 1
-    assert selection['candidates'] == 1
+def test_chained_durations_never_prove_recording_identity():
+    with pytest.raises(worker.SourceSelectionError) as error:
+        choose([song(i, 220 + i*3, f'Album {i}') for i in range(6)])
+    assert error.value.code == 'ambiguous'
 
 
-def test_all_distinct_durations_refused():
-    """Every 15 Step candidate had its own duration, so nothing may be assumed."""
-    worker = load_worker()
-    matches = [song(i, d) for i, d in enumerate([272.5, 225.9, 261.0, 290.4, 283.1, 232.2, 249.3])]
+def test_explicit_source_id_or_unique_album_selects_without_studio_claim():
+    matches = [song(1, 237.9, 'The Best Of'), song(2, 239., '40 Jaar Pinkpop')]
+    chosen, selection = choose(matches, source_id='2')
+    assert chosen.identifier == '2'
+    assert selection['method'] == 'source_id'
+    assert 'cluster_size' not in selection
+    chosen, selection = choose(matches, album='The Best Of')
+    assert chosen.identifier == '1'
+    assert selection['method'] == 'album'
+
+
+def test_single_id_duplicate_is_not_false_ambiguity():
+    chosen, selection = choose([song(1, 237.9, 'Album'), song(1, 237.9, 'Album')])
+    assert chosen.identifier == '1'
+    assert selection['method'] == 'unique_id'
+
+
+def test_missing_candidate_is_unavailable_not_a_payment_claim():
+    with pytest.raises(worker.SourceSelectionError) as error:
+        choose([])
+    assert error.value.code == 'unavailable'
+
+
+def test_failure_envelope_preserves_original_selection_error(tmp_path):
+    args = SimpleNamespace(scratch=tmp_path, stage='download')
     try:
-        worker.select_release(matches)
-    except RuntimeError as exc:
-        assert '录音室版本' in str(exc)
-    else:
-        raise AssertionError('ambiguous live-only catalogue must be refused')
-
-
-def test_empty_candidates_refused():
-    worker = load_worker()
-    try:
-        worker.select_release([])
-    except RuntimeError as exc:
-        assert '没有可免费下载' in str(exc)
-    else:
-        raise AssertionError('empty candidate list must be refused')
+        choose([song(1, 237.9, 'Album A'), song(2, 237.9, 'Album B')])
+    except worker.SourceSelectionError as error:
+        worker.write_failure(args, error)
+    path = tmp_path / 'error.json'
+    before = path.read_bytes()
+    record = json.loads(before)
+    assert record['code'] == 'source_ambiguous'
+    assert record['candidates'][0]['identifier'] == '1'
+    worker.write_failure(args, subprocess.CalledProcessError(1, ['download']))
+    assert path.read_bytes() == before

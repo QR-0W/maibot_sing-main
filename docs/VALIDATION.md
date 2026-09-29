@@ -35,7 +35,7 @@
 
 按用户许可，逐文件记录 SHA-256 后删除 50 个旧实验音频，共 224,701,886 bytes（约 214.3 MiB），包括旧 TTS/Tamaki 比较、旧 VCTK/Natsume 试听副本、分离中间音轨和中断测试 WAV。未递归删除实验根目录。
 
-保留完整原曲、选定模型/index、HuBERT、RVC/musicdl 工具及虚拟环境、研究与历史 JSON/日志、冻结回归输入、当前永久片段及整曲。清理依据见 [清理计划](CLEANUP_PLAN.md)。本机逐文件清单位于 `audio-lab/work/plugin-integration/cleanup-record.json`，不随代码提交。
+保留完整原曲、选定模型/index、HuBERT、RVC/musicdl 工具及虚拟环境、研究与历史 JSON/日志、冻结回归输入、当前永久片段及整曲。此段仅记录首次发布前的本机实验清理历史；详细路径与逐文件清单保存在管理员私有开发记录中，不随通用插件包提交。
 
 ## 尚未执行的线上步骤
 

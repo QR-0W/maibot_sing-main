@@ -2,6 +2,7 @@
 """One bounded systemd service: locked orchestration, separate Demucs and RVC children."""
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 from types import MethodType
 import argparse
@@ -16,10 +17,14 @@ import sys
 import time
 import unicodedata
 
-LOCK = Path('/home/qr0w/audio-lab/inference.lock')
-RVC = Path('/home/qr0w/audio-lab/tools/rvc/rvc_infer.py')
-# Two releases within this many seconds are treated as the same recording.
-RELEASE_CLUSTER_TOLERANCE_S = 4.0
+# Support direct CLI execution and isolated import-based tests without importing
+# the plugin entry point or any model library here.
+if __package__:
+    from .source_selection import SourceCandidate, SourceSelectionError, select_source
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from source_selection import SourceCandidate, SourceSelectionError, select_source
+    sys.path.pop(0)
 
 
 def verify_limits() -> None:
@@ -57,44 +62,40 @@ def norm(value: object) -> str:
     return ' '.join(unicodedata.normalize('NFKC', str(value or '')).casefold().split())
 
 
-def select_release(matches: list) -> tuple[object, dict]:
-    """Pick the studio master among official candidates of the same title/artist.
+def select_release(matches: list, *, title: str, artist: str, max_seconds: int,
+                   max_bytes: int, album: str | None = None,
+                   source_id: str | None = None) -> tuple[object, dict]:
+    """Require a unique stable ID or explicit release choice; runtime is not identity."""
+    candidates = [SourceCandidate('NeteaseMusicClient', str(song.identifier),
+        str(song.song_name), str(song.singers), str(song.album), float(song.duration_s or 0),
+        int(song.file_size_bytes) if song.file_size_bytes else None) for song in matches]
+    chosen = select_source(candidates, title=title, artist=artist, max_seconds=max_seconds,
+        max_bytes=max_bytes, album=album, source_id=source_id)
+    original = next(song for song in matches if str(song.identifier) == chosen.identifier)
+    return original, {'policy': 'explicit-source-v1',
+        'method': 'source_id' if source_id else 'album' if album else 'unique_id',
+        'chosen_id': chosen.identifier, 'chosen_album': chosen.album,
+        'notice': 'A selected catalogue ID is not proof of studio provenance or rights'}
 
-    A popular studio recording is re-released across many compilations, so its
-    duration repeats; a live take has its own distinct duration. Metadata alone
-    cannot label a version as live, so require a duration cluster that at least
-    two independent releases agree on and that clearly beats every other cluster.
-    Otherwise refuse instead of silently converting a live recording.
 
-    Args:
-        matches: Candidate SongInfo objects already filtered by title, artist and length.
-
-    Returns:
-        tuple: The chosen candidate and a record of how it was selected.
-    """
-    if not matches:
-        raise RuntimeError('官方源没有可免费下载的完整版本；请核对「歌名 - 艺人」是否准确，或换一首歌')
-    ordered = sorted(matches, key=lambda song: float(song.duration_s or 0))
-    if len(ordered) == 1:
-        return ordered[0], {'candidates': 1, 'cluster_size': 1, 'cluster_seconds': [round(float(ordered[0].duration_s), 1)],
-                            'reason': '官方源只有唯一候选'}
-    clusters: list[list] = []
-    for song in ordered:
-        if clusters and float(song.duration_s) - float(clusters[-1][-1].duration_s) <= RELEASE_CLUSTER_TOLERANCE_S:
-            clusters[-1].append(song)
-        else:
-            clusters.append([song])
-    ranked = sorted(clusters, key=len, reverse=True)
-    best, runner_up = ranked[0], (ranked[1] if len(ranked) > 1 else [])
-    seconds = sorted(round(float(song.duration_s or 0), 1) for song in best)
-    if len(best) < 2 or len(best) <= len(runner_up):
-        raise RuntimeError('官方源只有多个时长各不相同、无法确认录音室版本的候选（可能都是现场或改编版本）；'
-                           '请换一首歌，或改用你手上的原曲文件')
-    chosen = best[0]
-    return chosen, {'candidates': len(ordered), 'cluster_size': len(best), 'cluster_seconds': seconds,
-                    'runner_up_size': len(runner_up), 'tolerance_s': RELEASE_CLUSTER_TOLERANCE_S,
-                    'chosen_album': str(chosen.album), 'chosen_id': str(chosen.identifier),
-                    'reason': '同一时长在多张官方发行中重复出现，取为录音室母带'}
+def write_failure(args, exc: Exception) -> None:
+    """Persist a bounded error envelope for the parent, separate from worker logs."""
+    path = args.scratch / 'error.json'
+    if path.exists():
+        return  # Keep the original child-stage failure, not CalledProcessError.
+    messages = {
+        'ambiguous': '找到多个同名发行，尚未开始翻唱与发送；请明确选择专辑或来源曲目 ID。',
+        'unavailable': '当前来源未返回符合条件的音频候选；尚未生成或发送翻唱。',
+        'invalid_selection': '所选专辑或曲目 ID 与当前候选不匹配，请重新确认。',
+    }
+    if isinstance(exc, SourceSelectionError):
+        record = {'version': 1, 'stage': 'source_selection', 'code': 'source_'+exc.code,
+                  'message': messages.get(exc.code, '歌曲选择失败；尚未生成或发送翻唱。'),
+                  'candidates': [asdict(c) for c in exc.candidates[:10]]}
+    else:
+        record = {'version': 1, 'stage': args.stage, 'code': 'worker_failed',
+                  'message': '本地处理未完成，尚未进入语音发送；诊断日志已保留。'}
+    path.write_text(json.dumps(record, ensure_ascii=False), encoding='utf-8')
 
 
 def download(args: argparse.Namespace) -> None:
@@ -115,18 +116,14 @@ def download(args: argparse.Namespace) -> None:
     native = client.music_clients[source]
     native._parsewiththirdpartapis = MethodType(native_only, native)
     results = client.search(args.title + ' ' + args.artist).get(source, [])
-    matches = [song for song in results if norm(song.song_name) == norm(args.title)
-               and norm(args.artist) == norm(song.singers)
-               and 30 <= float(song.duration_s or 0) <= args.max_seconds
-               and not any(tag in norm(song.song_name + ' ' + str(song.album))
-                           for tag in ('试听', 'preview', 'live', '现场', '伴奏', 'karaoke'))
-               and (not song.file_size_bytes or int(song.file_size_bytes) <= args.max_bytes)]
-    chosen, selection = select_release(matches)
+    chosen, selection = select_release(results, title=args.title, artist=args.artist,
+        max_seconds=args.max_seconds, max_bytes=args.max_bytes,
+        album=args.album, source_id=args.source_id)
     chosen.chunk_size = 64 * 1024
     downloaded = native.download([chosen], num_threadings=1,
                                  request_overrides={'timeout': (8, 20)}, auto_supplement_song=False)
     if len(downloaded) != 1:
-        raise RuntimeError('官方源未提供该曲目的下载地址（不绕过付费或会员限制），请换一首歌')
+        raise RuntimeError('所选来源下载未完成；请检查来源可用性，不自动替换其他发行版本')
     path = Path(downloaded[0].save_path).resolve(strict=True)
     if not path.is_relative_to((args.scratch / 'musicdl').resolve()) or path.stat().st_size > args.max_bytes:
         raise RuntimeError('下载结果越界或过大')
@@ -135,6 +132,17 @@ def download(args: argparse.Namespace) -> None:
         'artist': str(chosen.singers), 'album': str(chosen.album),
         'expected_duration_s': float(chosen.duration_s), 'selection': selection,
         'file': str(path)}, ensure_ascii=False))
+
+
+def chunk_bounds(frames: int, rate: int) -> list[tuple[int, int]]:
+    """Bound each RVC call to <=25 s and never leave a sub-5 s final chunk."""
+    if frames < 30 * rate or rate <= 0:
+        raise ValueError('无效或过短的原始音频')
+    starts = list(range(0, frames, 20 * rate))
+    if len(starts) > 1 and frames - starts[-1] < 5 * rate:
+        starts.pop()
+    return [(start, starts[i+1] if i+1 < len(starts) else frames)
+            for i, start in enumerate(starts)]
 
 
 def separate(args: argparse.Namespace) -> None:
@@ -162,9 +170,29 @@ def separate(args: argparse.Namespace) -> None:
     backing = sum(stems[i] for i, name in enumerate(model.sources) if name != 'vocals').T.numpy()
     mono = voice.mean(axis=1)
     sf.write(args.scratch / 'vocals.wav', mono, rate, subtype='FLOAT')
-    for i, start in enumerate(range(0, len(mono), 20 * rate)):
-        sf.write(args.scratch / f'vocal_{i:03d}.wav', mono[start:start + 20 * rate], rate, subtype='FLOAT')
+    for i, (start, end) in enumerate(chunk_bounds(len(mono), rate)):
+        sf.write(args.scratch / f'vocal_{i:03d}.wav', mono[start:end], rate, subtype='FLOAT')
     sf.write(args.scratch / 'backing.wav', backing, rate, subtype='FLOAT')
+
+
+def align_converted_chunk(chunk, reference_length: int):
+    """Match the input timeline without injecting a silent gap at every 20s seam.
+
+    RVC currently returns 882 fewer samples per call (20 ms at 44.1 kHz).
+    Linear interpolation distributes that sub-0.2% timing correction over the
+    chunk instead of adding 20 ms of silence next to the following vocal.
+    This causes at most a few cents of pitch drift, not a key transposition.
+    """
+    import numpy as np
+    if reference_length <= 0 or not np.isfinite(chunk).all() or not chunk.size:
+        raise ValueError('无效的 RVC 分块输出')
+    if len(chunk) == reference_length:
+        return chunk
+    if abs(len(chunk) - reference_length) > reference_length * .005:
+        raise RuntimeError('RVC 分块时轴漂移超过 0.5%，拒绝擅自拉伸')
+    xp = np.arange(len(chunk), dtype=np.float64)
+    samples = np.linspace(0, len(chunk) - 1, reference_length, dtype=np.float64)
+    return np.interp(samples, xp, chunk).astype(chunk.dtype, copy=False)
 
 
 def mix(args: argparse.Namespace) -> None:
@@ -178,7 +206,7 @@ def mix(args: argparse.Namespace) -> None:
         chunk, ar = sf.read(converted, dtype='float32')
         if ar != sr or rr != sr or abs(len(chunk) - len(reference)) > sr * .1 or not np.isfinite(chunk).all():
             raise RuntimeError('RVC 片段采样率、时长或数值异常')
-        chunks.append(np.pad(chunk[:len(reference)], (0, max(0, len(reference)-len(chunk)))))
+        chunks.append(align_converted_chunk(chunk, len(reference)))
     if not chunks:
         raise RuntimeError('没有 RVC 转换片段')
     after = np.concatenate(chunks)
@@ -204,14 +232,20 @@ def mix(args: argparse.Namespace) -> None:
 
 def orchestrate(args: argparse.Namespace) -> None:
     verify_limits()
-    with LOCK.open('a+b') as lock:
+    with args.inference_lock.open('a+b') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         verify_limits()
         script = str(Path(__file__).resolve())
-        python = '/home/qr0w/svc-bench/.venv39/bin/python'
-        opts = ['--scratch', str(args.scratch), '--title', args.title, '--artist', args.artist,
+        python = str(args.worker_python)
+        opts = ['--worker-python', str(args.worker_python), '--musicdl-python', str(args.musicdl_python),
+                '--rvc-script', str(args.rvc_script), '--inference-lock', str(args.inference_lock),
+                '--scratch', str(args.scratch), '--title', args.title, '--artist', args.artist,
                 '--model', str(args.model), '--index', str(args.index),
                 '--max-seconds', str(args.max_seconds), '--max-bytes', str(args.max_bytes)]
+        if args.album:
+            opts.extend(['--album', args.album])
+        if args.source_id:
+            opts.extend(['--source-id', args.source_id])
         if args.instrumental:
             opts.append('--instrumental')
         if args.source_file:
@@ -222,7 +256,7 @@ def orchestrate(args: argparse.Namespace) -> None:
                 'title': args.title, 'artist': args.artist, 'sha256': digest_file(src),
                 'file': str(src)}, ensure_ascii=False))
         else:
-            run('/home/qr0w/musicdl-run/.venv/bin/python', script, 'download', *opts, timeout=100)
+            run(str(args.musicdl_python), script, 'download', *opts, timeout=100)
         info = json.loads((args.scratch / 'source.json').read_text())
         src = Path(info['file'])
         probe = json.loads(run('ffprobe', '-v', 'error', '-show_format', '-of', 'json', str(src),
@@ -232,7 +266,7 @@ def orchestrate(args: argparse.Namespace) -> None:
             raise RuntimeError('拒绝试听或超长歌曲')
         expected = info.get('expected_duration_s', duration)
         if abs(duration - expected) > max(3., expected * .02):
-            raise RuntimeError('下载音频与官方歌曲时长不符，拒绝试听截断或错曲')
+            raise RuntimeError('下载音频与来源标注时长不符，拒绝使用；此检查不能判定录音身份')
         info['sha256'] = digest_file(src)
         if src.stat().st_size > args.max_bytes:
             raise RuntimeError('下载大小超限')
@@ -241,7 +275,7 @@ def orchestrate(args: argparse.Namespace) -> None:
             str(args.scratch / 'original.wav'), timeout=120)
         run(python, script, 'separate', *opts, timeout=360)
         for chunk in sorted(args.scratch.glob('vocal_???.wav')):
-            run(python, str(RVC), '--model', str(args.model), '--index', str(args.index),
+            run(python, str(args.rvc_script), '--model', str(args.model), '--index', str(args.index),
                 '--input', str(chunk), '--output', str(chunk.with_name(chunk.stem + '_converted.wav')),
                 '--limit-seconds', '25', '--pitch', '0', '--f0-method', 'harvest',
                 '--index-rate', '0.5', '--filter-radius', '3', '--rms-mix-rate', '0.25',
@@ -270,13 +304,23 @@ def main() -> None:
     parser.add_argument('--artist', required=True)
     parser.add_argument('--model', type=Path, required=True)
     parser.add_argument('--index', type=Path, required=True)
+    parser.add_argument('--worker-python', type=Path, required=True)
+    parser.add_argument('--musicdl-python', type=Path, required=True)
+    parser.add_argument('--rvc-script', type=Path, required=True)
+    parser.add_argument('--inference-lock', type=Path, required=True)
     parser.add_argument('--source-file', type=Path)
+    parser.add_argument('--album')
+    parser.add_argument('--source-id')
     parser.add_argument('--max-seconds', type=int, required=True)
     parser.add_argument('--max-bytes', type=int, required=True)
     parser.add_argument('--instrumental', action='store_true')
     args = parser.parse_args()
     verify_limits()
-    {'run': orchestrate, 'download': download, 'separate': separate, 'mix': mix}[args.stage](args)
+    try:
+        {'run': orchestrate, 'download': download, 'separate': separate, 'mix': mix}[args.stage](args)
+    except Exception as exc:
+        write_failure(args, exc)
+        raise
 
 
 if __name__ == '__main__':

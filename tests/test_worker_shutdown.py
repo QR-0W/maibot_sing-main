@@ -39,7 +39,9 @@ async def test_worker_stop_failure_preserves_scratch_and_ownership(tmp_path, mon
     model, index = tmp_path / 'model', tmp_path / 'index'
     model.write_bytes(b'model')
     index.write_bytes(b'index')
-    manager = backend.LocalBackend(tmp_path / 'library', model=model, index=index)
+    manager = backend.LocalBackend(tmp_path / 'library', model=model, index=index,
+        worker_python=Path(sys.executable), musicdl_python=Path(sys.executable),
+        rvc_script=Path(__file__).resolve(), inference_lock=tmp_path / '.inference.lock')
     class FailedWorker:
         returncode = 1
         async def communicate(self):

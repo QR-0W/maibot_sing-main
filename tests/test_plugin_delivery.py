@@ -25,7 +25,16 @@ def plugin(tmp_path):
     logger.handlers = [logging.NullHandler()]
     logger.propagate = False
     instance = plugin_module.create_plugin()
-    instance.set_plugin_config(tomllib.loads((ROOT / 'config.example.toml').read_text()))
+    config = tomllib.loads((ROOT / 'config.example.toml').read_text())
+    model = tmp_path / 'NatsumeIroha.pth'
+    index = tmp_path / 'NatsumeIroha.index'
+    model.write_bytes(b'model-fixture')
+    index.write_bytes(b'index-fixture')
+    config['local'].update(model_path=str(model), index_path=str(index),
+                           worker_python=str(Path(sys.executable)), musicdl_python=str(Path(sys.executable)),
+                           rvc_script=str(Path(__file__).resolve()),
+                           inference_lock=str(tmp_path / '.inference.lock'))
+    instance.set_plugin_config(config)
     instance._ctx = SimpleNamespace(logger=logger, paths=SimpleNamespace(
         data_dir=str(tmp_path / 'data'), runtime_dir=str(tmp_path / 'runtime')))
     return instance

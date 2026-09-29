@@ -14,6 +14,12 @@ sys.modules[spec.name] = backend
 spec.loader.exec_module(backend)
 
 
+def fake_runtime_paths(tmp_path):
+    """Mocked subprocess tests still supply explicit, existing admin runtime paths."""
+    return {'worker_python': Path(sys.executable), 'musicdl_python': Path(sys.executable),
+            'rvc_script': Path(__file__).resolve(), 'inference_lock': tmp_path / '.inference.lock'}
+
+
 def test_source_identity_and_parameters_change_key():
     source = {'type': 'musicdl-native', 'title': 'song', 'artist': 'artist'}
     first = backend.cache_key(source, 'model1', 'index1', False)
@@ -118,7 +124,7 @@ async def test_publish_keeps_only_song_and_metadata(tmp_path, monkeypatch):
     index.write_bytes(b'index')
     original.write_bytes(b'test original')
     manager = backend.LocalBackend(tmp_path / 'library', model=model, index=index,
-                                   allowlist=(original,))
+                                   allowlist=(original,), **fake_runtime_paths(tmp_path))
 
     class FakeProcess:
         returncode = 0
