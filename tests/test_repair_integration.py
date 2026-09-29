@@ -133,9 +133,10 @@ async def test_command_reports_ambiguous_choices_without_sending(plugin):
         assert '请选择明确版本' in sends[-1][0]
         assert '发不出去' not in sends[-1][0]
         job_id = result.split()[-1]
-        assert instance._jobs.store.get(job_id, 'stream-1').state == 'needs_selection'
-        tool = await instance.handle_cover_tool('Song - Artist', stream_id='forged')
-        assert '未入队' in tool['content']
+        saved = instance._jobs.store.get(job_id, 'stream-1')
+        assert saved.state == 'needs_selection' and saved.delivery_state == 'not_requested'
+        tool = await instance.handle_cover_tool('Song - Artist', stream_id='forged', auto_reply=True)
+        assert '未入队' in tool['content'] and '--auto-reply' in tool['content']
         assert instance._jobs.store.get(job_id, 'stream-1').state == 'needs_selection'
     finally:
         await instance.on_unload()

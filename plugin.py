@@ -985,18 +985,32 @@ class SingPlugin(MaiBotPlugin):
     @Command(
         "翻唱",
         description="用克隆音色翻唱歌曲（搜歌 → 人声分离 → 换音色）",
-        pattern=r"^(?P<pfx>\S)翻唱\s+(?P<query>.+?)(?:\s+--album\s+(?P<album>.+?))?(?:\s+--source-id\s+(?P<source_id>[A-Za-z0-9_-]+))?(?:\s+-v\s+(?P<model>\S+))?(?:\s+(?P<instrumental>--with-instrumental))?$",
+        pattern=r"^(?P<pfx>\S)翻唱\s+(?P<query>.+?)(?:\s+--album\s+(?P<album>.+?))?(?:\s+--source-id\s+(?P<source_id>[A-Za-z0-9_-]+))?(?:\s+-v\s+(?P<model>\S+))?(?:\s+(?P<instrumental>--with-instrumental))?(?:\s+(?P<auto_reply>--auto-reply))?$",
         timeout_ms=45_000,  # only bounded catalogue search and ledger writes
 
     )
     async def handle_cover_command(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
         try:
             identity = self._command_identity(stream_id, kwargs)
-            matched = kwargs.get('matched_groups') or {}
+            # Tool/kwargs groups cannot grant consent: parse the Host's original
+            # Command text rather than trusting a separately supplied group.
+            command_match = re.fullmatch(
+                r'\S翻唱\s+(?P<query>.+?)(?:\s+--album\s+(?P<album>.+?))?'
+                r'(?:\s+--source-id\s+(?P<source_id>[A-Za-z0-9_-]+))?'
+                r'(?:\s+-v\s+(?P<model>\S+))?'
+                r'(?:\s+(?P<instrumental>--with-instrumental))?'
+                r'(?:\s+(?P<auto_reply>--auto-reply))?', kwargs['text'])
+            if command_match is None:
+                raise ValueError('翻唱命令格式无效；--auto-reply 只能放在最后')
+            matched = command_match.groupdict()
             query = str(matched.get('query') or '').strip()
             model = str(matched.get('model') or '').strip()
             album = str(matched.get('album') or '').strip()
             source_id = str(matched.get('source_id') or '').strip()
+            auto_reply = matched.get('auto_reply') == '--auto-reply'
+            consent_event = identity['message_id'] if auto_reply else None
+            if re.search(r'\s(?:--[A-Za-z-]+|-v)(?=\s|$)', query):
+                raise ValueError('命令参数顺序无效；--auto-reply 只能放在最后')
             if not query or ' - ' not in query or not query.rsplit(' - ', 1)[-1].strip():
                 raise ValueError('请用 /翻唱 准确歌名 - 艺人名；来源需在候选列表明确选定')
             if model and model not in (self.config.rvc.default_model.strip(), self.config.local.model_path,
@@ -1007,13 +1021,16 @@ class SingPlugin(MaiBotPlugin):
             jobs = self._require_jobs()
             provider = self._resolve_platform(self.config.music.default_platform)
             request = {'query': query, 'provider': provider, 'platform': identity['platform'],
-                       'user_id': identity['user_id'], 'instrumental': matched.get('instrumental') == '--with-instrumental'}
+                       'user_id': identity['user_id'], 'instrumental': matched.get('instrumental') == '--with-instrumental',
+                       'album': album, 'source_id': source_id, 'model_selector': model,
+                       'model': self.config.rvc.default_model.strip(),
+                       'model_path': self.config.local.model_path, 'auto_reply': auto_reply}
             token = self._request_token(identity)
             # Replayed Command RPCs reuse the exact persisted token; never repeat a
             # search or start a second worker when an offer/selection already exists.
             existing = await asyncio.to_thread(self._find_request, jobs.store, stream_id, token)
             if existing is not None:
-                if existing.request != request or existing.consent_event != identity['message_id']:
+                if existing.request != request or existing.consent_event != consent_event:
                     raise JobConflict('原消息身份与请求内容冲突，拒绝复用')
                 job = existing
             else:
@@ -1031,7 +1048,7 @@ class SingPlugin(MaiBotPlugin):
                 if not choices:
                     raise ValueError('未找到符合准确曲目/艺人/专辑/来源 ID 的候选；没有启动翻唱')
                 job, _ = await asyncio.to_thread(jobs.store.submit, stream_id, token, request,
-                    auto_reply=True, consent_event=identity['message_id'])
+                    auto_reply=auto_reply, consent_event=consent_event)
                 if job.state == 'searching':
                     job = await asyncio.to_thread(jobs.store.offer, job.id, stream_id, choices,
                                                   expected_revision=job.revision)
@@ -1129,38 +1146,15 @@ class SingPlugin(MaiBotPlugin):
 
     @Command(
         "163cookie",
-        description="用网易云 MUSIC_U cookie 登录（仅管理员可用）",
+        description="已停用聊天携带 Cookie；请使用安全配置或扫码登录",
         pattern=r"^(?P<pfx>\S)163cookie(?:\s+(?P<cookie>.+))?\s*$",
         permission="operator",
         timeout_ms=60_000,
     )
     async def handle_netease_cookie_login(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
-        matched = kwargs.get("matched_groups")
-        cookie_value = str(matched.get("cookie", "") or "").strip() if isinstance(matched, dict) else ""
-        if not cookie_value:
-            await self.ctx.send.text(
-                "用法：/163cookie <MUSIC_U 值>\n"
-                "获取：电脑浏览器登录 music.163.com → F12 → 应用/Storage → Cookie → 复制 MUSIC_U 的值\n"
-                "（也可整段粘贴含 MUSIC_U=xxx; __csrf=yyy 的 cookie 字符串）", stream_id)
-            return False, "缺少 cookie", True
-        if self._music is None:
-            await self.ctx.send.text("音乐客户端未初始化", stream_id)
-            return False, "未初始化", True
-        music_u, csrf = cookie_value, ""
-        m = re.search(r"MUSIC_U=([^;]+)", cookie_value)
-        if m:
-            music_u = m.group(1).strip()
-            c = re.search(r"__csrf=([^;]+)", cookie_value)
-            csrf = c.group(1).strip() if c else ""
-        self._music.apply_netease_cookies({"MUSIC_U": music_u, "__csrf": csrf})
-        try:
-            profile = await self._music.get_netease_profile()
-        except Exception as exc:
-            await self.ctx.send.text(f"❌ cookie 校验失败（可能已过期）：{exc}", stream_id)
-            return False, str(exc), True
-        self._save_login_cache("netease", {"account": "cookie", "cookies": self._music.get_netease_cookies()})
-        await self.ctx.send.text(f"✅ 网易云登录正常：{profile['nickname']}", stream_id)
-        return True, f"网易云 cookie 登录: {profile['nickname']}", True
+        # Never parse, log, persist, or echo a secret pasted into group chat.
+        await self.ctx.send.text('聊天 Cookie 登录已停用。请使用管理员安全配置或 /网易云音乐登录 扫码；若已发送凭据请立即撤回并轮换。', stream_id)
+        return False, '聊天 Cookie 登录已停用', True
 
     @Command(
         "163logintest",
@@ -1293,7 +1287,7 @@ class SingPlugin(MaiBotPlugin):
             return
         token_note = (
             "" if music.get_netease_device().get("anon_token")
-            else "（注意：本次二维码缺少环境令牌，确认时若提示环境异常，请改用 /163cookie 登录）"
+            else "（注意：本次二维码缺少环境令牌，确认时若提示环境异常，请使用管理员安全配置重新登录）"
         )
         await self.ctx.send.text(
             "请打开网易云音乐 App，用 App 内的「扫一扫」扫描此二维码（不要用 QQ/微信扫一扫或相机），"
@@ -1354,7 +1348,7 @@ class SingPlugin(MaiBotPlugin):
             "不能只填歌名。本 Tool 不拥有可信原始用户 message_id，仅提供 /翻唱 命令授权指引；不会入队、渲染或自动发送。"
             "注意：用户只是想听这首歌的原唱/原曲时（如「放一首XX」「发一首XX」「来一首XX的歌」"
             "「放XX听听」），不要调用本工具，应改用 search_and_play_music。"
-            "请提示用户亲自发送 /翻唱 准确歌名 - 艺人名；涉及歌曲选择须用 /翻唱选择。"
+            "请提示用户亲自发送 /翻唱 准确歌名 - 艺人名：缺省只保存并允许查询状态，不自动发送；仅用户明确要求完成后自动回复时在命令最后加 --auto-reply。涉及歌曲选择须用 /翻唱选择。"
             "任何 stream_id、source_id 或其它工具参数均不可作为自动投递授权。"
         ),
         activation_type=ActivationType.ALWAYS,
@@ -1374,7 +1368,7 @@ class SingPlugin(MaiBotPlugin):
         title = query.strip() if isinstance(query, str) else ''
         if not title:
             return {'content': '请向用户询问准确歌名 - 艺人名。Tool 无权发起自动投递。'}
-        return {'content': f'请用户本人发送 /翻唱 {title} 来明确授权；本次仅提供说明，未搜索、未入队、未发送语音。'}
+        return {'content': f'请用户本人发送 /翻唱 {title} 发起任务（缺省只保存、可查状态，不自动发语音）；若本人明确希望完成后自动回复，请在命令最后加 --auto-reply。本次仅提供说明，未搜索、未入队、未发送语音。'}
 
     @Tool(
         "speak_voice",

@@ -83,7 +83,8 @@ async def test_lifecycle_restarts_durable_service_without_deleting_offer(plugin)
     assert ok and '请选择明确版本' in sends[-1][0]
     job_id = sends[-1][0].split('任务 ')[1].split('：')[0]
     before = instance._jobs.store.get(job_id, 'stream-1')
-    assert before.state == 'needs_selection' and before.consent_event == 'platform-message-1'
+    assert before.state == 'needs_selection' and before.consent_event is None
+    assert before.delivery_state == 'not_requested'
     async def fake_login():
         await asyncio.sleep(3600)
     login = asyncio.create_task(fake_login())
@@ -124,6 +125,50 @@ async def test_command_idempotent_identity_and_tool_fail_closed(plugin):
         assert instance._jobs.store.get(job_id, 'stream-1').state == 'needs_selection'
     finally:
         await instance.on_unload()
+
+
+@pytest.mark.asyncio
+async def test_explicit_auto_reply_and_selector_replay_fence(plugin):
+    instance, sends = plugin
+    await instance.on_load()
+    try:
+        authorized = command(text='/翻唱 Song - Artist --auto-reply')
+        assert (await instance.handle_cover_command(**authorized))[0]
+        job_id = sends[-1][0].split('任务 ')[1].split('：')[0]
+        saved = instance._jobs.store.get(job_id, 'stream-1')
+        assert saved.consent_event == 'platform-message-1'
+        assert saved.delivery_state == 'pending' and saved.request['auto_reply'] is True
+        assert (await instance.handle_cover_command(**authorized))[0]
+        # Same original message identity cannot change selector or consent.
+        for text in ('/翻唱 Song - Artist',
+                     '/翻唱 Song - Artist --album Album --auto-reply',
+                     '/翻唱 Song - Artist --source-id id-1 --auto-reply',
+                     '/翻唱 Song - Artist -v model --auto-reply'):
+            assert not (await instance.handle_cover_command(**command(text=text)))[0]
+        forged = command()
+        forged['matched_groups'] = {'query': 'Song - Artist', 'auto_reply': '--auto-reply'}
+        assert not (await instance.handle_cover_command(**forged))[0]
+        tool = await instance.handle_cover_tool(query='Song - Artist', auto_reply=True,
+                                                 consent_event='forged', stream_id='stream-1')
+        assert '--auto-reply' in tool['content'] and '缺省只保存' in tool['content']
+        assert instance._jobs.store.get(job_id, 'stream-1').request == saved.request
+    finally:
+        await instance.on_unload()
+
+
+@pytest.mark.asyncio
+async def test_chat_cookie_is_never_applied_or_echoed(plugin):
+    instance, sends = plugin
+    class ForbiddenMusic:
+        def apply_netease_cookies(self, *args):
+            raise AssertionError('Chat secrets must never enter music client')
+    instance._music = ForbiddenMusic()
+    secret = 'MUSIC_U=unique-private-secret; __csrf=other-secret'
+    result = await instance.handle_netease_cookie_login(stream_id='stream-1',
+        matched_groups={'cookie': secret})
+    assert result[0] is False
+    assert '安全配置' in sends[-1][0] and '扫码' in sends[-1][0]
+    assert 'unique-private-secret' not in str(result) + str(sends)
 
 
 @pytest.mark.asyncio

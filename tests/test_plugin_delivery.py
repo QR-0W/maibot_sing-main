@@ -14,7 +14,7 @@ async def test_unknown_sdk_false_never_retries_and_artifact_remains(plugin, tmp_
     instance, sends = plugin
     await instance.on_load()
     try:
-        assert (await instance.handle_cover_command(**command()))[0]
+        assert (await instance.handle_cover_command(**command(text='/翻唱 Song - Artist --auto-reply')))[0]
         job_id = sends[-1][0].split('任务 ')[1].split('：')[0]
         offer = instance._jobs.store.choices(job_id, 'stream-1')
         await instance._jobs.close()  # never run a real systemd unit in this suite
@@ -47,7 +47,7 @@ async def test_sdk_sent_needs_message_id_and_is_never_duplicate(plugin, tmp_path
     instance, sends = plugin
     await instance.on_load()
     try:
-        assert (await instance.handle_cover_command(**command()))[0]
+        assert (await instance.handle_cover_command(**command(text='/翻唱 Song - Artist --auto-reply')))[0]
         job_id = sends[-1][0].split('任务 ')[1].split('：')[0]
         offer = instance._jobs.store.choices(job_id, 'stream-1')
         await instance._jobs.close()
