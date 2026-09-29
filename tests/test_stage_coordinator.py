@@ -227,6 +227,62 @@ async def test_cancel_reopen_reconciles_old_unit_without_new_launch(work):
 
 
 @pytest.mark.asyncio
+async def test_reconcile_only_active_unit_never_claims_or_starts(work):
+    store,run,folder,step=work
+    owner=store.claim_step(run.id,run.run_token,step.name)
+    runner=StubUnitRunner('active')
+    result=await coordinator.StageCoordinator(store,runner).reconcile_step(
+        run.id,run.stream_id,run.run_token,step,folder,'a'*64)
+    assert result=={'unit':owner.unit_name,'state':'running'}
+    assert runner.starts==0
+    assert [(item['unit_name'],item['status']) for item in
+            store.stage_attempts(run.id,run.stream_id)]==[(owner.unit_name,'claimed')]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_only_unknown_unit_retains_claim_without_start(work):
+    store,run,folder,step=work
+    owner=store.claim_step(run.id,run.run_token,step.name)
+    runner=StubUnitRunner('unknown')
+    with pytest.raises(runner_module.UnitError) as error:
+        await coordinator.StageCoordinator(store,runner).reconcile_step(
+            run.id,run.stream_id,run.run_token,step,folder,'a'*64)
+    assert error.value.code=='unit_status_unknown' and runner.starts==0
+    assert store.stage_attempts(run.id,run.stream_id)[0]['status']=='claimed'
+    assert store.get(run.id,run.stream_id).unit_name==owner.unit_name
+
+
+@pytest.mark.asyncio
+async def test_reconcile_only_stopped_unit_settles_verified_receipt(work):
+    store,run,folder,step=work
+    owner=store.claim_step(run.id,run.run_token,step.name)
+    (folder/'output.bin').write_bytes(b'valid stopped output')
+    inp=receipts.sha256(folder/'input.bin')
+    receipts.StageReceipts(folder,'a'*64).seal(
+        step.name,{'input.bin':inp},['output.bin'])
+    runner=StubUnitRunner('stopped')
+    result=await coordinator.StageCoordinator(store,runner).reconcile_step(
+        run.id,run.stream_id,run.run_token,step,folder,'a'*64)
+    assert result['state']=='completed' and result['unit']==owner.unit_name
+    assert runner.starts==0
+    assert store.stage_attempts(run.id,run.stream_id)[0]['status']=='completed'
+
+
+@pytest.mark.asyncio
+async def test_reconcile_only_cancelled_unlaunched_claim_finishes_cancel(work):
+    store,run,folder,step=work
+    owner=store.claim_step(run.id,run.run_token,step.name)
+    store.cancel(run.id,run.stream_id)
+    runner=StubUnitRunner('absent')
+    result=await coordinator.StageCoordinator(store,runner).reconcile_step(
+        run.id,run.stream_id,run.run_token,step,folder,'a'*64)
+    assert result=={'unit':owner.unit_name,'state':'cancelled'}
+    assert runner.starts==0
+    assert store.get(run.id,run.stream_id).error['code']=='cancelled'
+    assert store.stage_attempts(run.id,run.stream_id)[0]['status']=='interrupted'
+
+
+@pytest.mark.asyncio
 async def test_inherited_flock_survives_parent_close(tmp_path):
     ownership=importlib.import_module('coord_test_pkg.services.ownership')
     path=tmp_path/'job.lock'

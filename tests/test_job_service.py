@@ -23,6 +23,7 @@ ledger = importlib.import_module('job_service_test_pkg.services.job_store')
 offers = importlib.import_module('job_service_test_pkg.services.source_offer')
 download_module = importlib.import_module('job_service_test_pkg.services.source_download')
 ownership = importlib.import_module('job_service_test_pkg.services.ownership')
+runner_module = importlib.import_module('job_service_test_pkg.services.unit_runner')
 recipes = importlib.import_module('job_service_test_pkg.runtime.recipe_identity')
 
 
@@ -46,6 +47,21 @@ class FakeCoordinator:
         self.pause_first = pause_first
         self.paused = False
         self.calls = []
+        self.reconciles = []
+
+    async def reconcile_step(self, job_id, stream_id, run_token, step, workspace, recipe):
+        self.reconciles.append(step.name)
+        owner = self.store.get(job_id, stream_id)
+        attempt = next(item for item in self.store.stage_attempts(job_id, stream_id)
+                       if item['unit_name'] == owner.unit_name)
+        assert attempt['status'] == 'claimed' and owner.active_step == step.name
+        settled = self.store.settle_step(job_id, run_token, owner.unit_name, completed=True)
+        if settled.state == 'cancel_requested':
+            result = self.store.finish_failure(job_id, run_token,
+                {'code': 'cancelled', 'message': '用户取消；已有阶段停止。'},
+                expected_unit=settled.unit_name, expected_revision=settled.revision)
+            return {'unit': owner.unit_name, 'state': result.state}
+        return {'unit': owner.unit_name, 'state': 'completed', 'reused': True}
 
     async def run_step(self, job_id, stream_id, run_token, step, workspace, plan, recipe):
         self.calls.append(step.name)
@@ -66,6 +82,18 @@ class StopAfterFirstCoordinator(FakeCoordinator):
             # another stage can be claimed.
             raise asyncio.CancelledError
         return result
+
+
+class ActiveReconcileCoordinator(FakeCoordinator):
+    async def reconcile_step(self, job_id, stream_id, run_token, step, workspace, recipe):
+        self.reconciles.append(step.name)
+        return {'unit': self.store.get(job_id, stream_id).unit_name, 'state': 'running'}
+
+
+class UnknownReconcileCoordinator(FakeCoordinator):
+    async def reconcile_step(self, job_id, stream_id, run_token, step, workspace, recipe):
+        self.reconciles.append(step.name)
+        raise runner_module.UnitError('unit_status_unknown', 'private systemctl detail')
 
 
 class NoopArtifacts:
@@ -201,6 +229,94 @@ async def test_reload_scans_running_job_and_reconciles_same_claimed_unit(tmp_pat
     assert all(item['status'] == 'completed' for item in final_attempts)
     assert [item['step'] for item in final_attempts][0] == 'decode'
     assert [item['step'] for item in final_attempts][-1] == 'validate'
+    assert second_coordinator.reconciles == ['decode']
+
+
+@pytest.mark.asyncio
+async def test_changed_assets_reconcile_active_unit_before_any_rehash(tmp_path):
+    first, store, catalogue, coordinator, downloads = make_service(tmp_path, pause_first=True)
+    queued, _ = await first.submit_selected('stream-active', 'rpc-message-active',
+        {'instrumental': False}, selected('active-before-hash'))
+    assert (await first.run_once()).state == 'running'
+    first.runtime.model.write_bytes(b'changed-while-existing-unit-active')
+
+    reopened = ledger.JobStore(store.path)
+    active = ActiveReconcileCoordinator(reopened)
+    second, _, _, _, resumed_downloads = make_service(
+        tmp_path, store=reopened, catalogue=catalogue, coordinator=active)
+    second.inventory.build = lambda source: (_ for _ in ()).throw(
+        AssertionError('Active existing unit must be reconciled before inventory'))
+    observed = await second.run_once()
+    assert observed.state == 'running'
+    assert active.reconciles == ['decode'] and active.calls == []
+    assert resumed_downloads == []
+    assert reopened.stage_attempts(queued.id, queued.stream_id)[0]['status'] == 'claimed'
+
+
+@pytest.mark.asyncio
+async def test_changed_assets_after_claim_reconcile_then_fail_before_new_stage(tmp_path):
+    first, store, catalogue, coordinator, downloads = make_service(tmp_path, pause_first=True)
+    queued, _ = await first.submit_selected('stream-reconcile', 'rpc-message-reconcile',
+        {'instrumental': False}, selected('reconcile-before-hash'))
+    assert (await first.run_once()).state == 'running'
+    first.runtime.model.write_bytes(b'changed-before-reconcile-completed')
+
+    reopened = ledger.JobStore(store.path)
+    reconciler = FakeCoordinator(reopened)
+    second, _, _, _, resumed_downloads = make_service(
+        tmp_path, store=reopened, catalogue=catalogue, coordinator=reconciler)
+    failed = await second.run_once()
+    assert failed.state == 'failed' and failed.error['code'] == 'asset_inventory_changed'
+    assert reconciler.reconciles == ['decode'] and reconciler.calls == []
+    attempts = reopened.stage_attempts(queued.id, queued.stream_id)
+    assert [(item['step'], item['status']) for item in attempts] == [('decode', 'completed')]
+    assert resumed_downloads == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_claim_is_publicly_recorded_and_loop_backs_off(tmp_path):
+    first, store, catalogue, coordinator, downloads = make_service(tmp_path, pause_first=True)
+    queued, _ = await first.submit_selected('stream-unknown', 'rpc-message-unknown',
+        {'instrumental': False}, selected('unknown-unit'))
+    assert (await first.run_once()).state == 'running'
+
+    reopened = ledger.JobStore(store.path)
+    unknown = UnknownReconcileCoordinator(reopened)
+    second, _, _, _, resumed_downloads = make_service(
+        tmp_path, store=reopened, catalogue=catalogue, coordinator=unknown)
+    second.runtime.model.write_bytes(b'changed-but-must-not-hash-while-unit-unknown')
+    second.inventory.build = lambda source: (_ for _ in ()).throw(
+        AssertionError('Unknown existing unit must retain slot before inventory'))
+    await second.start()
+    await wait_until(lambda: len(unknown.reconciles) == 1)
+    await asyncio.sleep(.15)
+    assert unknown.reconciles == ['decode']  # first retry waits at least one second
+    record = await second.coordinator_error(queued.id, queued.stream_id)
+    global_record = await second.coordinator_error()
+    assert record['code'] == 'unit_status_unknown'
+    assert '无法确认' in record['message'] and 'private systemctl detail' not in str(record)
+    assert global_record['retry_after_s'] >= 1
+    assert reopened.get(queued.id, queued.stream_id).state == 'running'
+    assert reopened.stage_attempts(queued.id, queued.stream_id)[0]['status'] == 'claimed'
+    assert unknown.calls == [] and resumed_downloads == []
+    await second.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_active_claim_reconciles_without_new_stage(tmp_path):
+    first, store, catalogue, coordinator, downloads = make_service(tmp_path, pause_first=True)
+    queued, _ = await first.submit_selected('stream-cancel-active', 'rpc-message-cancel-active',
+        {'instrumental': False}, selected('cancel-active'))
+    assert (await first.run_once()).state == 'running'
+    store.cancel(queued.id, queued.stream_id)
+    reopened = ledger.JobStore(store.path)
+    active = ActiveReconcileCoordinator(reopened)
+    second, _, _, _, _ = make_service(
+        tmp_path, store=reopened, catalogue=catalogue, coordinator=active)
+    observed = await second.run_once()
+    assert observed.state == 'cancel_requested'
+    assert active.reconciles == ['decode'] and active.calls == []
+    assert reopened.stage_attempts(queued.id, queued.stream_id)[0]['status'] == 'claimed'
 
 
 @pytest.mark.asyncio
@@ -269,6 +385,26 @@ async def test_cancelled_owned_job_never_resolves_or_launches_a_stage(tmp_path):
     finished = await instance.run_once()
     assert finished.state == 'cancelled' and finished.error['code'] == 'cancelled'
     assert downloads == [] and catalogue.resolved == [] and coordinator.calls == []
+
+
+@pytest.mark.asyncio
+async def test_production_downloader_receives_lease_preserving_offload(tmp_path, monkeypatch):
+    instance, store, catalogue, coordinator, downloads = make_service(tmp_path)
+    observed=[]
+
+    async def production_spy(gateway, chosen, workspace, *, max_bytes, offload=None, **kwargs):
+        observed.append(offload)
+        assert offload == instance._offload
+        path=workspace/'source.audio'
+        await offload(path.write_bytes,b'S'*4096)
+        return path,'ignored',4096
+
+    instance.downloader=production_spy
+    monkeypatch.setattr(service_module,'download_selected',production_spy)
+    await instance.submit_selected('stream-offload','rpc-message-offload',
+                                   {'instrumental':False},selected('offloaded-source'))
+    assert (await instance.run_once()).state=='ready'
+    assert observed==[instance._offload]
 
 
 @pytest.mark.asyncio

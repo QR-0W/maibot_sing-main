@@ -62,7 +62,8 @@ class StageCoordinator:
             valid=await self._verified(workspace,recipe,step)
         except (CheckpointError,OSError):
             valid=False
-        error=None if valid else self._failure(workspace,owner,recipe,step,fallback_code)
+        error=None if valid else await asyncio.to_thread(
+            self._failure,workspace,owner,recipe,step,fallback_code)
         settled=await asyncio.to_thread(self.store.settle_step,owner.id,owner.run_token,
                                         owner.unit_name,completed=valid)
         if settled.state=='cancel_requested':
@@ -73,6 +74,54 @@ class StageCoordinator:
                 interrupted=error['code'] in INTERRUPTED_CODES)
             raise UnitError(error['code'],error['message'])
         return {'unit':owner.unit_name,'state':'completed','reused':True}
+
+    async def reconcile_step(self, job_id: str, stream_id: str, run_token: str,
+                             step, workspace: Path, recipe: str) -> Dict:
+        """Observe and settle the existing durable unit; never claim or launch.
+
+        This path is used before cancellation or changed assets can authorize any
+        new work. Acquiring the per-job flock proves no launch helper still owns
+        an absent unit; active, busy, and unknown observations retain the slot.
+        """
+        await asyncio.to_thread(self.store.get,job_id,stream_id)
+        try:
+            with exclusive(self.lock_path(job_id)):
+                owner=await asyncio.to_thread(self.store.get,job_id,stream_id)
+                if owner.run_token!=run_token or owner.state not in ('running','cancel_requested'):
+                    raise JobConflict('Caller no longer owns this job')
+                if owner.unit_name is None or owner.active_step!=step.name:
+                    raise JobConflict('No matching durable stage exists to reconcile')
+                attempts=await asyncio.to_thread(self.store.stage_attempts,job_id,stream_id)
+                current=next((item for item in attempts
+                              if item['unit_name']==owner.unit_name),None)
+                if current is None:
+                    raise JobConflict('Stage has no durable unit ownership record')
+                state=await self.runner.state(owner.unit_name)
+                if state=='active':
+                    return {'unit':owner.unit_name,'state':'running'}
+                if state not in ('absent','stopped'):
+                    raise UnitError('unit_status_unknown',
+                                    'Cannot prove current unit inactivity')
+                if current['status']!='claimed':
+                    if owner.state=='cancel_requested':
+                        return await self._cancelled(owner)
+                    if current['status']=='completed':
+                        if not await self._verified(workspace,recipe,step):
+                            raise UnitError('receipt_invalid',
+                                            'Previously completed artifact changed')
+                        return {'unit':owner.unit_name,'state':'completed','reused':True}
+                    raise JobConflict('Interrupted stage requires an explicit retry decision')
+                log=workspace/'unit-logs'/(owner.unit_name+'.log')
+                StageReceipts._safe(log)
+                if log.exists() and state!='stopped' and not UnitRunner.launch_finished(
+                        workspace,owner.unit_name):
+                    raise UnitError('launch_unknown',
+                                    'Launch has no durable completion witness; slot retained')
+                # stopped is proof of inactivity. absent plus our acquired flock
+                # proves neither a unit nor launch helper can still begin work.
+                return await self._settle(owner,workspace,recipe,step)
+        except OwnershipBusy:
+            return {'state':'owned','unit':None}
 
     async def run_step(self, job_id: str, stream_id: str, run_token: str,
                        step, workspace: Path, plan: Path, recipe: str) -> Dict:

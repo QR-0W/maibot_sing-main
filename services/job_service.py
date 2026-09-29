@@ -13,10 +13,13 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 import asyncio
 import json
+import logging
+import math
 import os
 import re
 import sqlite3
 import stat
+import time
 import uuid
 
 from ..runtime.recipe_identity import fingerprint, recipe_document, validate_document
@@ -30,6 +33,16 @@ from .source_download import DownloadError, download_selected
 from .source_offer import CatalogueItem
 from .stage_coordinator import StageCoordinator
 from .unit_runner import UnitError, save_plan
+
+
+LOGGER = logging.getLogger(__name__)
+_COORDINATOR_MESSAGES = {
+    'unit_status_unknown': '无法确认当前计算单元是否已停止；任务槽位保留，未启动新阶段。',
+    'launch_unknown': '无法确认当前阶段是否已完成启动或退出；任务槽位保留，未启动新阶段。',
+    'scheduler_ownership_lost': '后台调度所有权不可用；任务槽位保留，未启动新阶段。',
+    'job_scan_failed': '后台任务扫描暂时失败；未启动新阶段。',
+    'job_ownership_conflict': '后台任务所有权冲突；未启动新阶段。',
+}
 
 
 class JobServiceError(RuntimeError):
@@ -126,6 +139,57 @@ def _atomic_json(path: Path, document: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _replace_status(path: Path, document: dict) -> None:
+    raw = json.dumps(document, ensure_ascii=False, sort_keys=True,
+                     separators=(',', ':'), allow_nan=False).encode('utf-8')
+    if len(raw) > 4096:
+        raise JobServiceError('coordinator_status_oversized',
+                              'Coordinator status exceeds 4KiB')
+    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.part')
+    try:
+        with temporary.open('xb') as output:
+            os.chmod(temporary, 0o600)
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary,path)
+        directory=os.open(path.parent,os.O_DIRECTORY|os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_status(path: Path):
+    try:
+        if not path.exists():
+            return None
+        if path.is_symlink() or not path.is_file() or path.stat().st_size>4096:
+            raise ValueError('unsafe status path')
+        value=json.loads(path.read_text(encoding='utf-8'))
+        if (not isinstance(value,dict)
+                or set(value)!={'schema','code','message','retry_after_s','updated_at'}
+                or value.get('schema')!=1
+                or not isinstance(value.get('code'),str)
+                or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',value['code'])
+                or not isinstance(value.get('message'),str)
+                or not 1<=len(value['message'])<=300
+                or isinstance(value.get('retry_after_s'),bool)
+                or not isinstance(value.get('retry_after_s'),(int,float))
+                or not math.isfinite(value['retry_after_s'])
+                or not .05<=value['retry_after_s']<=60
+                or isinstance(value.get('updated_at'),bool)
+                or not isinstance(value.get('updated_at'),(int,float))
+                or not math.isfinite(value['updated_at'])):
+            raise ValueError('invalid status document')
+        return value
+    except (OSError,ValueError,TypeError,json.JSONDecodeError) as exc:
+        raise JobServiceError('coordinator_status_invalid',
+                              'Coordinator status is invalid') from exc
+
+
 class JobService:
     """One lightweight scheduler for durable selected-source jobs.
 
@@ -175,8 +239,10 @@ class JobService:
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='sing-job-io')
         self._offloads: set[asyncio.Future] = set()
         self._late_offload_errors: list[BaseException] = []
+        self._coordinator_failures: list[BaseException] = []
         self._wake = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        self._loop_failures = 0
         self._closing = False
         self._closed = False
 
@@ -298,6 +364,41 @@ class JobService:
         self._wake.set()
         return result
 
+    @staticmethod
+    def _coordinator_document(exc: Exception, retry_after_s: float) -> dict:
+        code=str(getattr(exc,'code','coordinator_error'))
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',code):
+            code='coordinator_error'
+        message=_COORDINATOR_MESSAGES.get(
+            code,'后台任务协调暂时失败；任务槽位保留，未启动新阶段。')
+        return {'schema':1,'code':code,'message':message,
+                'retry_after_s':round(min(60,max(.05,retry_after_s)),3),
+                'updated_at':round(time.time(),3)}
+
+    async def _record_coordinator_error(self, exc: Exception, *, job: Optional[Job],
+                                        retry_after_s: float) -> None:
+        document=self._coordinator_document(exc,retry_after_s)
+        path=(self._workspace(job) if job is not None else self.runtime.work_root)/'coordinator-error.json'
+        await self._offload(_replace_status,path,document)
+        LOGGER.error('%s code=%s job=%s',document['message'],document['code'],
+                     job.id if job is not None else 'scheduler')
+
+    async def _clear_coordinator_error(self, job: Optional[Job]) -> None:
+        path=(self._workspace(job) if job is not None else self.runtime.work_root)/'coordinator-error.json'
+        await self._offload(path.unlink,missing_ok=True)
+
+    async def coordinator_error(self, job_id: Optional[str] = None,
+                                stream_id: Optional[str] = None):
+        """Return a bounded public-safe nonterminal coordinator status."""
+        if (job_id is None)!=(stream_id is None):
+            raise ValueError('Job and stream identities must be supplied together')
+        if job_id is None:
+            path=self.runtime.work_root/'coordinator-error.json'
+        else:
+            job=await self._offload(self.store.get,job_id,stream_id)
+            path=self._workspace(job)/'coordinator-error.json'
+        return await self._offload(_read_status,path)
+
     async def run_once(self) -> Optional[Job]:
         """Reconcile one owned run, or atomically claim and run one queued job."""
         active = await self._offload(self.scanner, self.store,
@@ -312,7 +413,11 @@ class JobService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await self._preserve_failure(job, exc)
+            if not await self._preserve_failure(job, exc):
+                raise
+            await self._clear_coordinator_error(job)
+        else:
+            await self._clear_coordinator_error(job)
         return await self._offload(self.store.get, job.id, job.stream_id)
 
     async def _loop(self) -> None:
@@ -321,12 +426,33 @@ class JobService:
                 result = await self.run_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                result = None
+            except Exception as exc:
+                self._loop_failures=min(7,self._loop_failures+1)
+                timeout=min(60,max(self.runtime.poll_interval_s,
+                                   float(2**(self._loop_failures-1))))
+                self._coordinator_failures.append(exc)
+                del self._coordinator_failures[:-16]
+                try:
+                    await self._record_coordinator_error(
+                        exc,job=None,retry_after_s=timeout)
+                except Exception as status_exc:
+                    self._coordinator_failures.append(status_exc)
+                    del self._coordinator_failures[:-16]
+                    LOGGER.error('无法写入后台协调器受限错误状态；将在有限退避后重试。')
+                result=None
+            else:
+                self._loop_failures=0
+                timeout=(self.runtime.poll_interval_s if result is not None else
+                         min(60,self.runtime.poll_interval_s*5))
+                try:
+                    await self._clear_coordinator_error(None)
+                except Exception as clear_exc:
+                    self._coordinator_failures.append(clear_exc)
+                    del self._coordinator_failures[:-16]
+                    LOGGER.error('无法清理后台协调器受限错误状态。')
             self._wake.clear()
-            timeout = self.runtime.poll_interval_s if result is not None else min(60, self.runtime.poll_interval_s * 5)
             try:
-                await asyncio.wait_for(self._wake.wait(), timeout)
+                await asyncio.wait_for(self._wake.wait(),timeout)
             except asyncio.TimeoutError:
                 pass
 
@@ -389,8 +515,11 @@ class JobService:
             raise JobServiceError('cancelled', 'Job cancelled before source resolution')
         if not source.exists():
             current = await self._progress(current, 'downloading', 0, 0)
-            result = await self.downloader(self.catalogue, selected, workspace,
-                                           max_bytes=self.runtime.max_download_bytes)
+            download_options={'max_bytes':self.runtime.max_download_bytes}
+            if self.downloader is download_selected:
+                download_options['offload']=self._offload
+            result = await self.downloader(self.catalogue,selected,workspace,
+                                           **download_options)
             downloaded = Path(result[0])
             if downloaded != source or not downloaded.is_file() or downloaded.is_symlink():
                 raise JobServiceError('source_download_contract', 'Downloader returned an unexpected source path')
@@ -520,6 +649,24 @@ class JobService:
         attempts = await self._offload(self.store.stage_attempts, job.id, job.stream_id)
         start = self._attempt_prefix(steps, attempts)
         total = len(steps)
+        # Existing durable ownership is reconciled before hashing changed assets
+        # or considering another claim. This path can neither claim nor launch.
+        if attempts and attempts[-1]['status']=='claimed':
+            current=await self._offload(self.store.get,job.id,job.stream_id)
+            step=steps[start]
+            result=await self.coordinator.reconcile_step(
+                current.id,current.stream_id,current.run_token,
+                step,workspace,recipe_key)
+            if result.get('state') in ('running','owned'):
+                return
+            if result.get('state')=='cancelled':
+                return
+            if result.get('state')!='completed':
+                raise JobServiceError('stage_result_invalid',
+                                      'Stage reconciler returned an invalid state')
+            attempts=await self._offload(self.store.stage_attempts,job.id,job.stream_id)
+            start=self._attempt_prefix(steps,attempts)
+            await self._progress(current,self._stage_progress(step),start,total)
         # A completed plan can be published from its immutable bytes and receipts
         # even if an administrator later updates the configured model.  Any job
         # with an uncompleted stage must instead prove that source, weights, code,
@@ -567,19 +714,22 @@ class JobService:
         message = str(message).strip()[:1500] or 'Background media job failed'
         return {'code': code, 'message': message}
 
-    async def _preserve_failure(self, original: Job, exc: Exception) -> None:
+    async def _preserve_failure(self, original: Job, exc: Exception) -> bool:
         current = await self._offload(self.store.get, original.id, original.stream_id)
         if current.state in self._TERMINAL:
-            return
+            return True
         if current.state not in ('running', 'cancel_requested'):
-            return
+            return True
         attempts = await self._offload(self.store.stage_attempts, current.id, current.stream_id)
-        # An active/unknown unit still owns the slot.  StageCoordinator will
-        # reconcile it on the next scan; never convert uncertainty into failure.
+        # A claimed unit may still be active or unknown. Retain its slot, expose a
+        # bounded public-safe coordinator fault, and make the loop back off.
         if any(item['status'] == 'claimed' for item in attempts):
-            return
+            await self._record_coordinator_error(
+                exc,job=current,retry_after_s=max(1,self.runtime.poll_interval_s))
+            return False
         error = self._error(exc)
         await self._offload(self.store.finish_failure, current.id, current.run_token, error,
             expected_unit=current.unit_name, expected_revision=current.revision,
             interrupted=error['code'] in ('stage_timeout', 'unit_timeout', 'unit_signal',
                                           'stage_terminated', 'launch_unknown', 'unit_wait_unknown'))
+        return True
