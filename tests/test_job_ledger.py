@@ -180,6 +180,21 @@ def test_crash_during_send_becomes_unknown_never_automatically_resent(store):
     assert reopened.claim_delivery(job.id,job.stream_id) is None
 
 
+def test_delivery_ledger_requires_positive_platform_ack_and_consistent_message_id(store):
+    job=ready(store)
+    claimed=store.claim_delivery(job.id,job.stream_id)
+    assert claimed is not None
+    for outcome, message_id in (('sent',None),('sent',''),('sent','   '),
+                                ('failed','platform-123'),('unknown','platform-123')):
+        with pytest.raises(ValueError):
+            store.delivery_result(job.id,claimed.delivery_token,outcome,message_id=message_id)
+        assert store.get(job.id,job.stream_id).delivery_state=='dispatching'
+    unknown=store.delivery_result(job.id,claimed.delivery_token,'unknown')
+    assert unknown.delivery_state=='unknown' and unknown.message_id is None
+    sent=store.delivery_result(job.id,claimed.delivery_token,'sent',message_id='platform-123')
+    assert sent.delivery_state=='sent' and sent.message_id=='platform-123'
+
+
 def test_two_coordinators_cannot_send_twice(store):
     job=ready(store)
     other=JobStore(store.path)

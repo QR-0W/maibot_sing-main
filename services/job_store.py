@@ -403,8 +403,12 @@ class JobStore:
         """Only a positive acknowledgement proves sent. Ambiguous failures remain unknown."""
         if outcome not in ('sent','failed','unknown'):
             raise ValueError('Invalid delivery outcome')
-        if message_id is not None:
+        if outcome == 'sent':
+            if not isinstance(message_id,str) or not message_id.strip():
+                raise ValueError('Positive delivery requires a platform message id')
             _text(message_id,'platform message id')
+        elif message_id is not None:
+            raise ValueError('Unconfirmed delivery must not carry a platform message id')
         with self._transaction() as db:
             row = db.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
             if row is None or row['delivery_token'] != delivery_token or row['delivery_state'] not in ('dispatching','unknown'):
