@@ -362,7 +362,7 @@ class JobService:
     async def _prepare(self, job: Job, workspace: Path, selected: CatalogueItem):
         frozen = await asyncio.to_thread(self._read_frozen, workspace, selected)
         if frozen is not None:
-            return frozen
+            return (*frozen, True)
         source, report = await self._source(job, workspace, selected)
         inventory = await asyncio.to_thread(self.inventory.build, source)
         duration = report.get('duration_s')
@@ -388,7 +388,22 @@ class JobService:
         await asyncio.to_thread(save_plan, plan_path, workspace=workspace,
                                 recipe=fingerprint(recipe),
                                 inference_lock=self.runtime.inference_lock, steps=steps)
-        return recipe, tuple(steps), plan_path
+        return recipe, tuple(steps), plan_path, False
+
+    async def _verify_resume_inventory(self, workspace: Path, recipe: dict) -> None:
+        """Fail closed if a frozen job would launch with different real assets."""
+        source = workspace / 'source.audio'
+        current = await asyncio.to_thread(self.inventory.build, source)
+        changed_hashes = sorted(name for name, digest in recipe['hashes'].items()
+                                if current.hashes.get(name) != digest)
+        changed_versions = sorted(name for name, version in recipe['versions'].items()
+                                  if current.versions.get(name) != version)
+        if changed_hashes or changed_versions:
+            # Names are recipe schema labels, never private paths or credentials.
+            labels = ','.join(changed_hashes + changed_versions)
+            raise JobServiceError('asset_inventory_changed',
+                'Frozen render inventory changed before resume (' + labels + '); '
+                'no new media stage was launched.')
 
     @staticmethod
     def _stage_progress(step: Step) -> str:
@@ -423,11 +438,17 @@ class JobService:
         await asyncio.to_thread(self._ensure_workspace, workspace)
         if await self._cancel_without_unit(job):
             return
-        recipe, steps, plan_path = await self._prepare(job, workspace, selected)
+        recipe, steps, plan_path, frozen = await self._prepare(job, workspace, selected)
         recipe_key = fingerprint(recipe)
         attempts = await asyncio.to_thread(self.store.stage_attempts, job.id, job.stream_id)
         start = self._attempt_prefix(steps, attempts)
         total = len(steps)
+        # A completed plan can be published from its immutable bytes and receipts
+        # even if an administrator later updates the configured model.  Any job
+        # with an uncompleted stage must instead prove that source, weights, code,
+        # and runtime versions still match the recipe before coordinator launch.
+        if frozen and start < total:
+            await self._verify_resume_inventory(workspace, recipe)
         for position in range(start, total):
             current = await asyncio.to_thread(self.store.get, job.id, job.stream_id)
             if current.state == 'cancel_requested' and not any(
