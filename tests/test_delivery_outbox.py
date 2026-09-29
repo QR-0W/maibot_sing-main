@@ -27,7 +27,9 @@ DeliveryOutbox = delivery.DeliveryOutbox
 
 @pytest.fixture
 def store(tmp_path):
-    return JobStore(tmp_path / 'jobs.sqlite3', max_pending=3)
+    result = JobStore(tmp_path / 'jobs.sqlite3', max_pending=3)
+    result.bind_artifact_root(str(tmp_path))
+    return result
 
 
 def ready(store, *, token='message-1', stream='stream-a', consent=True):

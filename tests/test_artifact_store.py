@@ -52,6 +52,7 @@ def publish(prepared):
 def job_ready_to_publish(prepared):
     artifacts_store,work,recipe,key,plan=prepared
     store=ledger.JobStore(work.parent/'jobs.sqlite3')
+    store.bind_artifact_root(str(artifacts_store.root))
     job,_=store.submit('verified-test-stream','fixed-test-message',{'query':'synthetic'},
                        auto_reply=True,consent_event='fixed-test-message')
     offer=store.offer(job.id,job.stream_id,[source.CatalogueItem('163','synthetic','Synthetic','Test','Fixture')],
