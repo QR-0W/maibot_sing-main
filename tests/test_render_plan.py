@@ -8,7 +8,7 @@ m=importlib.util.module_from_spec(spec);sys.modules[spec.name]=m;spec.loader.exe
 
 
 def plan(seconds):
-    return m.build_plan('/workspace','/python','/runtime/media_stage.py','/rvc.py','/model.pth','/index',int(seconds*44100))
+    return m.build_plan('/workspace','/python','/runtime/media_stage.py','/rvc.py','/model.pth','/index','/hubert.pt',int(seconds*44100))
 
 
 @pytest.mark.parametrize('seconds,count',[(30,2),(40,2),(41,2),(44.9,2),(45,3),(237.923,12),(300,15)])
@@ -18,6 +18,7 @@ def test_finite_chunk_plan(seconds,count):
     assert len(conversion)==count
     assert all(s.unit_limit_s<900 for s in steps)
     assert all(s.argv[s.argv.index('--pitch')+1]=='0' for s in conversion)
+    assert all(s.argv[s.argv.index('--hubert')+1]=='/hubert.pt' for s in conversion)
     assert steps[-1].name=='validate'
     assert m.total_compute_budget(steps)==sum(s.timeout_s+30 for s in steps)
     produced=set(['source.audio'])
