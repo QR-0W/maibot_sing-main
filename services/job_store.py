@@ -120,6 +120,10 @@ class JobStore:
                     seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
                     event TEXT NOT NULL, revision INTEGER NOT NULL, created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS store_settings (
+                    namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+                    PRIMARY KEY(namespace,key)
+                );
             ''')
 
     @contextmanager
@@ -194,6 +198,139 @@ class JobStore:
                        (job_id,stream_id,request_token,document,digest,'pending' if auto_reply else 'not_requested',consent_event,now,now))
             db.execute('INSERT INTO events(job_id,event,revision,created_at) VALUES(?,?,0,?)',(job_id,'submitted',now))
             return self._job(db.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()), True
+
+    def admit_offer(self, stream_id: str, request_token: str, request: Dict[str, Any],
+                    candidates: list, *, auto_reply: bool = False,
+                    consent_event: Optional[str] = None, select_single: bool = True,
+                    ttl_s: int = 600) -> Tuple[Job, bool]:
+        """Atomically admit one immutable search result snapshot.
+
+        The transaction never exposes a half-created ``searching`` row. Replaying
+        the same trusted request returns its original job without extending the
+        offer or replacing its candidates/selection.
+        """
+        _text(stream_id,'stream'); _text(request_token,'request token')
+        if type(auto_reply) is not bool or type(select_single) is not bool:
+            raise ValueError('auto_reply and select_single must be bool')
+        if auto_reply:
+            _text(consent_event,'explicit auto-reply consent')
+        elif consent_event is not None:
+            raise ValueError('Consent event supplied without auto_reply')
+        if type(ttl_s) is not int or not 30 <= ttl_s <= 1800:
+            raise ValueError('Invalid offer expiry')
+        document = _json(request)
+        digest = hashlib.sha256(document.encode()).hexdigest()
+        with self._transaction() as db:
+            row = db.execute('SELECT * FROM jobs WHERE stream_id=? AND request_token=?',
+                             (stream_id,request_token)).fetchone()
+            if row:
+                if row['request_hash'] != digest or row['consent_event'] != consent_event:
+                    raise JobConflict('Same request token has different contents or consent')
+                return self._job(row), False
+            count = db.execute("SELECT count(*) FROM jobs WHERE state IN ('searching','queued','running','cancel_requested','needs_selection')").fetchone()[0]
+            if count >= self.max_pending:
+                raise JobConflict('Job queue is full')
+            from .source_offer import snapshot
+            items = snapshot(candidates)
+            candidate_document = _json({'items':items})
+            selected = None
+            if select_single and len(items) == 1 and items[0]['availability'] not in (
+                    'requires_login','unavailable','over_limit'):
+                selected = items[0]
+            job_id, offer_id, now = uuid.uuid4().hex, uuid.uuid4().hex, time.time()
+            state = 'queued' if selected is not None else 'needs_selection'
+            stage = 'queued' if selected is not None else 'awaiting_selection'
+            revision = 2 if selected is not None else 1
+            db.execute('''INSERT INTO jobs(
+                  id,stream_id,request_token,request_json,request_hash,
+                  selected_source_json,offer_id,selected_row,state,stage,revision,
+                  delivery_state,consent_event,created_at,updated_at)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                       (job_id,stream_id,request_token,document,digest,
+                        _json(selected) if selected is not None else None,
+                        offer_id,1 if selected is not None else None,state,stage,revision,
+                        'pending' if auto_reply else 'not_requested',consent_event,now,now))
+            db.execute('INSERT INTO offers(id,job_id,candidates_json,expires_at) VALUES(?,?,?,?)',
+                       (offer_id,job_id,candidate_document,now+ttl_s))
+            db.execute('INSERT INTO events(job_id,event,revision,created_at) VALUES(?,?,0,?)',
+                       (job_id,'submitted',now))
+            db.execute('INSERT INTO events(job_id,event,revision,created_at) VALUES(?,?,1,?)',
+                       (job_id,'offer_created',now))
+            if selected is not None:
+                db.execute('INSERT INTO events(job_id,event,revision,created_at) VALUES(?,?,2,?)',
+                           (job_id,'source_selected',now))
+            row = db.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
+            return self._job(row), True
+
+    def find_request(self, stream_id: str, request_token: str) -> Optional[Job]:
+        """Return the job owned by one trusted request identity, if any."""
+        _text(stream_id,'stream'); _text(request_token,'request token')
+        with self._connect() as db:
+            row = db.execute('SELECT * FROM jobs WHERE stream_id=? AND request_token=?',
+                             (stream_id,request_token)).fetchone()
+            return self._job(row) if row is not None else None
+
+    def expire_candidates(self, now: Optional[float] = None) -> int:
+        """Boundedly retire expired offers and legacy half-submitted searches."""
+        if now is None:
+            now = time.time()
+        if isinstance(now,bool) or not isinstance(now,(int,float)) or not 0 <= now < float('inf'):
+            raise ValueError('Invalid expiry time')
+        now = float(now)
+        with self._transaction() as db:
+            rows = db.execute('''SELECT j.* FROM jobs AS j
+                WHERE (j.state='needs_selection' AND EXISTS(
+                    SELECT 1 FROM offers AS o
+                    WHERE o.id=j.offer_id AND o.job_id=j.id AND o.expires_at<=?))
+                   OR (j.state='searching' AND j.updated_at<=?)
+                ORDER BY j.updated_at,j.id LIMIT 100''',(now,now-600)).fetchall()
+            for row in rows:
+                if row['state'] == 'needs_selection':
+                    error = {'code':'candidate_expired',
+                             'message':'候选已过期；未启动媒体任务，请重新发起请求。'}
+                    event = 'candidate_expired'
+                else:
+                    error = {'code':'search_abandoned',
+                             'message':'旧搜索未完整提交；已安全终结，请重新发起请求。'}
+                    event = 'search_abandoned'
+                delivery = ('cancelled' if row['delivery_state'] in
+                            ('not_requested','pending') else row['delivery_state'])
+                self._change(db,row,event,state='cancelled',stage='expired',
+                             delivery_state=delivery,error_json=_json(error))
+            return len(rows)
+
+    @staticmethod
+    def _artifact_root_value(absroot: Any) -> str:
+        try:
+            raw = os.fspath(absroot)
+        except TypeError as exc:
+            raise ValueError('Artifact root must be a path') from exc
+        if not isinstance(raw,str) or not raw or any(ord(ch) < 32 for ch in raw):
+            raise ValueError('Invalid artifact root')
+        normalized = os.path.normpath(raw)
+        if not os.path.isabs(raw) or normalized != raw:
+            raise ValueError('Artifact root must be a normalized absolute path')
+        return normalized
+
+    def bind_artifact_root(self, absroot: Any) -> str:
+        """Persist one immutable artifact namespace without touching the filesystem.
+
+        A pre-settings ledger containing any jobs is deliberately not guessed: an
+        operator must perform an explicit, separately audited legacy migration.
+        """
+        root = self._artifact_root_value(absroot)
+        with self._transaction() as db:
+            row = db.execute('''SELECT value FROM store_settings
+                WHERE namespace='artifact_store.v1' AND key='root' ''').fetchone()
+            if row is not None:
+                if row['value'] != root:
+                    raise JobConflict('Artifact root is already bound; migration is required')
+                return row['value']
+            if db.execute('SELECT 1 FROM jobs LIMIT 1').fetchone() is not None:
+                raise JobConflict('Legacy ledger has jobs but no artifact root binding; explicit migration is required')
+            db.execute('INSERT INTO store_settings(namespace,key,value) VALUES(?,?,?)',
+                       ('artifact_store.v1','root',root))
+            return root
 
     def get(self, job_id: str, stream_id: str) -> Job:
         with self._connect() as db:
@@ -395,6 +532,9 @@ class JobStore:
             row = self._owned(db,job_id,stream_id)
             if row['state'] != 'ready' or row['delivery_state'] != 'pending':
                 return None
+            if not db.execute('''SELECT 1 FROM store_settings
+                    WHERE namespace='artifact_store.v1' AND key='root' ''').fetchone():
+                raise JobConflict('Artifact root is not bound; delivery claim refused')
             if not row['consent_event']:
                 raise JobConflict('No persisted authorization to auto-reply')
             return self._change(db,row,'delivery_claimed',delivery_state='dispatching',delivery_token=uuid.uuid4().hex)

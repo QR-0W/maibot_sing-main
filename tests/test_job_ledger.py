@@ -20,7 +20,9 @@ Item = choices.CatalogueItem
 
 @pytest.fixture
 def store(tmp_path):
-    return JobStore(tmp_path/'jobs.sqlite3', max_pending=3)
+    result = JobStore(tmp_path/'jobs.sqlite3', max_pending=3)
+    assert result.bind_artifact_root(tmp_path/'covers') == str(tmp_path/'covers')
+    return result
 
 
 def catalogue():
@@ -67,6 +69,107 @@ def test_consent_required_and_never_implicitly_added(store):
     job = ready(store,consent=False)
     assert job.state=='ready' and job.delivery_state=='not_requested'
     assert store.claim_delivery(job.id,job.stream_id) is None
+
+
+def test_atomic_admission_commits_offer_and_optional_single_selection(store):
+    request={'query':'radiohead creep','asset_generation':'generation-a'}
+    single, created = store.admit_offer('a','single',request,catalogue()[:1])
+    assert created and single.state=='queued' and single.stage=='queued'
+    assert single.selected_row==1 and single.selected_source['track_id']=='first'
+    assert store.find_request('a','single')==single
+    assert [entry['revision'] for entry in store.history(single.id,'a')]==[0,1,2]
+
+    manual, created = store.admit_offer('a','manual',request,catalogue(),select_single=True)
+    assert created and manual.state=='needs_selection' and manual.selected_source is None
+    assert store.choices(manual.id,'a')['offer_id']==manual.offer_id
+    assert [entry['revision'] for entry in store.history(manual.id,'a')]==[0,1]
+    assert store.claim_next().id==single.id
+
+
+def test_atomic_admission_replay_never_changes_offer_expiry_or_selection(store,monkeypatch):
+    now=[1000.]
+    monkeypatch.setattr(ledger.time,'time',lambda:now[0])
+    original, created = store.admit_offer('a','request',{'query':'creep'},catalogue(),ttl_s=30)
+    snapshot=store.choices(original.id,'a')
+    now[0]=1010.
+    replay, created = store.admit_offer('a','request',{'query':'creep'},
+        list(reversed(catalogue())),select_single=False,ttl_s=1800)
+    assert not created and replay==original
+    assert store.choices(original.id,'a')==snapshot
+    with pytest.raises(JobConflict,match='different contents or consent'):
+        store.admit_offer('a','request',{'query':'other'},catalogue())
+    with pytest.raises(JobConflict,match='different contents or consent'):
+        store.admit_offer('a','request',{'query':'creep'},catalogue(),
+                          auto_reply=True,consent_event='request')
+
+
+def test_atomic_admission_is_concurrent_and_capacity_safe(store):
+    other=JobStore(store.path,max_pending=3)
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        admitted=list(threads.map(
+            lambda current: current.admit_offer('a','same',{'query':'creep'},catalogue()),
+            (store,other)))
+    assert len({job.id for job, _ in admitted})==1
+    assert sorted(created for _, created in admitted)==[False,True]
+    store.admit_offer('a','two',{'query':'two'},catalogue())
+    store.admit_offer('a','three',{'query':'three'},catalogue())
+    with pytest.raises(JobConflict,match='full'):
+        store.admit_offer('a','extra',{'query':'extra'},catalogue())
+    assert store.find_request('a','extra') is None
+
+
+def test_atomic_single_unavailable_is_not_silently_queued(store):
+    item=Item('163','locked','Creep','Radiohead','Album',238,
+              availability='requires_login')
+    job, created=store.admit_offer('a','locked',{},[item])
+    assert created and job.state=='needs_selection' and job.selected_source is None
+    with pytest.raises(JobConflict,match='requires_login'):
+        store.select(job.id,'a',job.offer_id,1)
+
+
+def test_expiry_retires_candidates_and_legacy_searches_without_touching_queued(store,monkeypatch):
+    now=[1000.]
+    monkeypatch.setattr(ledger.time,'time',lambda:now[0])
+    offered,_=store.admit_offer('a','offer',{},catalogue(),auto_reply=True,
+                               consent_event='offer',ttl_s=30)
+    legacy,_=store.submit('a','legacy',{},auto_reply=True,consent_event='legacy')
+    queued_job,_=store.admit_offer('a','queued',{},catalogue()[:1])
+    now[0]=1601.
+    assert store.expire_candidates(now=now[0])==2
+    expired_offer=store.get(offered.id,'a')
+    expired_search=store.get(legacy.id,'a')
+    assert (expired_offer.state,expired_offer.stage,expired_offer.delivery_state,
+            expired_offer.error['code'])==('cancelled','expired','cancelled','candidate_expired')
+    assert (expired_search.state,expired_search.stage,expired_search.delivery_state,
+            expired_search.error['code'])==('cancelled','expired','cancelled','search_abandoned')
+    assert store.get(queued_job.id,'a').state=='queued'
+    assert store.choices(offered.id,'a')['offer_id']==offered.offer_id
+    assert store.expire_candidates(now=now[0])==0
+
+
+def test_artifact_root_binding_is_immutable_and_legacy_unbound_is_fail_closed(tmp_path):
+    empty=JobStore(tmp_path/'empty.sqlite3')
+    root=tmp_path/'covers-v2'
+    assert empty.bind_artifact_root(root)==str(root)
+    assert JobStore(empty.path).bind_artifact_root(root)==str(root)
+    with pytest.raises(JobConflict,match='already bound'):
+        empty.bind_artifact_root(tmp_path/'another-root')
+    with pytest.raises(ValueError,match='normalized absolute'):
+        empty.bind_artifact_root(str(tmp_path/'x'/'..'/'covers-v2'))
+
+    legacy=JobStore(tmp_path/'legacy.sqlite3')
+    pending=ready(legacy)
+    with pytest.raises(JobConflict,match='Legacy ledger'):
+        legacy.bind_artifact_root(tmp_path/'legacy-covers')
+    with pytest.raises(JobConflict,match='not bound'):
+        legacy.claim_delivery(pending.id,pending.stream_id)
+    assert legacy.get(pending.id,pending.stream_id).delivery_state=='pending'
+
+
+def test_find_request_is_stream_scoped(store):
+    job,_=store.admit_offer('a','request',{},catalogue())
+    assert store.find_request('a','request')==job
+    assert store.find_request('b','request') is None
 
 
 def test_default_first_and_command_choose_share_snapshot(store):
