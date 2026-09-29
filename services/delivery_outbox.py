@@ -40,7 +40,9 @@ class DeliveryReceipt:
 def classify_ack(result: Any) -> DeliveryReceipt:
     """Normalize the SDK detailed-send contract without optimistic guessing."""
     if result is False:
-        return DeliveryReceipt('failed')
+        return DeliveryReceipt('unknown')
+    # The Host can turn a post-platform hook/store exception into sent=False.
+    # Neither that result nor bare False proves the platform rejected the send.
     if not isinstance(result, Mapping):
         return DeliveryReceipt('unknown')
     sent = result.get('sent')
@@ -48,8 +50,6 @@ def classify_ack(result: Any) -> DeliveryReceipt:
     valid_id = isinstance(message_id, str) and bool(message_id.strip())
     if sent is True and valid_id:
         return DeliveryReceipt('sent', message_id.strip())
-    if sent is False and not valid_id:
-        return DeliveryReceipt('failed')
     return DeliveryReceipt('unknown')
 
 
@@ -105,6 +105,8 @@ class DeliveryOutbox:
         self._validate_artifact = validate_artifact
         self._acknowledgement_timeout_s = float(acknowledgement_timeout_s)
         self._late_ack_tasks: set[asyncio.Task[None]] = set()
+        self._write_tasks: set[asyncio.Task[Job]] = set()
+        self._send_tasks: set[asyncio.Task[Any]] = set()
 
     async def recover(self) -> int:
         """On startup, fence every pre-restart dispatch as unknown."""
@@ -120,21 +122,32 @@ class DeliveryOutbox:
                 message_id=receipt.message_id,
             )
         )
-        try:
-            return await asyncio.shield(write_task)
-        except asyncio.CancelledError:
-            # Once a platform result is known, do not let host cancellation
-            # strand the durable row in dispatching while sqlite still writes.
-            await asyncio.shield(write_task)
-            raise
+        self._write_tasks.add(write_task)
+        write_task.add_done_callback(self._write_tasks.discard)
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(write_task)
+                if cancelled:
+                    raise asyncio.CancelledError
+                return result
+            except asyncio.CancelledError:
+                if write_task.done():
+                    # Consume a completed write even if cancellation races it.
+                    write_task.result()
+                    raise
+                cancelled = True
+                # Repeated cancellations must not detach the SQLite writer.
 
     async def _mark_unknown(self, job: Job) -> Job:
         return await self._record(job, DeliveryReceipt('unknown'))
 
-    async def _observe_late(self, job: Job, send_task: asyncio.Task[Any]) -> None:
+    async def _observe_late(self, job: Job, send_task: asyncio.Task[Any],
+                            unknown_done: asyncio.Event) -> None:
         """A late result may settle the same RPC, but never starts another one."""
         try:
             result = await send_task
+            await unknown_done.wait()
             receipt = classify_ack(result)
             if receipt.outcome != 'unknown':
                 await self._record(job, receipt)
@@ -145,8 +158,9 @@ class DeliveryOutbox:
             # the only honest result for a transport exception.
             return
 
-    def _watch_late(self, job: Job, send_task: asyncio.Task[Any]) -> None:
-        watcher = asyncio.create_task(self._observe_late(job, send_task))
+    def _watch_late(self, job: Job, send_task: asyncio.Task[Any],
+                    unknown_done: asyncio.Event) -> None:
+        watcher = asyncio.create_task(self._observe_late(job, send_task, unknown_done))
         self._late_ack_tasks.add(watcher)
         watcher.add_done_callback(self._late_ack_tasks.discard)
 
@@ -155,6 +169,24 @@ class DeliveryOutbox:
         tasks = tuple(self._late_ack_tasks)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def shutdown(self, *, timeout_s: float = 1.0) -> None:
+        """Bound unload time; leave ambiguous attempts unknown, never retry.
+
+        A running SQLite thread cannot be killed safely; its tracked write will
+        complete independently. Cancelling observers does not undo platform work.
+        """
+        if timeout_s < 0:
+            raise ValueError('Invalid shutdown timeout')
+        tasks = tuple(self._late_ack_tasks | self._send_tasks)
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=timeout_s)
+            for task in pending:
+                task.cancel()
+            # Retrieve exceptions from already completed tasks.
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
 
     async def dispatch(self, job_id: str, stream_id: str) -> Optional[Job]:
         """Attempt one eligible delivery, returning ``None`` when not claimable.
@@ -192,17 +224,21 @@ class DeliveryOutbox:
             return await self._mark_unknown(claimed)
 
         send_task = asyncio.create_task(self._sender.send(claimed, artifact))
+        self._send_tasks.add(send_task)
+        send_task.add_done_callback(self._send_tasks.discard)
         try:
             async with asyncio.timeout(self._acknowledgement_timeout_s):
                 result = await asyncio.shield(send_task)
-        except TimeoutError:
-            unknown = await self._mark_unknown(claimed)
-            self._watch_late(claimed, send_task)
+        except (TimeoutError, asyncio.CancelledError) as interruption:
+            unknown_done = asyncio.Event()
+            self._watch_late(claimed, send_task, unknown_done)
+            try:
+                unknown = await self._mark_unknown(claimed)
+            finally:
+                unknown_done.set()
+            if isinstance(interruption, asyncio.CancelledError):
+                raise interruption
             return unknown
-        except asyncio.CancelledError:
-            await self._mark_unknown(claimed)
-            self._watch_late(claimed, send_task)
-            raise
         except Exception:
             return await self._mark_unknown(claimed)
 

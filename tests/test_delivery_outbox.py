@@ -102,8 +102,8 @@ async def test_two_senders_claim_once_and_use_detailed_sdk_contract(store, tmp_p
 @pytest.mark.parametrize(
     ('result', 'expected'),
     [
-        ({'sent': False, 'message_id': None}, 'failed'),
-        (False, 'failed'),
+        ({'sent': False, 'message_id': None}, 'unknown'),
+        (False, 'unknown'),
         ({'sent': True, 'message_id': None}, 'unknown'),
         (True, 'unknown'),
         ({'success': True, 'message_id': 'not-an-ack'}, 'unknown'),
@@ -222,6 +222,64 @@ async def test_exception_and_artifact_validation_failure_are_unknown(store, tmp_
     failed_transport = await failing.dispatch(other.id, other.stream_id)
     assert failed_transport.delivery_state == 'unknown'
     assert send_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_post_send_host_exception_is_not_a_rejection(store, tmp_path):
+    job = ready(store)
+    async def host_rpc(*args, **kwargs):
+        # Platform succeeded, then an internal Host hook/store failed and the
+        # Host converted that exception to this SDK response.
+        return {'sent': False, 'message_id': None}
+    outbox = DeliveryOutbox(store, CustomVoiceSender(host_rpc), lambda key: artifact(tmp_path))
+    assert (await outbox.dispatch(job.id, job.stream_id)).delivery_state == 'unknown'
+    assert await outbox.dispatch(job.id, job.stream_id) is None
+
+
+@pytest.mark.asyncio
+async def test_late_ack_after_recover_does_not_overwrite_sent(store, tmp_path):
+    job = ready(store)
+    release = asyncio.Event()
+    async def host_rpc(*args, **kwargs):
+        await release.wait()
+        return {'sent': True, 'message_id': 'after-recovery'}
+    outbox = DeliveryOutbox(store, CustomVoiceSender(host_rpc),
+                            lambda key: artifact(tmp_path), acknowledgement_timeout_s=0.01)
+    attempt = asyncio.create_task(outbox.dispatch(job.id, job.stream_id))
+    while store.get(job.id, job.stream_id).delivery_state != 'dispatching':
+        await asyncio.sleep(0)
+    assert await outbox.recover() == 1
+    assert (await attempt).delivery_state == 'unknown'
+    release.set()
+    await outbox.drain_late_acknowledgements()
+    assert store.get(job.id, job.stream_id).message_id == 'after-recovery'
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_keeps_sqlite_result_observed(store, tmp_path):
+    job = ready(store)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    def delayed_result(*args, **kwargs):
+        import time
+        started_loop.call_soon_threadsafe(started.set)
+        while not release.is_set():
+            time.sleep(0.001)
+        return original(*args, **kwargs)
+    started_loop = asyncio.get_running_loop()
+    original = store.delivery_result
+    store.delivery_result = delayed_result
+    async def host_rpc(*args, **kwargs):
+        return {'sent': True, 'message_id': 'confirmed'}
+    outbox = DeliveryOutbox(store, CustomVoiceSender(host_rpc), lambda key: artifact(tmp_path))
+    attempt = asyncio.create_task(outbox.dispatch(job.id, job.stream_id))
+    await started.wait()
+    attempt.cancel()
+    attempt.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await attempt
+    assert store.get(job.id, job.stream_id).message_id == 'confirmed'
 
 
 @pytest.mark.asyncio
