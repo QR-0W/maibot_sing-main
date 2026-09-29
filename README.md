@@ -7,7 +7,7 @@ MaiBot 插件：通过音乐来源搜索与 RVC 本地处理生成歌曲翻唱�
 - 请求已知歌曲并进行人声分离、RVC 转换，可选混回伴奏。
 - 本地后端复用已有 Natsume Iroha RVC v1 模型/index，不重新训练或声称存在英语版 Iroha CV。
 - 完成的翻唱持久保存为 MP3 与 provenance 元数据；临时下载、分离 stems 等 scratch 与成品分开管理。
-- 任务具有 queued / processing / completed / failed / cancelled / interrupted 状态；请求和成品缓存遵从本地配置契约。
+- 新任务使用 SQLite 持久账本：搜索/候选等待、queued、running、ready、failed、cancelled、interrupted；渲染与消息投递分别记录，不能把 ready 说成平台已送达。
 - 旧 sidecar 仅为兼容路径，不会成为本地后端失败后的隐式无界 fallback；以契约规定为准。
 
 > 运行环境、隔离要求、输出目录和部署前检查见 [DEPLOYMENT.md](docs/DEPLOYMENT.md)。操作前先审阅 [config.example.toml](config.example.toml) 与当前 [CONFIG_CONTRACT.md](docs/CONFIG_CONTRACT.md)。不要把包含凭证的真实 `config.toml` 提交到版本库。
@@ -31,14 +31,15 @@ git clone https://github.com/QR-0W/maibot_sing-main.git maibot-sing
 
 ## 命令与 Tool
 
-- `/翻唱 <准确歌名> - <艺人名>`：搜索明确录音版本并创建持久任务；可追加 `--album` 或 `--source-id` 缩小候选。
+- `/翻唱 <准确歌名> - <艺人名>`：搜索并创建持久任务，默认仅保存、不自动发送；可追加 `--album` 或 `--source-id` 缩小候选。
+- 在上述命令**最后**追加 `--auto-reply`：显式授权完成后向原会话最多发起一次自动投递；如需伴奏，将 `--with-instrumental` 放在它前面。
 - `/翻唱选择 <任务ID> <序号>`：从插件已显示的候选快照中选择版本。
 - `/翻唱状态 <任务ID>`：查询渲染与投递状态。
 - `/翻唱取消 <任务ID>`：持久化取消请求；不能撤回已被平台接受的发送。
 - `/说 <文本>`、`/音色列表`：旧说话/音色入口，是否可用取决于受限后端和管理员配置。
 - `/qq音乐登录`、`/网易云音乐登录`、`/163logintest`、`/qqlogintest`：仅 operator 使用的登录与诊断命令。
 
-插件还声明了供 LLM 发现的翻唱与说话 Tool；默认不要把它们提升为核心工具。`/163cookie` 会在聊天命令中携带登录凭证，当前审计将其列为待整改项，不建议在生产会话使用。实际启用前请核对 [SDK 合规审计](docs/SDK_COMPLIANCE.md) 的组件与安全待验项。
+插件还声明了供 LLM 发现的翻唱与说话 Tool，但当前 Host 的 Tool 参数缺少可信原始消息锚点：它们只给出原会话 Command 指引，不凭自由会话 ID 入队或发送，默认也不要提升为核心工具。`/163cookie` 已停止解析和应用聊天输入中的秘密，仅指向配置或扫码流程；不要在聊天粘贴凭证。实际启用前请核对 [SDK 合规审计](docs/SDK_COMPLIANCE.md) 和[配置契约](docs/CONFIG_CONTRACT.md)中的边界。
 
 ## 模型来源与限制
 
