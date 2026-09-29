@@ -1,9 +1,11 @@
 """Mock provider transport: exact-ID streaming and hostile redirect handling."""
 from pathlib import Path
+import asyncio
 import hashlib
 import importlib
 import importlib.util
 import sys
+import threading
 
 import httpx
 import pytest
@@ -74,6 +76,7 @@ async def test_bad_source_url_never_downloaded(tmp_path,gateway,bad):
         await source.download_selected(catalogue,chosen(),tmp_path)
     assert exc.value.code in ('source_url_rejected','source_protocol_error') and len(calls)==1
     assert not (tmp_path/'source.audio').exists()
+    assert not list(tmp_path.glob('*.part'))
 
 
 @pytest.mark.asyncio
@@ -117,3 +120,148 @@ async def test_known_preview_is_rejected_before_get(tmp_path,gateway):
     with pytest.raises(service.CatalogueError) as exc:
         await source.download_selected(catalogue,chosen(),tmp_path)
     assert exc.value.code=='source_preview' and calls==['music.163.com']
+    assert not list(tmp_path.glob('*.part'))
+
+
+async def wait_thread_flag(flag):
+    for _ in range(200):
+        if flag.is_set():
+            return
+        await asyncio.sleep(.005)
+    raise AssertionError('background disk operation did not start')
+
+
+def mock_success(client,content=b'A'*2048):
+    def handler(request):
+        if request.url.path.endswith('/url'):
+            return httpx.Response(200,json={'code':200,'data':[{
+                'id':1,'url':'https://cdn.music.126.net/track.mp3?sig=private',
+                'size':len(content)}]})
+        return httpx.Response(200,content=content)
+    mock(client,handler)
+
+
+@pytest.mark.asyncio
+async def test_blocked_disk_write_does_not_block_event_loop(tmp_path,gateway,monkeypatch):
+    client,catalogue=gateway
+    mock_success(client)
+    entered,release=threading.Event(),threading.Event()
+    original=source._append_block
+    def blocked(*args):
+        entered.set()
+        if not release.wait(2):
+            raise AssertionError('test did not release disk write')
+        return original(*args)
+    monkeypatch.setattr(source,'_append_block',blocked)
+    task=asyncio.create_task(source.download_selected(catalogue,chosen(),tmp_path))
+    try:
+        await wait_thread_flag(entered)
+        ticks=0
+        async def heartbeat():
+            nonlocal ticks
+            for _ in range(10):
+                await asyncio.sleep(.005)
+                ticks+=1
+        await heartbeat()
+        assert ticks==10 and not task.done()
+    finally:
+        release.set()
+    path,digest,amount=await task
+    assert path.read_bytes()==b'A'*2048 and amount==2048
+    assert digest==hashlib.sha256(b'A'*2048).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_default_offload_observes_late_error():
+    entered,release=threading.Event(),threading.Event()
+    def broken():
+        entered.set()
+        if not release.wait(2):
+            raise AssertionError('test did not release broken offload')
+        raise RuntimeError('late disk failure')
+    task=asyncio.create_task(source._offload_io(None,broken))
+    await wait_thread_flag(entered)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError) as exc:
+        await task
+    assert isinstance(exc.value.__cause__,RuntimeError)
+    assert str(exc.value.__cause__)=='late disk failure'
+
+
+@pytest.mark.asyncio
+async def test_cancelled_blocked_write_finishes_only_private_part(tmp_path,gateway,monkeypatch):
+    client,catalogue=gateway
+    mock_success(client)
+    entered,release=threading.Event(),threading.Event()
+    original=source._append_block
+    def blocked(*args):
+        entered.set()
+        if not release.wait(2):
+            raise AssertionError('test did not release disk write')
+        return original(*args)
+    monkeypatch.setattr(source,'_append_block',blocked)
+    task=asyncio.create_task(source.download_selected(catalogue,chosen(),tmp_path))
+    await wait_thread_flag(entered)
+    task.cancel()
+    await asyncio.sleep(.02)
+    assert not task.done() and not (tmp_path/'source.audio').exists()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    parts=list(tmp_path.glob('source-*.part'))
+    assert len(parts)==1 and parts[0].read_bytes()==b'A'*2048
+    assert not (tmp_path/'source.audio').exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_publish_never_leaves_completed_target(tmp_path,gateway,monkeypatch):
+    client,catalogue=gateway
+    mock_success(client)
+    entered,release=threading.Event(),threading.Event()
+    original=source._publish_part
+    def blocked(*args):
+        entered.set()
+        if not release.wait(2):
+            raise AssertionError('test did not release publication')
+        return original(*args)
+    monkeypatch.setattr(source,'_publish_part',blocked)
+    task=asyncio.create_task(source.download_selected(catalogue,chosen(),tmp_path))
+    await wait_thread_flag(entered)
+    task.cancel()
+    await asyncio.sleep(.02)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not (tmp_path/'source.audio').exists()
+    assert len(list(tmp_path.glob('source-*.part')))==1
+
+
+@pytest.mark.asyncio
+async def test_exclusive_publish_never_overwrites_racing_source(tmp_path,gateway,monkeypatch):
+    client,catalogue=gateway
+    mock_success(client)
+    original=source._publish_part
+    def raced(temporary,target,workspace,cancelled):
+        target.write_bytes(b'other scheduler source')
+        return original(temporary,target,workspace,cancelled)
+    monkeypatch.setattr(source,'_publish_part',raced)
+    with pytest.raises(source.DownloadError) as exc:
+        await source.download_selected(catalogue,chosen(),tmp_path)
+    assert exc.value.code=='source_exists'
+    assert (tmp_path/'source.audio').read_bytes()==b'other scheduler source'
+    assert len(list(tmp_path.glob('source-*.part')))==1
+
+
+@pytest.mark.asyncio
+async def test_injected_offload_owns_every_file_operation(tmp_path,gateway):
+    client,catalogue=gateway
+    mock_success(client)
+    calls=[]
+    async def offload(function,*args,**kwargs):
+        calls.append(function.__name__)
+        return await asyncio.to_thread(function,*args,**kwargs)
+    await source.download_selected(catalogue,chosen(),tmp_path,offload=offload)
+    assert calls[0]=='_prepare_destination'
+    assert '_append_block' in calls and calls[-1]=='_publish_part'
