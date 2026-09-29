@@ -112,7 +112,13 @@ class DeliveryOutbox:
         """On startup, fence every pre-restart dispatch as unknown."""
         return await asyncio.to_thread(self._store.recover_dispatches)
 
-    async def _record(self, job: Job, receipt: DeliveryReceipt) -> Job:
+    def _consume_background_write(self, task: asyncio.Task[Any]) -> None:
+        self._write_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def _record(self, job: Job, receipt: DeliveryReceipt,
+                      done: Optional[asyncio.Event] = None) -> Job:
         write_task = asyncio.create_task(
             asyncio.to_thread(
                 self._store.delivery_result,
@@ -123,24 +129,18 @@ class DeliveryOutbox:
             )
         )
         self._write_tasks.add(write_task)
-        write_task.add_done_callback(self._write_tasks.discard)
-        cancelled = False
-        while True:
-            try:
-                result = await asyncio.shield(write_task)
-                if cancelled:
-                    raise asyncio.CancelledError
-                return result
-            except asyncio.CancelledError:
-                if write_task.done():
-                    # Consume a completed write even if cancellation races it.
-                    write_task.result()
-                    raise
-                cancelled = True
-                # Repeated cancellations must not detach the SQLite writer.
+        def finished(task: asyncio.Task[Job]) -> None:
+            self._write_tasks.discard(task)
+            if not task.cancelled():
+                task.exception()  # Retrieve detached SQLite failures.
+            if done is not None:
+                done.set()
+        write_task.add_done_callback(finished)
+        return await asyncio.shield(write_task)
 
-    async def _mark_unknown(self, job: Job) -> Job:
-        return await self._record(job, DeliveryReceipt('unknown'))
+    async def _mark_unknown(self, job: Job,
+                            done: Optional[asyncio.Event] = None) -> Job:
+        return await self._record(job, DeliveryReceipt('unknown'), done)
 
     async def _observe_late(self, job: Job, send_task: asyncio.Task[Any],
                             unknown_done: asyncio.Event) -> None:
@@ -202,10 +202,18 @@ class DeliveryOutbox:
         try:
             claimed = await asyncio.shield(claim_task)
         except asyncio.CancelledError:
-            # sqlite may already have committed the claim in its worker thread.
-            claimed = await asyncio.shield(claim_task)
-            if claimed is not None:
-                await self._mark_unknown(claimed)
+            # A SQLite thread cannot be interrupted. Reconcile its eventual
+            # claim without holding the unloading coordinator hostage.
+            def reconcile(task: asyncio.Task[Optional[Job]]) -> None:
+                try:
+                    row = task.result()
+                except Exception:
+                    return
+                if row is not None:
+                    watcher = asyncio.create_task(self._mark_unknown(row))
+                    self._write_tasks.add(watcher)
+                    watcher.add_done_callback(self._consume_background_write)
+            claim_task.add_done_callback(reconcile)
             raise
         if claimed is None:
             return None
@@ -232,10 +240,7 @@ class DeliveryOutbox:
         except (TimeoutError, asyncio.CancelledError) as interruption:
             unknown_done = asyncio.Event()
             self._watch_late(claimed, send_task, unknown_done)
-            try:
-                unknown = await self._mark_unknown(claimed)
-            finally:
-                unknown_done.set()
+            unknown = await self._mark_unknown(claimed, unknown_done)
             if isinstance(interruption, asyncio.CancelledError):
                 raise interruption
             return unknown

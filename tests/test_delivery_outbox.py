@@ -279,7 +279,39 @@ async def test_repeated_cancellation_keeps_sqlite_result_observed(store, tmp_pat
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await attempt
+    while outbox._write_tasks:
+        await asyncio.sleep(0.001)
     assert store.get(job.id, job.stream_id).message_id == 'confirmed'
+
+
+@pytest.mark.asyncio
+async def test_cancel_then_shutdown_is_bounded_with_blocked_sqlite(store, tmp_path):
+    job = ready(store)
+    started = asyncio.Event()
+    release = __import__('threading').Event()
+    loop = asyncio.get_running_loop()
+    original = store.delivery_result
+    def blocked_result(*args, **kwargs):
+        loop.call_soon_threadsafe(started.set)
+        release.wait(5)
+        return original(*args, **kwargs)
+    store.delivery_result = blocked_result
+    async def host_rpc(*args, **kwargs):
+        return {'sent': True, 'message_id': 'eventual'}
+    outbox = DeliveryOutbox(store, CustomVoiceSender(host_rpc), lambda key: artifact(tmp_path))
+    attempt = asyncio.create_task(outbox.dispatch(job.id, job.stream_id))
+    try:
+        await started.wait()
+        attempt.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(attempt, 0.2)
+        await asyncio.wait_for(outbox.shutdown(timeout_s=0.01), 0.2)
+        assert store.get(job.id, job.stream_id).delivery_state == 'dispatching'
+    finally:
+        release.set()
+    while outbox._write_tasks:
+        await asyncio.sleep(0.001)
+    assert store.get(job.id, job.stream_id).message_id == 'eventual'
 
 
 @pytest.mark.asyncio
