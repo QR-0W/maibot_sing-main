@@ -22,13 +22,14 @@ import stat
 import time
 import uuid
 
-from ..runtime.recipe_identity import fingerprint, recipe_document, validate_document
+from ..runtime.recipe_identity import SCHEMA, fingerprint, recipe_document, validate_document
 from ..runtime.render_plan import Step, build_plan
 from .artifact_store import ArtifactError, ArtifactStore, publish_job
 from .asset_inventory import (AssetInventory, InventoryError, RuntimeInventory,
                               RUNTIME_HASH_NAMES, runtime_generation)
 from .catalogue_service import CatalogueError, CatalogueService
-from .job_store import TRUSTED_QQ_INGRESS, Job, JobConflict, JobStore
+from .job_store import (TRUSTED_QQ_INGRESS, JOB_PROGRESS_STAGES, Job, JobConflict,
+                        JobStore, request_modes)
 from .media_probe import probe_download
 from .source_download import DownloadError, download_selected
 from .source_offer import CatalogueItem
@@ -54,6 +55,8 @@ RENDER_PARAMETER_POLICY = {
     'resample_hz': 44100,
     'encode': {'codec': 'libmp3lame', 'bitrate': '192k'},
     'instrumental_modes': [False, True],
+    'render_modes': ['full', 'excerpt'],
+    'excerpt_policy': 'sing-excerpt-selection-v1',
 }
 
 _COORDINATOR_MESSAGES = {
@@ -249,8 +252,7 @@ class JobService:
     background loop or an explicit ``run_once`` call used by tests/hosts.
     """
     _TERMINAL = frozenset(('ready', 'failed', 'cancelled', 'interrupted'))
-    _PROGRESS = ('starting', 'resolving', 'downloading', 'separating',
-                 'converting', 'encoding', 'validating', 'publishing')
+    _PROGRESS = JOB_PROGRESS_STAGES
 
     def __init__(self, store: JobStore, catalogue: CatalogueService,
                  coordinator: StageCoordinator, artifacts: Any,
@@ -456,9 +458,7 @@ class JobService:
         if 'service_generation' in request:
             raise ValueError('Service generation is reserved for the durable coordinator')
         _reject_credentials(request)
-        instrumental=request.get('instrumental',False)
-        if type(instrumental) is not bool:
-            raise ValueError('Instrumental must be explicit bool')
+        request_modes(request)
         declared_auto_reply=request.get('auto_reply',False)
         if type(auto_reply) is not bool or type(declared_auto_reply) is not bool:
             raise ValueError('Auto reply must be explicit bool')
@@ -736,6 +736,8 @@ class JobService:
             recipe = json.loads(recipe_path.read_text(encoding='utf-8'))
             plan = json.loads(plan_path.read_text(encoding='utf-8'))
             validate_document(recipe)
+            if recipe['schema'] != SCHEMA:
+                raise ValueError('Legacy recipes are read-only committed artifacts')
             if (plan.get('schema') != 1 or plan.get('workspace') != str(workspace)
                     or plan.get('inference_lock') != str(self.runtime.inference_lock)
                     or plan.get('recipe') != fingerprint(recipe)):
@@ -745,7 +747,7 @@ class JobService:
                           for item in plan['steps'])
             rebuilt = self.recipe_builder(provider=selected.provider, track_id=selected.track_id,
                 hashes=recipe['hashes'], versions=recipe['versions'], steps=steps,
-                **self._runtime_args(workspace))
+                render_mode=recipe['render_mode'], **self._runtime_args(workspace))
             if rebuilt != recipe:
                 raise ValueError('private plan differs from portable recipe')
         except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -786,13 +788,12 @@ class JobService:
                 or not 30*sample_rate <= frames <= self.runtime.max_duration_s*sample_rate):
             raise JobServiceError('source_probe_invalid',
                                   'Media probe omitted exact normalized source frames')
-        request = job.request
-        instrumental = request.get('instrumental', False)
+        _, render_mode, instrumental = request_modes(job.request)
         steps = self.plan_builder(**self._runtime_args(workspace), frames=frames,
-                                  instrumental=instrumental)
+                                  instrumental=instrumental, render_mode=render_mode)
         recipe = self.recipe_builder(provider=selected.provider, track_id=selected.track_id,
             hashes=inventory.hashes, versions=inventory.versions, steps=steps,
-            **self._runtime_args(workspace))
+            render_mode=render_mode, **self._runtime_args(workspace))
         recipe_path, plan_path = workspace / 'recipe.json', workspace / 'plan.json'
         await self._offload(_atomic_json, recipe_path, recipe)
         # If recipe survived a crash before plan creation, require byte-identical
@@ -824,6 +825,8 @@ class JobService:
     def _stage_progress(step: Step) -> str:
         if step.name in ('decode', 'separate'):
             return 'separating'
+        if step.name == 'excerpt':
+            return 'excerpt'
         if step.name.startswith('convert_') or step.name == 'mix':
             return 'converting'
         if step.name == 'encode':
@@ -853,7 +856,14 @@ class JobService:
         await self._offload(self._ensure_workspace, workspace)
         if await self._cancel_without_unit(job):
             return
+        _, render_mode, instrumental = request_modes(job.request)
         frozen_plan=await self._offload(self._read_frozen,workspace,selected)
+        if frozen_plan is not None:
+            frozen_recipe = frozen_plan[0]
+            mix = next((step for step in frozen_recipe['steps'] if step['name']=='mix'), None)
+            if (frozen_recipe['render_mode'] != render_mode or mix is None
+                    or ('--instrumental' in mix['argv']) != instrumental):
+                raise JobServiceError('frozen_plan_invalid', 'Frozen plan differs from requested render options')
         if (frozen_plan is None
                 and job.request.get('service_generation')!=self.generation):
             raise JobServiceError('configuration_changed',

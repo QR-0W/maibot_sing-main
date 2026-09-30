@@ -20,28 +20,58 @@ ledger=importlib.import_module('artifact_test_pkg.services.job_store')
 source=importlib.import_module('artifact_test_pkg.services.source_offer')
 
 
-@pytest.fixture
-def prepared(tmp_path):
+def selection_document():
+    return {'schema':'sing-excerpt-selection-v1','sample_rate':44100,
+            'source_frames':31*44100,'output_frames':15*44100,
+            'source_ranges':[
+                {'start_frame':44101,'end_frame':374851,'output_start_frame':0,
+                 'output_end_frame':330750},
+                {'start_frame':882001,'end_frame':1212751,'output_start_frame':330750,
+                 'output_end_frame':661500}],
+            'analysis':{'hop_frames':2205,'rms_threshold':.01,'flatness_max':.5,
+                        'breath_gap_frames':26460,'minimum_fragment_frames':52920,
+                        'analyzed_hops':620},
+            'fades':{'in_frames':2205,'out_frames':5292},
+            'normalization':{'target_rms':.12,'applied_gain':1.0}}
+
+
+def prepare_artifact(tmp_path, render_mode='full'):
     work=tmp_path/'work';work.mkdir()
     root=tmp_path/'library';root.mkdir()
     (work/'source.audio').write_bytes(b'fixed synthetic source bytes')
     paths=dict(workspace=str(work),worker_python='/python',worker_script='/media.py',
                rvc_script='/rvc.py',model='/model.pth',index='/index',hubert='/hubert.pt',
                 demucs_repo='/offline-model-repo')
-    plan=plan_module.build_plan(**paths,frames=31*44100,instrumental=True)
+    plan=plan_module.build_plan(**paths,frames=31*44100,instrumental=True,
+                               render_mode=render_mode)
     hashes={k:format(i+1,'064x') for i,k in enumerate(recipes.HASH_NAMES)}
     hashes['source']=receipts.sha256(work/'source.audio')
     document=recipes.recipe_document(provider='163',track_id='synthetic',hashes=hashes,
-        versions={k:'1.2.3' for k in recipes.VERSION_NAMES},steps=plan,**paths)
+        versions={k:'1.2.3' for k in recipes.VERSION_NAMES},steps=plan,
+        render_mode=render_mode,**paths)
     key=recipes.fingerprint(document)
     stage_store=receipts.StageReceipts(work,key)
     for step in plan:
         for name in step.outputs:
             if not (work/name).exists():
-                (work/name).write_bytes(('synthetic output '+name).encode())
+                if name=='selection.json':
+                    (work/name).write_text(json.dumps(selection_document(),sort_keys=True,
+                        separators=(',',':'),ensure_ascii=False,allow_nan=False),encoding='utf-8')
+                else:
+                    (work/name).write_bytes(('synthetic output '+name).encode())
         inputs={name:receipts.sha256(work/name) for name in step.inputs}
         stage_store.seal(step.name,inputs,list(step.outputs))
     return artifacts.ArtifactStore(root,min_free_bytes=0),work,document,key,plan
+
+
+@pytest.fixture
+def prepared(tmp_path):
+    return prepare_artifact(tmp_path)
+
+
+@pytest.fixture
+def excerpt_prepared(tmp_path):
+    return prepare_artifact(tmp_path, 'excerpt')
 
 
 def publish(prepared):
@@ -247,3 +277,122 @@ def test_no_publication_before_all_attempts_settled(prepared):
     store.claim_step(job.id,job.run_token,'post_validate')
     with pytest.raises(ledger.JobConflict):publish_job(prepared,store,job)
     assert not (audio.root/key).exists()
+
+
+def test_excerpt_selection_survives_workspace_removal_and_catalog_is_precise(excerpt_prepared):
+    import shutil
+    store,work,recipe,key,plan=excerpt_prepared
+    result=publish(excerpt_prepared)
+    metadata_path=result.path.with_name('metadata.json')
+    metadata=json.loads(metadata_path.read_text())
+    assert metadata['selection']==selection_document()
+    raw=json.dumps(metadata['selection'],sort_keys=True,separators=(',',':'),
+                   ensure_ascii=False,allow_nan=False).encode()
+    assert metadata['excerpt_receipt']['outputs']['selection.json']=={
+        'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}
+    assert metadata['excerpt_receipt']['stage']=='excerpt'
+    assert metadata['excerpt_receipt']['recipe']==key
+    assert store.reconcile_catalog()==[]
+    entry=json.loads((store.root/'library-index.json').read_text())['entries'][0]
+    assert entry['excerpt']=='00分01.000秒至00分08.500秒+00分20.000秒至00分27.500秒拼接'
+    assert ':' not in Path(entry['file']).name
+    assert len(Path(entry['file']).name.encode())<=255
+    before=metadata_path.read_bytes()
+    shutil.rmtree(work)
+    assert store.verify(key)==result
+    assert publish(excerpt_prepared)==result
+    assert metadata_path.read_bytes()==before
+
+
+@pytest.mark.parametrize('corrupt',[
+    'missing_selection','missing_receipt','source_frames','range','valid_but_unsealed_range',
+    'nonfinite','receipt_digest','receipt_bytes','receipt_stage','receipt_recipe',
+    'receipt_outputs','receipt_input','bool_bytes'])
+def test_malformed_excerpt_metadata_is_rejected_by_store_and_catalog(excerpt_prepared,corrupt):
+    store,work,recipe,key,plan=excerpt_prepared
+    result=publish(excerpt_prepared)
+    path=result.path.with_name('metadata.json')
+    metadata=json.loads(path.read_text())
+    if corrupt=='missing_selection':metadata.pop('selection')
+    elif corrupt=='missing_receipt':metadata.pop('excerpt_receipt')
+    elif corrupt=='source_frames':metadata['selection']['source_frames']=True
+    elif corrupt=='range':metadata['selection']['source_ranges'][0]['output_end_frame']+=1
+    elif corrupt=='valid_but_unsealed_range':
+        record=metadata['selection']['source_ranges'][0]
+        record['start_frame']+=100;record['end_frame']+=100
+    elif corrupt=='nonfinite':metadata['selection']['normalization']['applied_gain']=float('nan')
+    elif corrupt=='receipt_digest':metadata['excerpt_receipt']['outputs']['selection.json']['sha256']='0'*64
+    elif corrupt=='receipt_bytes':metadata['excerpt_receipt']['outputs']['selection.json']['bytes']+=1
+    elif corrupt=='receipt_stage':metadata['excerpt_receipt']['stage']='separate'
+    elif corrupt=='receipt_recipe':metadata['excerpt_receipt']['recipe']='f'*64
+    elif corrupt=='receipt_outputs':metadata['excerpt_receipt']['outputs'].pop('excerpt_backing.wav')
+    elif corrupt=='receipt_input':metadata['excerpt_receipt']['inputs']['vocals.wav']='not-a-digest'
+    elif corrupt=='bool_bytes':metadata['excerpt_receipt']['outputs']['vocal_000.wav']['bytes']=True
+    os.chmod(path,0o600);path.write_text(json.dumps(metadata))
+    with pytest.raises(artifacts.ArtifactError):store.verify(key)
+    with pytest.raises(ValueError):artifacts.library_catalog.rebuild_library(store.root)
+    assert len(store.reconcile_catalog())==1
+
+
+def test_selection_file_must_be_canonical_and_match_stage_receipt(excerpt_prepared):
+    store,work,recipe,key,plan=excerpt_prepared
+    path=work/'selection.json'
+    data=json.loads(path.read_text())
+    path.write_text(json.dumps(data,indent=2)+'\n')
+    # Even a valid receipt for noncanonical JSON must not bless metadata that
+    # cannot reproduce the same bytes after the workspace is gone.
+    excerpt=next(step for step in plan if step.name=='excerpt')
+    (work/'.receipts/excerpt.json').unlink()
+    receipts.StageReceipts(work,key).seal('excerpt',
+        {name:receipts.sha256(work/name) for name in excerpt.inputs},list(excerpt.outputs))
+    # Re-seal dependent receipts too, so rejection comes from canonical evidence.
+    for step in plan[3:]:
+        (work/'.receipts'/f'{step.name}.json').unlink()
+        receipts.StageReceipts(work,key).seal(step.name,
+            {name:receipts.sha256(work/name) for name in step.inputs},list(step.outputs))
+    with pytest.raises(artifacts.ArtifactError,match='selection'):publish(excerpt_prepared)
+    assert not (store.root/key).exists()
+
+
+def test_v2_committed_artifact_is_readonly_compatible(prepared):
+    store,work,recipe,key,plan=prepared
+    result=publish(prepared)
+    metadata=json.loads(result.path.with_name('metadata.json').read_text())
+    legacy=metadata['recipe']
+    legacy['schema']='sing-render-v2';legacy.pop('render_mode')
+    legacy['hashes'].pop('excerpt_selection')
+    # A real v2 plan predates explicit render-mode switches.
+    for step in legacy['steps']:
+        argv=step['argv']
+        if '--render-mode' in argv:
+            position=argv.index('--render-mode');del argv[position:position+2]
+    old_key=recipes.fingerprint(legacy)
+    metadata['key']=old_key;metadata['recipe_schema']='sing-render-v2'
+    metadata['parameters']={'policy':'sing-render-v2'}
+    metadata['validation']['recipe']=old_key
+    folder=store.root/old_key;result.path.parent.rename(folder)
+    path=folder/'metadata.json';os.chmod(path,0o600)
+    path.write_text(json.dumps(metadata));os.chmod(path,0o444)
+    before={name:((folder/name).read_bytes(),(folder/name).stat().st_ino,
+                  (folder/name).stat().st_mode) for name in ('metadata.json','cover.mp3')}
+    assert store.verify(old_key).key==old_key
+    assert store.reconcile_catalog()==[]
+    for name,value in before.items():
+        item=folder/name
+        assert (item.read_bytes(),item.stat().st_ino,item.stat().st_mode)==value
+    with pytest.raises(artifacts.ArtifactError,match='Legacy recipes'):
+        store.publish(work,legacy,title='No v2 writes',artist='Fixture')
+
+
+def test_excerpt_publish_recovery_after_rename_is_idempotent(excerpt_prepared,monkeypatch):
+    store,work,recipe,key,plan=excerpt_prepared
+    sync=artifacts._sync_directory
+    def crash(path):
+        if path==store.root:raise OSError('synthetic excerpt post-rename crash')
+        sync(path)
+    monkeypatch.setattr(artifacts,'_sync_directory',crash)
+    with pytest.raises(OSError):publish(excerpt_prepared)
+    path=store.root/key/'metadata.json';before=path.read_bytes();inode=path.stat().st_ino
+    monkeypatch.setattr(artifacts,'_sync_directory',sync)
+    result=publish(excerpt_prepared)
+    assert result.key==key and path.read_bytes()==before and path.stat().st_ino==inode

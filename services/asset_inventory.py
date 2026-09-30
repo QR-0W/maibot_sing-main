@@ -36,6 +36,7 @@ class AssetPaths:
     worker: Path
     render_plan: Path
     stage_executor: Path
+    excerpt_selection: Path
 
     def documents(self) -> Dict[str, Path]:
         return {name: Path(getattr(self, name)) for name in HASH_NAMES if name != 'source'}
@@ -45,7 +46,7 @@ RUNTIME_HASH_NAMES = tuple(name for name in HASH_NAMES if name != 'source')
 RUNTIME_EXECUTION_PATH_NAMES = (
     'model', 'index', 'hubert', 'demucs_repo', 'rvc_script', 'rvc_upstream',
     'media_stage', 'worker', 'render_plan', 'stage_executor', 'worker_python',
-    'worker_script', 'inference_lock',
+    'worker_script', 'inference_lock', 'excerpt_selection',
 )
 RUNTIME_CONTEXT_NAMES = ('execution_paths', 'artifact_root', 'limits', 'parameter_policy')
 RUNTIME_LIMIT_NAMES = ('max_duration_s', 'max_download_bytes')

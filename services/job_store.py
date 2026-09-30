@@ -18,7 +18,27 @@ import uuid
 
 # Only plugin-side validation of the current NapCat codec + registered Host
 # gateway may assign this version. A historic consent_event alone is unsafe.
-TRUSTED_QQ_INGRESS = 'napcat-host-route-v1'
+TRUSTED_QQ_INGRESS = 'napcat-direct-text-v2'
+DELIVERY_MODES = frozenset(('file','voice'))
+RENDER_MODES = frozenset(('full','excerpt'))
+JOB_PROGRESS_STAGES = ('starting','resolving','downloading','separating','excerpt',
+                       'converting','encoding','validating','publishing')
+
+
+def request_modes(request: Dict[str, Any]) -> Tuple[str, str, bool]:
+    """Validate public render/delivery modes without rewriting legacy requests."""
+    if not isinstance(request,dict):
+        raise ValueError('Expected request object')
+    delivery_mode = request.get('delivery_mode','voice')
+    render_mode = request.get('render_mode','full')
+    instrumental = request.get('instrumental',False)
+    if not isinstance(delivery_mode, str) or delivery_mode not in DELIVERY_MODES:
+        raise ValueError('Invalid delivery mode')
+    if not isinstance(render_mode, str) or render_mode not in RENDER_MODES:
+        raise ValueError('Invalid render mode')
+    if type(instrumental) is not bool:
+        raise ValueError('instrumental must be bool')
+    return delivery_mode,render_mode,instrumental
 
 
 def trusted_delivery_request(request: Dict[str, Any]) -> bool:
@@ -192,6 +212,7 @@ class JobStore:
             _text(consent_event,'explicit auto-reply consent')
         elif consent_event is not None:
             raise ValueError('Consent event supplied without auto_reply')
+        request_modes(request)
         document = _json(request)
         digest = hashlib.sha256(document.encode()).hexdigest()
         with self._transaction() as db:
@@ -230,6 +251,7 @@ class JobStore:
             raise ValueError('Consent event supplied without auto_reply')
         if type(ttl_s) is not int or not 30 <= ttl_s <= 1800:
             raise ValueError('Invalid offer expiry')
+        request_modes(request)
         document = _json(request)
         digest = hashlib.sha256(document.encode()).hexdigest()
         with self._transaction() as db:
@@ -479,7 +501,7 @@ class JobStore:
         return row
 
     def progress(self, job_id: str, run_token: str, *, stage: str, done: int, total: int) -> Job:
-        stages = ('starting','resolving','downloading','separating','converting','encoding','validating','publishing')
+        stages = JOB_PROGRESS_STAGES
         if stage not in stages or type(done) is not int or type(total) is not int or not 0 <= done <= total <= 60:
             raise ValueError('Invalid stage progress')
         with self._transaction() as db:
@@ -547,8 +569,13 @@ class JobStore:
             if not db.execute('''SELECT 1 FROM store_settings
                     WHERE namespace='artifact_store.v1' AND key='root' ''').fetchone():
                 raise JobConflict('Artifact root is not bound; delivery claim refused')
+            request = json.loads(row['request_json'])
+            try:
+                request_modes(request)
+            except ValueError as exc:
+                raise JobConflict('Persisted request has invalid delivery or render modes') from exc
             if (not row['consent_event']
-                    or not trusted_delivery_request(json.loads(row['request_json']))):
+                    or not trusted_delivery_request(request)):
                 raise JobConflict('No verified QQ ingress and explicit authorization to auto-reply')
             return self._change(db,row,'delivery_claimed',delivery_state='dispatching',delivery_token=uuid.uuid4().hex)
 

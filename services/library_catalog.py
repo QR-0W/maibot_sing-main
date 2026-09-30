@@ -128,6 +128,23 @@ def _seconds(value: Any) -> str:
 
 
 def _excerpt(data: dict[str, Any]) -> str:
+    recipe = data.get('recipe')
+    if isinstance(recipe, dict) and recipe.get('render_mode') == 'excerpt':
+        from ..runtime.excerpt_selection import validate_selection, ExcerptSelectionError
+        try:
+            selection = validate_selection(data.get('selection'))
+        except ExcerptSelectionError as exc:
+            raise ValueError('Invalid catalog selection evidence') from exc
+        ranges = selection['source_ranges']
+        rate = selection['sample_rate']
+        def timestamp(frame):
+            milliseconds = (frame*1000 + rate//2)//rate
+            minutes, remainder = divmod(milliseconds, 60000)
+            seconds, fraction = divmod(remainder, 1000)
+            return f'{minutes:02d}分{seconds:02d}.{fraction:03d}秒'
+        bounds = '+'.join(f'{timestamp(item["start_frame"])}至{timestamp(item["end_frame"])}'
+                          for item in ranges)
+        return bounds + ('拼接' if len(ranges) > 1 else '片段')
     source = data['source']
     if source.get('type') == 'local':
         provenance = data.get('excerpt_provenance')
@@ -254,7 +271,7 @@ def _rebuild_locked(root: Path, *, skip_corrupt: bool = False,
     _managed_text(root / 'library-index.json', json.dumps(index, ensure_ascii=False, indent=2) + '\n', index=True)
     lines = [MARKER, '# 翻唱成品库', '', '在 songs 目录按歌手、歌名、音色、片段和伴奏模式找文件；末尾短 ID 用于区分版本。',
              '这里是原成品的硬链接，不重新编码、不额外复制音频数据；删除一个名称不会删除另一个，原地改写或改权限则会影响两者。',
-             '来源范围未独立核验；未记录起点的旧片段如实标注，不冒充整曲。', '',
+             '新选段源时间显示到毫秒（舍入），+ 表示按顺序拼接；metadata.json 保留阶段回执与精确源帧半开区间 [起点,终点)。旧来源范围未独立核验，未记录起点的片段不冒充整曲。', '',
              '| 歌手 | 歌名 | 音色 | 范围 | 模式 | 音频 |', '| --- | --- | --- | --- | --- | --- |']
     for entry in entries:
         fields = [entry[field].replace('|', '\\|').replace('[', '\\[').replace(']', '\\]')

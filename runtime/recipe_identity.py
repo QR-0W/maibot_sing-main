@@ -8,10 +8,13 @@ import hashlib
 import json
 import re
 
-SCHEMA = 'sing-render-v2'
-HASH_NAMES = ('source', 'model', 'index', 'hubert', 'demucs_repo',
-              'rvc_script', 'rvc_upstream', 'media_stage', 'worker',
-              'render_plan', 'stage_executor')
+SCHEMA = 'sing-render-v3'
+LEGACY_SCHEMA = 'sing-render-v2'
+READABLE_SCHEMAS = (LEGACY_SCHEMA, SCHEMA)
+LEGACY_HASH_NAMES = ('source', 'model', 'index', 'hubert', 'demucs_repo',
+                     'rvc_script', 'rvc_upstream', 'media_stage', 'worker',
+                     'render_plan', 'stage_executor')
+HASH_NAMES = (*LEGACY_HASH_NAMES, 'excerpt_selection')
 VERSION_NAMES = ('python','numpy','torch','torchaudio','demucs','soundfile',
                  'librosa','pyworld','faiss','fairseq','scipy','praat-parselmouth',
                   'torchcrepe','omegaconf','numba','ffmpeg','libmp3lame')
@@ -23,13 +26,15 @@ class RecipeError(ValueError):
 
 def recipe_document(*, provider, track_id, hashes, versions, steps,
                     workspace, worker_python, worker_script, rvc_script,
-                    model, index, hubert, demucs_repo):
+                    model, index, hubert, demucs_repo, render_mode='full'):
     """Canonical identity, with local filesystem paths replaced by placeholders.
 
     Settings are sourced from exactly the argv tuples later executed, so chunk
     policy, original pitch, separation, gain, interpolation and encoding changes
     cannot silently reuse an old artifact if the corresponding code hashes change.
     """
+    if not isinstance(render_mode,str) or render_mode not in ('full','excerpt'):
+        raise RecipeError('Invalid render mode')
     if provider not in ('163','qq') or not isinstance(track_id,str) or not re.fullmatch('[A-Za-z0-9_-]{1,100}',track_id):
         raise RecipeError('Invalid selected provider and ID')
     if not isinstance(hashes,dict) or set(hashes)!=set(HASH_NAMES):
@@ -72,18 +77,29 @@ def recipe_document(*, provider, track_id, hashes, versions, steps,
             argv.append(token)
         normalized.append({'name':step.name,'argv':argv,'timeout_s':step.timeout_s,
                            'inputs':list(step.inputs),'outputs':list(step.outputs)})
-    return {'schema':SCHEMA,'provider':provider,'track_id':track_id,
-            'hashes':dict(hashes),'versions':dict(versions),'steps':normalized}
+    return validate_document({'schema':SCHEMA,'provider':provider,'track_id':track_id,
+            'render_mode':render_mode,
+            'hashes':dict(hashes),'versions':dict(versions),'steps':normalized})
 
 
 def validate_document(document):
     """Validate persisted recipes too, not only documents built in this process."""
-    if not isinstance(document,dict) or set(document)!= {'schema','provider','track_id','hashes','versions','steps'} or document['schema']!=SCHEMA:
+    if not isinstance(document,dict) or document.get('schema') not in READABLE_SCHEMAS:
         raise RecipeError('Unrecognized render recipe schema')
+    current = document['schema'] == SCHEMA
+    fields = {'schema','provider','track_id','hashes','versions','steps'}
+    if current:
+        fields.add('render_mode')
+    if set(document) != fields:
+        raise RecipeError('Unrecognized render recipe fields')
+    if current and (not isinstance(document['render_mode'],str)
+                    or document['render_mode'] not in ('full','excerpt')):
+        raise RecipeError('Invalid render mode')
+    hash_names = HASH_NAMES if current else LEGACY_HASH_NAMES
     if (document['provider'] not in ('163','qq') or not isinstance(document['track_id'],str)
             or not re.fullmatch('[A-Za-z0-9_-]{1,100}',document['track_id'])):
         raise RecipeError('Invalid source identity')
-    for field,names,pattern in (('hashes',HASH_NAMES,'[0-9a-f]{64}'),
+    for field,names,pattern in (('hashes',hash_names,'[0-9a-f]{64}'),
                                  ('versions',VERSION_NAMES,'[0-9A-Za-z.+_~!-]{1,80}')):
         values=document[field]
         if (not isinstance(values,dict) or set(values)!=set(names) or
@@ -130,6 +146,28 @@ def validate_document(document):
     option = separate['argv'].index('--demucs-repo')
     if option + 1 >= len(separate['argv']) or separate['argv'][option + 1] != '${DEMUCS_REPO}':
         raise RecipeError('Separation stage must bind the inventoried Demucs repo')
+    if current:
+        for step in steps:
+            if step['name'] not in ('separate','excerpt','mix'):
+                continue
+            argv = step['argv']
+            if argv.count('--render-mode') != 1:
+                raise RecipeError('Media stage requires one explicit render mode')
+            position = argv.index('--render-mode')
+            if position + 1 >= len(argv) or argv[position + 1] != document['render_mode']:
+                raise RecipeError('Media stage render mode differs from recipe')
+        excerpt = next((step for step in steps if step['name'] == 'excerpt'), None)
+        if document['render_mode'] == 'excerpt':
+            if (excerpt is None or excerpt['inputs'] != ['vocals.wav','backing.wav']
+                    or set(excerpt['outputs']) != {'vocal_000.wav','excerpt_backing.wav','selection.json'}
+                    or [step['name'] for step in steps] !=
+                       ['decode','separate','excerpt','convert_000','mix','encode','validate']
+                    or 'selection.json' not in steps[4]['inputs']
+                    or 'excerpt_backing.wav' not in steps[4]['inputs']):
+                raise RecipeError('Excerpt mode requires the synchronized selection plan')
+        elif excerpt is not None or any('selection.json' in step['inputs'] + step['outputs']
+                                        for step in steps):
+            raise RecipeError('Full mode cannot contain an excerpt selection plan')
     return document
 
 

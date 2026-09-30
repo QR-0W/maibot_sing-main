@@ -1,6 +1,6 @@
 # 0.5.0 配置契约（开发中，尚未部署）
 
-本契约描述当前隔离分支，不是启用指令。配置结构以 [plugin.py](../plugin.py) 的 `SingPluginConfig` 为准，依赖与版本范围以 [_manifest.json](../_manifest.json) 为准。遵循 MaiBot 官方[配置管理](https://docs.mai-mai.org/plugin/config)与[生命周期](https://docs.mai-mai.org/plugin/lifecycle)约定。
+本契约描述 `feat/conversational-singing`：**尚未合并、尚未部署**，不是启用指令。本次不部署运行 profile、不测试真实 QQ；manifest 与配置版本均保持 `0.5.0`。配置结构以 [plugin.py](<../plugin.py>) 的 `SingPluginConfig` 为准，依赖与版本范围以 [_manifest.json](<../_manifest.json>) 为准。遵循 MaiBot 官方 [Vibe Coding 指南](https://docs.mai-mai.org/plugin/vibe-coding)、[配置管理](https://docs.mai-mai.org/plugin/config)与[生命周期](https://docs.mai-mai.org/plugin/lifecycle)约定。完整语法与速度 B 说明见[对话式翻唱](<CONVERSATIONAL_SINGING.md>)。
 
 ## 配置来源与兼容性
 
@@ -32,17 +32,31 @@
 
 ## 请求、选曲和明确许可
 
+同一个 `@Command("翻唱")` 同时匹配斜杠与严格自然语法，沿用 Host Command 的禁用/权限检查；不是 Hook 副作用，也不接受 Tool 提供的身份，不是任意 LLM 聊天触发。
+
+| 入口 | 默认渲染 | 默认伴奏 | 默认投递格式 |
+|---|---|---|---|
+| `/翻唱 准确歌名 - 艺人名` | `full` 整曲 | 有伴奏 | `file` |
+| `唱一下《准确歌名 - 艺人名》`、`唱一段《…》`、`唱《…》` | `excerpt` 12–18 秒 | 干声、无伴奏 | `voice` |
+
+以下只是语法示例，不执行、不向真实 QQ 发送：
+
 ```text
-/翻唱 准确歌名 - 艺人名
-/翻唱 准确歌名 - 艺人名 --album 专辑名 --source-id 平台曲目ID --with-instrumental --auto-reply
+/翻唱 Creep - Radiohead
+唱一下《Creep - Radiohead》
+唱一段《Creep - Radiohead》 --full --with-instrumental --file
+/翻唱 Creep - Radiohead --excerpt --without-instrumental --voice --auto-reply
 /翻唱选择 任务ID 序号
 /翻唱状态 任务ID
 /翻唱取消 任务ID
 ```
 
-- `--auto-reply` 必须位于最后；仅该显式参数表示同意在完成后向原会话自动发送一次。没有该参数时仅保存结果，不请求自动投递。
+- 两入口均可显式覆盖 `--full` / `--excerpt`、`--with-instrumental` / `--without-instrumental`、`--file` / `--voice`；各维度最多出现一次，冲突和同值重复均拒绝。
+- 保留 `--album 专辑名`、`--source-id 平台曲目ID`、`-v 管理员固定音色`，每个选择器也只能出现一次；不能用 `-v` 传任意路径。未知选项、缺值和额外闲聊拒绝。
+- **两入口都只有原文末尾唯一字面量 `--auto-reply` 才授权完成后自动投递最多一次；没有这个原文 flag 均只生成保存，不自动发送音频。** `file` / `voice` 仅为格式，不是许可；合法 Command 的任务/候选/状态文本响应不受此音频开关替代。
 - 所有可能向 stream 回复的 Command（含 `/说`、音色列表、扫码、登录态和停用 Cookie 错误响应）在任何发送、搜索、模型或任务入队前，先核原始宿主消息 ID、QQ 平台、会话、用户和文本；缺可信来源时连拒绝消息也**不向该 stream 发送**。当前只接受当前 NapCat codec 的 `additional_config.self_id`/`napcat_message_type`/目标群或用户字段，与已注册 Host gateway 添加的非空 `platform_io_account_id` 自洽；显式拒绝 `webui_virtual_group_`。缺字段的旧适配器 QQ 消息将安全拒绝，不允许降级；普通 WebUI 和 WebUI 虚拟 QQ 均不作为生产测试沙箱。这是固定版本的当前 Host/NapCat 信任边界，不是抵御有网关 RPC 权限恶意插件的加密签名。
-- `--auto-reply` 从可信原始文本解析；候选约束与许可参与请求内容一致性检查。持久 request 必须带固定 `napcat-host-route-v1` 来源证明。旧无此证明的 `pending` 即使存有消息 ID/许可，在候选扫描及单事务 `claim_delivery` 中双重拒绝，不追认、不自动发 QQ；若需继续，只能由真正 QQ 用户重新发送新命令。
+- raw Host 仅接受 1–32 个直接 `{type: "text", data: "…"}` 组件，不接受额外组件键；用单个空格拼接后 ≤2048 字符，必须与 Host `processed_plain_text` 和 handler `text` 完全一致。拒绝 @、引用、语音、转发、card 和 notify；`is_notify` 必须为 `False`，`reply_to` 可省略或为 `None`，任何其他非 `None` 值均拒绝。不能把嵌套/媒体转写文字当成直接文本。
+- `--auto-reply` 从上述可信原文解析；候选约束、模式与许可参与请求一致性检查。持久 request 必须带 `napcat-direct-text-v2` 来源证明。旧 v1（`napcat-host-route-v1`）及缺证明的 `pending` 即使存有消息 ID/许可，在扫描及事务 `claim_delivery` 中也双重拒绝，不追认、不自动发 QQ；已 `sent`/`unknown` 不重发。不能通过手改记录补证明；需要新任务时由真实用户自行从可信原会话发起。
 - 多个候选保留展示顺序，由用户选择；选定后只解析该平台和曲目 ID。不可下载、仅试听或过长时不换另一条录音。标注时长只能检查媒体长度一致性，不能证明 studio 或使用权。
 - 候选快照默认有效 600 秒。接纳前及调度周期会有界回收过期候选和遗留半提交搜索（每轮至多 100 项），保留记录并撤销待投递许可；重复同一消息不会延长有效期。过期后请发起新请求，不选择旧快照。
 - 当前 Host 的 Tool 参数不是可信原始消息身份，因此 Tool 只给出原会话 Command 指引，不凭模型参数入队或投递。不能把“自然语言默认第一候选”的纯选择函数误称为已完成可信 Tool 自动任务集成。

@@ -36,6 +36,7 @@ from .services.delivery_outbox import CustomVoiceSender, DeliveryOutbox
 from .services.job_service import JobService, RenderRuntime, RENDER_PARAMETER_POLICY
 from .services.job_store import TRUSTED_QQ_INGRESS, JobConflict, JobNotFound, JobStore
 from .services.ownership import OwnershipBusy, exclusive
+from .services.request_options import COVER_COMMAND_PATTERN, parse_request_text, validate_direct_host_text
 from .services.source_offer import normalized
 from .services.stage_coordinator import StageCoordinator
 from .services.unit_runner import UnitRunner
@@ -540,7 +541,8 @@ class SingPlugin(MaiBotPlugin):
             demucs_repo=path('demucs_repo_path'),rvc_script=path('rvc_script'),
             rvc_upstream=path('rvc_upstream_path'),media_stage=runtime_dir/'media_stage.py',
             worker=runtime_dir/'worker.py',render_plan=runtime_dir/'render_plan.py',
-            stage_executor=runtime_dir/'stage_executor.py')
+            stage_executor=runtime_dir/'stage_executor.py',
+            excerpt_selection=runtime_dir/'excerpt_selection.py')
         inventory=AssetInventory(asset_paths,RuntimeVersionProbe(path('worker_python')))
         runtime=RenderRuntime(
             work_root=root/'jobs',worker_python=path('worker_python'),
@@ -556,6 +558,7 @@ class SingPlugin(MaiBotPlugin):
             'media_stage':runtime_dir/'media_stage.py','worker':runtime_dir/'worker.py',
             'render_plan':runtime_dir/'render_plan.py',
             'stage_executor':runtime_dir/'stage_executor.py',
+            'excerpt_selection':runtime_dir/'excerpt_selection.py',
             'worker_python':path('worker_python'),'worker_script':runtime_dir/'media_stage.py',
             'inference_lock':path('inference_lock')}
         runtime_context={
@@ -985,11 +988,13 @@ class SingPlugin(MaiBotPlugin):
         if any(not isinstance(value, str) or not value.strip() or len(value) > 256
                for value in values.values()):
             raise ValueError('宿主消息身份不完整，拒绝自动投递')
-        if (stream_id != values['stream_id'] or kwargs.get('platform') != values['platform']
+        if (not isinstance(kwargs.get('text'), str) or not kwargs['text'].strip()
+                or stream_id != values['stream_id'] or kwargs.get('platform') != values['platform']
                 or kwargs.get('user_id') != values['user_id']
                 or kwargs.get('text') != message.get('processed_plain_text')
                 or message.get('is_command') is not True):
             raise ValueError('宿主消息与会话/平台/用户不匹配，拒绝自动投递')
+        validate_direct_host_text(message, kwargs['text'])
         # Current trusted NapCat codec supplies self_id/message_type/target;
         # Host's registered gateway adds its independently resolved account_id.
         # WebUI virtual QQ supplies only at_bot, even with a real QQ group ID.
@@ -1122,8 +1127,8 @@ class SingPlugin(MaiBotPlugin):
 
     @Command(
         "翻唱",
-        description="用克隆音色翻唱歌曲（搜歌 → 人声分离 → 换音色）",
-        pattern=r"^(?P<pfx>\S)翻唱\s+(?P<query>.+?)(?:\s+--album\s+(?P<album>.+?))?(?:\s+--source-id\s+(?P<source_id>[A-Za-z0-9_-]+))?(?:\s+-v\s+(?P<model>\S+))?(?:\s+(?P<instrumental>--with-instrumental))?(?:\s+(?P<auto_reply>--auto-reply))?$",
+        description="/翻唱 默认完整伴奏文件；唱一下《歌名 - 艺人》默认清唱片段语音；仅末尾 --auto-reply 授权自动投递",
+        pattern=COVER_COMMAND_PATTERN,
         timeout_ms=45_000,  # only bounded catalogue search and ledger writes
 
     )
@@ -1132,28 +1137,15 @@ class SingPlugin(MaiBotPlugin):
         if identity is None:
             return False, '未验证的 QQ 命令来源', True
         try:
+            # No Hook/cache binding: both syntaxes arrive through this same Host
+            # Command after chat-disable/operator checks. Every request selector,
+            # including consent, comes only from the validated original text.
+            options = parse_request_text(kwargs['message']['processed_plain_text'])
             active=self._require_active_cover()
-            # Tool/kwargs groups cannot grant consent: parse the Host's original
-            # Command text rather than trusting a separately supplied group.
-            command_match = re.fullmatch(
-                r'\S翻唱\s+(?P<query>.+?)(?:\s+--album\s+(?P<album>.+?))?'
-                r'(?:\s+--source-id\s+(?P<source_id>[A-Za-z0-9_-]+))?'
-                r'(?:\s+-v\s+(?P<model>\S+))?'
-                r'(?:\s+(?P<instrumental>--with-instrumental))?'
-                r'(?:\s+(?P<auto_reply>--auto-reply))?', kwargs['text'])
-            if command_match is None:
-                raise ValueError('翻唱命令格式无效；--auto-reply 只能放在最后')
-            matched = command_match.groupdict()
-            query = str(matched.get('query') or '').strip()
-            model = str(matched.get('model') or '').strip()
-            album = str(matched.get('album') or '').strip()
-            source_id = str(matched.get('source_id') or '').strip()
-            auto_reply = matched.get('auto_reply') == '--auto-reply'
+            query, model = options.query, options.model_selector
+            album, source_id = options.album, options.source_id
+            auto_reply = options.auto_reply
             consent_event = identity['message_id'] if auto_reply else None
-            if re.search(r'\s(?:--[A-Za-z-]+|-v)(?=\s|$)', query):
-                raise ValueError('命令参数顺序无效；--auto-reply 只能放在最后')
-            if not query or ' - ' not in query or not query.rsplit(' - ', 1)[-1].strip():
-                raise ValueError('请用 /翻唱 准确歌名 - 艺人名；来源需在候选列表明确选定')
             if model and model not in active.model_aliases:
                 raise ValueError('只能使用管理员固定配置的音色')
             if identity['platform']!='qq':
@@ -1162,7 +1154,8 @@ class SingPlugin(MaiBotPlugin):
             provider=active.provider
             request={'query':query,'provider':provider,'platform':identity['platform'],
                      'user_id':identity['user_id'],
-                     'instrumental':matched.get('instrumental')=='--with-instrumental',
+                     'entry_kind':options.entry_kind,'render_mode':options.render_mode,
+                     'delivery_mode':options.delivery_mode,'instrumental':options.instrumental,
                      'album':album,'source_id':source_id,'model_selector':model,
                      'model':active.default_model,'model_path':active.model_path,
                      'auto_reply':auto_reply,'ingress_proof':TRUSTED_QQ_INGRESS}
@@ -1502,7 +1495,9 @@ class SingPlugin(MaiBotPlugin):
             "不能只填歌名。本 Tool 不拥有可信原始用户 message_id，仅提供 /翻唱 命令授权指引；不会入队、渲染或自动发送。"
             "注意：用户只是想听这首歌的原唱/原曲时（如「放一首XX」「发一首XX」「来一首XX的歌」"
             "「放XX听听」），不要调用本工具，应改用 search_and_play_music。"
-            "请提示用户亲自发送 /翻唱 准确歌名 - 艺人名：缺省只保存并允许查询状态，不自动发送；仅用户明确要求完成后自动回复时在命令最后加 --auto-reply。涉及歌曲选择须用 /翻唱选择。"
+            "请提示用户亲自发送 /翻唱 准确歌名 - 艺人名（默认完整伴奏文件），或 唱一下《准确歌名 - 艺人名》（默认清唱片段语音）。"
+            "可用 --full/--excerpt、--with-instrumental/--without-instrumental、--file/--voice 独立覆盖。"
+            "两种入口缺省只保存并允许查询状态，不自动发送；仅本人明确要求完成后自动回复时在原消息最后加 --auto-reply。涉及歌曲选择须用 /翻唱选择。"
             "任何 stream_id、source_id 或其它工具参数均不可作为自动投递授权。"
         ),
         activation_type=ActivationType.ALWAYS,
@@ -1510,19 +1505,26 @@ class SingPlugin(MaiBotPlugin):
 
         parameters=[
             ToolParameterInfo(name="query", param_type=ToolParamType.STRING, description="准确歌名 - 艺人名；必须包含艺人，不能仅用关键词", required=True),
-            ToolParameterInfo(name="with_instrumental", param_type=ToolParamType.BOOLEAN, description="是否混入伴奏（默认 false）", required=False),
+            ToolParameterInfo(name="instrumental", param_type=ToolParamType.BOOLEAN, description="用户偏好的伴奏模式，仅供建议，不提交请求或授予投递许可", required=False),
+            ToolParameterInfo(name="render_mode", param_type=ToolParamType.STRING, description="用户偏好的 full 或 excerpt，仅供建议", required=False),
+            ToolParameterInfo(name="delivery_mode", param_type=ToolParamType.STRING, description="用户偏好的 file 或 voice，仅供建议，不是自动投递许可", required=False),
             ToolParameterInfo(name="album", param_type=ToolParamType.STRING, description="用户明确选择的专辑，可选；不得根据时长猜测", required=False),
             ToolParameterInfo(name="source_id", param_type=ToolParamType.STRING, description="用户明确选择的返回候选曲目ID，可选；不得编造", required=False),
         ],
     )
-    async def handle_cover_tool(self, query: str = "", with_instrumental: bool = False, stream_id: str = "", album: str | None = None, source_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
-        # Tool arguments may contain a fabricated stream_id and do not include an
-        # authenticated original message_id. Never convert them into consent.
-        del stream_id, album, source_id, with_instrumental, kwargs
-        title = query.strip() if isinstance(query, str) else ''
-        if not title:
-            return {'content': '请向用户询问准确歌名 - 艺人名。Tool 无权发起自动投递。'}
-        return {'content': f'请用户本人发送 /翻唱 {title} 发起任务（缺省只保存、可查状态，不自动发语音）；若本人明确希望完成后自动回复，请在命令最后加 --auto-reply。本次仅提供说明，未搜索、未入队、未发送语音。'}
+    async def handle_cover_tool(self, query: str = "", **kwargs: Any) -> dict[str, Any]:
+        # Even an apparently complete message/identity is model-controlled here.
+        # Never bind Tool calls through hooks, recent messages or fabricated IDs.
+        # Static guidance also prevents query text from smuggling consent flags
+        # into a suggested ready-to-send command.
+        del query, kwargs
+        return {'content': (
+            '请用户本人发送 /翻唱 准确歌名 - 艺人名（默认完整伴奏文件），'
+            '或 唱一下《准确歌名 - 艺人名》（默认清唱片段语音）。'
+            '可用 --full/--excerpt、--with-instrumental/--without-instrumental、--file/--voice 独立覆盖，'
+            '用 --album 或 --source-id 明确版本。两种入口缺省只保存、可查状态，不自动投递；'
+            '只有本人明确希望完成后自动回复，才在原消息最后加 --auto-reply。'
+            'Tool 参数不能授权；本次仅提供说明，未搜索、未入队、未发送消息。')}
 
     @Tool(
         "speak_voice",

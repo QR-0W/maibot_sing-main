@@ -74,6 +74,28 @@ def test_consent_required_and_never_implicitly_added(store):
     assert store.claim_delivery(job.id,job.stream_id) is None
 
 
+@pytest.mark.parametrize('field,invalid', [
+    (field, invalid)
+    for field in ('delivery_mode', 'render_mode')
+    for invalid in ('invalid', '', None, True, 1, [], {})
+] + [('instrumental', invalid) for invalid in (None, 0, 1, 'false', [], {})])
+def test_invalid_public_request_modes_are_rejected_before_admission(store, field, invalid):
+    payload = {field: invalid}
+    with pytest.raises(ValueError):
+        store.submit('a', 'legacy', payload)
+    with pytest.raises(ValueError):
+        store.admit_offer('a', 'atomic', payload, catalogue())
+    assert store.find_request('a', 'legacy') is None
+    assert store.find_request('a', 'atomic') is None
+
+
+
+def test_legacy_and_explicit_public_request_modes(store):
+    assert ledger.request_modes({})==('voice','full',False)
+    assert ledger.request_modes({'delivery_mode':'file','render_mode':'excerpt',
+                                 'instrumental':True})==('file','excerpt',True)
+
+
 def test_atomic_admission_commits_offer_and_optional_single_selection(store):
     request={'query':'radiohead creep','asset_generation':'generation-a'}
     single, created = store.admit_offer('a','single',request,catalogue()[:1])
@@ -414,3 +436,26 @@ def test_queue_cap_applies_to_searching_and_history_is_monotonic(store):
     assert [e['revision'] for e in history]==[0,1]
     with pytest.raises(JobNotFound):
         store.history(job.id,'b')
+
+
+@pytest.mark.parametrize('delivery_mode', ['file', 'voice'])
+@pytest.mark.parametrize('render_mode', ['full', 'excerpt'])
+@pytest.mark.parametrize('instrumental', [False, True])
+def test_mode_combinations_persist_unchanged_across_restart(
+        store, delivery_mode, render_mode, instrumental):
+    payload = dict(delivery_mode=delivery_mode, render_mode=render_mode,
+                   instrumental=instrumental)
+    job, created = store.admit_offer('a', 'modes', payload, catalogue())
+    assert created
+    reopened = JobStore(store.path)
+    assert reopened.get(job.id, 'a').request == payload
+    assert ledger.request_modes(payload) == (delivery_mode, render_mode, instrumental)
+    again, created = reopened.admit_offer('a', 'modes', payload, catalogue())
+    assert not created and again.id == job.id
+
+
+def test_legacy_request_is_not_rewritten_on_admission_or_restart(store):
+    job, _ = store.admit_offer('a', 'legacy', {'query': 'creep'}, catalogue())
+    persisted = JobStore(store.path).get(job.id, 'a')
+    assert persisted.request == {'query': 'creep'}
+    assert ledger.request_modes(persisted.request) == ('voice', 'full', False)

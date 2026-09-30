@@ -1,5 +1,24 @@
 # Changelog
 
+## 未发布 — feat/conversational-singing
+
+此功能分支尚未合并、尚未部署；manifest 与配置版本保持 `0.5.0`。下方原 `0.5.0` 的测试与验收记录保留为历史基线，不是本功能分支全量通过声明。
+
+### 功能
+- 同一个 `@Command("翻唱")` 接受 `/翻唱 歌名 - 艺人` 与严格 `唱一下《歌名 - 艺人》` / `唱一段《…》` / `唱《…》`，不使用 Hook 副作用或 Tool 身份，不处理任意 LLM 聊天。
+- command 默认整曲/伴奏/file，natural 默认 12–18 秒片段/干声/voice。可用 `--full/--excerpt`、`--with-instrumental/--without-instrumental`、`--file/--voice` 独立覆盖；同维度冲突、重复和未知选项拒绝。保留 `--album`、`--source-id`、`-v`。
+- **两入口都只有原文末尾唯一 `--auto-reply` 才授予自动投递许可；否则仅生成保存，不自动发送音频。** file/voice 不是许可。
+- 速度 B：先分离整曲，再以 50 ms RMS/flatness 声学启发式选择一段，不足时选两段按原时间顺序拼接；保留 ≤0.6 秒换气、丢弃 <1.2 秒碎片、低能量端点、50/120 ms 淡入淡出及 RMS 归一，片段仅执行一次 RVC。不声称副歌识别、语义乐句边界、音质改善或固定耗时。
+- metadata 保存精确 source frame ranges、selection 及其阶段 receipt，目录毫秒标签仅为舍入显示。新 `sing-render-v3` 绑定 selector 源码 hash、`render_mode` 与实际 argv；`delivery_mode` 不改变音频缓存。已完成 v2 成品只读兼容，旧 v2 运行中 plan 不直接升级续跑。
+
+### 授权与验证边界
+- raw Host 仅接纳直接 text（1–32 段，空格拼接后 ≤2048 字符），拒绝 @、引用、语音、转发、card、notify；`reply_to` 缺省/`None` 可用，任何其他非 `None` 值拒绝。QQ 网关/路由检查仍保留，来源证明升级为 `napcat-direct-text-v2`；旧 v1 pending 不自动投递，sent/unknown 不重发。
+- file/voice 均只尝试一次详细发送；必须 `sent=True` 且有效非空字符串 `message_id` 才记 sent，其余为 unknown，不切换格式 fallback、不自动重试。真实 QQ file 尚未测试，本次不部署 profile、不做 QQ 试发。
+- 已报告的目标测试：renderer **191 passed**；入口、Host real serializer、ledger/outbox **340 passed**。这不是全量结果，不将不同测试集合相加；全量结果另行记录。
+- 模型暂留现有 Iroha baseline，没有已证同身份更佳替代；sid0 可加载且输出 finite 不证明角色身份、素材权利或品质，人工听辨待做。私有研究报告、机器路径、模型 hash 日志、音频与 credentials 不随仓库提交。
+
+操作、复现命令与细节见 [对话式翻唱](<docs/CONVERSATIONAL_SINGING.md>)、[配置契约](<docs/CONFIG_CONTRACT.md>) 和 [SDK 合规审计](<docs/SDK_COMPLIANCE.md>)；遵循 [MaiBot 官方 Vibe Coding 指南](https://docs.mai-mai.org/plugin/vibe-coding)。
+
 ## 0.5.0（dev 发布候选，启用前须迁移配置）
 
 程序修订 `81203d7` 已通过 359 项测试、真实 Runner/SDK 的隔离生命周期与原始消息桥接验收，以及独立代码审查。真实整曲冷运行和同任务/同 unit 重启恢复、精确帧配方相等后的检查点复用分别验证；这些不是生产 QQ 投递或音质验收。发布源码不等于已启用现网，沙哑、speaker 身份和素材权利限制仍保留。

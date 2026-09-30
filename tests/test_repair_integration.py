@@ -143,11 +143,13 @@ async def test_command_reports_ambiguous_choices_without_sending(plugin):
 
 
 def test_cover_command_parses_explicit_album_and_id():
-    import ast,re
-    path=Path(plugin_module.__file__)
-    tree=ast.parse(path.read_text())
-    method=next(n for n in ast.walk(tree) if isinstance(n,ast.AsyncFunctionDef) and n.name=='handle_cover_command')
-    pattern=next(k.value.value for d in method.decorator_list for k in d.keywords if k.arg=='pattern')
-    match=re.fullmatch(pattern,'/翻唱 Creep - Radiohead --album The Best Of --source-id 22558968')
-    assert match['query']=='Creep - Radiohead'
-    assert match['album']=='The Best Of' and match['source_id']=='22558968'
+    import re
+    from test_plugin_async_lifecycle import plugin_module
+
+    text = '/翻唱 Creep - Radiohead --album The Best Of --source-id 22558968'
+    pattern = plugin_module.COVER_COMMAND_PATTERN
+    assert re.fullmatch(pattern, text)
+    options = plugin_module.parse_request_text(text)
+    assert options.query == 'Creep - Radiohead'
+    assert options.album == 'The Best Of' and options.source_id == '22558968'
+    assert (options.render_mode, options.instrumental, options.delivery_mode) == ('full', True, 'file')

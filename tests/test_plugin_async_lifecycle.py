@@ -57,7 +57,10 @@ def plugin(tmp_path, monkeypatch):
     async def no_login():
         pass
     class FakeCatalogue:
+        def __init__(self):
+            self.search_calls = []
         async def search(self, query, provider, *, limit):
+            self.search_calls.append((query, provider, limit))
             return [plugin_module.SongInfo('id-1', 'Song', 'Artist', 'Album', provider, duration_s=120),
                     plugin_module.SongInfo('id-2', 'Song Live', 'Artist', 'Album Live', provider, duration_s=125)]
         async def close(self):
@@ -80,6 +83,8 @@ def command(stream='stream-1', msg='platform-message-1', *, user='user-1', text=
             'matched_groups': groups or {'query': 'Song - Artist'},
             'message': {'message_id': msg, 'platform': 'qq', 'session_id': stream,
                         'processed_plain_text': text, 'is_command': True,
+                        'raw_message': [{'type': 'text', 'data': text}],
+                        'is_notify': False,
                         'message_info': {'user_info': {'user_id': user},
                                           'group_info': {'group_id': 'trusted-group', 'group_name': 'test'},
                                           'additional_config': {'self_id': 'test-bot',
@@ -91,6 +96,7 @@ def command(stream='stream-1', msg='platform-message-1', *, user='user-1', text=
 @pytest.mark.asyncio
 @pytest.mark.parametrize('handler,text,groups', [
     ('handle_cover_command', '/翻唱 Song - Artist --auto-reply', {'query':'Song - Artist'}),
+    ('handle_cover_command', '唱一下《Song - Artist》 --auto-reply', {'query':'Song - Artist'}),
     ('handle_cover_select', '/翻唱选择 ' + 'a'*32 + ' 1', {'job_id':'a'*32,'number':'1'}),
     ('handle_cover_status', '/翻唱状态 ' + 'a'*32, {'job_id':'a'*32}),
     ('handle_cover_cancel', '/翻唱取消 ' + 'a'*32, {'job_id':'a'*32}),
@@ -192,6 +198,8 @@ async def test_lifecycle_restarts_durable_service_without_deleting_offer(plugin)
     before = instance._jobs.store.get(job_id, 'stream-1')
     assert before.state == 'needs_selection' and before.consent_event is None
     assert before.delivery_state == 'not_requested'
+    assert (before.request['entry_kind'], before.request['render_mode'],
+            before.request['instrumental'], before.request['delivery_mode']) == ('command', 'full', True, 'file')
     async def fake_login():
         await asyncio.sleep(3600)
     login = asyncio.create_task(fake_login())

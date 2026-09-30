@@ -155,6 +155,7 @@ def make_service(tmp_path, *, store=None, catalogue=None, coordinator=None,
             'rvc_upstream':paths.rvc_upstream,'media_stage':paths.media_stage,
             'worker':paths.worker,'render_plan':paths.render_plan,
             'stage_executor':paths.stage_executor,'worker_python':python,
+            'excerpt_selection':paths.excerpt_selection,
             'worker_script':paths.media_stage,'inference_lock':inference_lock},
         'artifact_root':artifact_root,
         'limits':{'max_duration_s':runtime.max_duration_s,
@@ -632,3 +633,86 @@ async def test_request_metadata_rejects_signed_url_before_ledger_write(tmp_path)
         await instance.submit_selected('stream-e', 'rpc-message-5',
             {'instrumental': False, 'playback_url': 'https://signed.invalid/private'}, selected())
     assert service_module.SqliteJobScanner()(store, ('running', 'cancel_requested')) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field', ['render_mode','delivery_mode'])
+@pytest.mark.parametrize('bad', [None,True,False,0,[],{},'','FULL','excerpt '])
+async def test_invalid_modes_never_admit_or_download(tmp_path,field,bad):
+    instance,store,catalogue,coordinator,downloads=make_service(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            await instance.submit_selected('stream-invalid-mode','request-invalid-mode',
+                {field:bad},selected())
+        assert store.find_request('stream-invalid-mode','request-invalid-mode') is None
+        assert downloads==[] and coordinator.calls==[]
+    finally:
+        await instance.close()
+
+
+@pytest.mark.asyncio
+async def test_full_excerpt_cache_split_but_delivery_transport_does_not_change_audio(tmp_path):
+    instance,store,catalogue,coordinator,downloads=make_service(tmp_path)
+    observed=[]
+    assert instance._PROGRESS is ledger.JOB_PROGRESS_STAGES
+    progress=store.progress
+    def record(*args,**kwargs):
+        observed.append(kwargs['stage'])
+        return progress(*args,**kwargs)
+    store.progress=record
+    keys={}
+    try:
+        for render,delivery in [('full','file'),('excerpt','file'),('excerpt','voice')]:
+            request={'render_mode':render,'delivery_mode':delivery,'instrumental':True}
+            queued,_=await instance.submit_selected('stream-modes',render+'-'+delivery,
+                                                   request,selected('same-source'))
+            finished=await instance.run_once()
+            assert finished.state=='ready', finished.error
+            recipe=json.loads((instance.runtime.work_root/queued.id/'recipe.json').read_text())
+            assert recipe['render_mode']==render and recipe['schema']=='sing-render-v3'
+            assert ('excerpt' in [step['name'] for step in recipe['steps']])==(render=='excerpt')
+            keys[render,delivery]=finished.artifact_key
+        assert keys['full','file']!=keys['excerpt','file']
+        assert keys['excerpt','file']==keys['excerpt','voice']
+        assert 'excerpt' in observed
+        assert observed[observed.index('excerpt') + 2]=='converting'
+    finally:
+        await instance.close()
+
+
+@pytest.mark.asyncio
+async def test_excerpt_recovery_keeps_frozen_plan_and_does_not_download_again(tmp_path):
+    first,store,catalogue,coordinator,downloads=make_service(tmp_path,pause_first=True)
+    queued,_=await first.submit_selected('stream-excerpt-recovery','excerpt-recovery',
+        {'render_mode':'excerpt','delivery_mode':'file'},selected())
+    assert (await first.run_once()).state=='running'
+    path=first.runtime.work_root/queued.id/'recipe.json'
+    frozen=path.read_bytes()
+    await first.close()
+    second,_,_,resumed,resumed_downloads=make_service(tmp_path,store=ledger.JobStore(store.path))
+    try:
+        finished=await second.run_once()
+        assert finished.state=='ready' and resumed_downloads==[], finished.error
+        assert resumed.reconciles==['decode'] and resumed.calls[0:2]==['separate','excerpt']
+        assert path.read_bytes()==frozen
+    finally:
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_frozen_excerpt_selector_change_blocks_next_launch(tmp_path):
+    first,store,catalogue,coordinator,downloads=make_service(tmp_path)
+    first.coordinator=StopAfterFirstCoordinator(store)
+    queued,_=await first.submit_selected('stream-selector-change','selector-change',
+        {'render_mode':'excerpt','delivery_mode':'file'},selected())
+    with pytest.raises(asyncio.CancelledError):await first.run_once()
+    await first.close()
+    first.inventory.paths.excerpt_selection.write_bytes(b'changed selector')
+    second,_,_,resumed,resumed_downloads=make_service(tmp_path,store=ledger.JobStore(store.path))
+    try:
+        failed=await second.run_once()
+        assert failed.id==queued.id and failed.state=='failed'
+        assert failed.error['code']=='asset_inventory_changed'
+        assert resumed.calls==[] and resumed_downloads==[]
+    finally:
+        await second.close()

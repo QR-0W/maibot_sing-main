@@ -1,8 +1,43 @@
 # MaiBot Plugin SDK 合规审计
 
-最新核对：2026-09-30，程序修订 `81203d7`。初审日期：2026-09-29。
+当前文档核对：`feat/conversational-singing` 功能分支，尚未合并、尚未部署；manifest/config 仍为 `0.5.0`。初审及程序修订 `81203d7` 的结果保留为下方历史基线，不能套用于当前功能分支。
 
-## 当前验收摘要（替代下方历史状态）
+## 未发布功能分支：接口与证据范围
+
+以 [MaiBot 官方 Vibe Coding 指南](https://docs.mai-mai.org/plugin/vibe-coding)、[Manifest](https://docs.mai-mai.org/plugin/manifest)、[生命周期](https://docs.mai-mai.org/plugin/lifecycle)和[配置管理](https://docs.mai-mai.org/plugin/config)为基线。源码接口已落地，操作见[对话式翻唱](<CONVERSATIONAL_SINGING.md>)；本次不部署运行 profile、不测试 QQ，不修改 Host 环境或安装依赖。
+
+| 项目 | 当前实现与限制 |
+|---|---|
+| 组件与身份 | [入口](<../plugin.py>)的同一个 `@Command("翻唱")` 用[严格解析器](<../services/request_options.py>)匹配 `/翻唱 歌名 - 艺人` 与 `唱一下《歌名 - 艺人》` / `唱一段《…》` / `唱《…》`。沿用 Host Command 检查，不使用 Hook 副作用或 Tool 身份，不表示任意 LLM 聊天可触发。Tool 仍只提供 Command 指引。 |
+| 独立默认维度 | command = full/伴奏/file；natural = 12–18 秒 excerpt/干声/voice。`--full/--excerpt`、`--with-instrumental/--without-instrumental`、`--file/--voice` 独立覆盖，各维度冲突和重复均拒绝。保留 `--album`、`--source-id`、`-v`，选择器也不能重复。 |
+| 原文许可 | **两入口都只有原文末尾唯一 `--auto-reply` 才授权自动投递；没有它都只生成保存，不自动发送音频。** file/voice 不是许可。许可不从 Tool、匹配组或模型转述构造；合法任务文本响应与音频投递分开。 |
+| Host 直接文本 | raw 仅 1–32 个直接 text 组件，空格拼接后 ≤2048 字符，与 Host/handler 文本完全一致。拒绝 @、引用、语音、转发、card、notify；`reply_to` 可省略/`None`，其他非 `None` 值一律拒绝；保留 QQ 账号/目标/Host route 检查。不可信来源不发送拒绝消息。 |
+| 持久来源证明 | [账本](<../services/job_store.py>)使用 `napcat-direct-text-v2`；旧 v1（`napcat-host-route-v1`）及无证明 pending 在扫描和 claim 两处拒绝，不自动投递；sent/unknown 不重发。不是密码学签名，不能防御有网关权限的恶意插件。 |
+| 渲染与收据 | [计划](<../runtime/render_plan.py>)先整曲分离，再以[选择器](<../runtime/excerpt_selection.py>)的 50 ms RMS/flatness 选一段，不足则两段按原时间顺序拼接，保留 ≤0.6 秒换气、丢弃 <1.2 秒碎片，低能量端点 + 50/120 ms fade + RMS 归一，片段仅一次 RVC。不等于副歌识别、语义乐句边界、音质改善或固定耗时。 |
+| 音频身份 | [配方](<../runtime/recipe_identity.py>)为 `sing-render-v3`，含 selector 源码 hash、`render_mode` 与实际 argv；`delivery_mode` 不改变 audio cache。metadata 保存精确源帧、selection 与 excerpt receipt，[目录](<../services/library_catalog.py>)毫秒标签仅舍入显示。已完成 v2 成品只读兼容，旧 v2 运行中 plan 不能直接升级续跑。 |
+| 单次 file/voice | [Outbox](<../services/delivery_outbox.py>)调用 `ctx.send.custom(..., return_details=True)`；voice 用 voiceurl，file 用 file 的 `{url, name}`。只有 `sent is True` 且有效非空字符串 `message_id` 才记 sent，其余 unknown。仅上传成功不足以确认送达，不切换格式 fallback、不自动重试。独立 `/说` 仍为一次 voiceurl。 |
+
+### 已报告目标测试（不是全量验收）
+
+- renderer：**191 passed**，覆盖选择、计划、精确帧/收据与成品/缓存兼容相关目标测试。
+- 入口 + Host real serializer / ledger / outbox：**340 passed**，覆盖严格语法与 raw Host 直接文本、来源拒绝、许可冻结、两种投递格式及 detailed ack/不重复投递边界。
+- 上述为目标集合证据，不能相加或称当前全量通过；全量结果由后续独立记录给出。本次文档核对不重新运行这些测试，不将历史 359 项结果当作功能分支验证。
+- **真实 QQ file 未测试**。real serializer 是 Host 序列化契约证据，不是生产 QQ/NapCat 端到端送达；不在现有 profile 部署或做 QQ 试发。仍需单独授权的端到端验证、平台路径可读性确认及人工听辨。
+- 模型暂留现 Iroha baseline，没有已证同身份更佳替代；sid0 可加载且输出 finite 不证明角色、权利或品质，高音/沙哑问题未宣称修复。
+
+使用已有依赖的隔离测试解释器及只读 Host checkout，泛化复现命令：
+
+```bash
+MAIBOT_TEST_HOST_ROOT=/path/to/MaiBot python -m pytest tests -q
+```
+
+媒体测试需要隔离 media 环境中已有的 `soundfile`、NumPy 等依赖；缺依赖时选择正确既有环境或记录未执行，不修改 MaiBot 环境、不安装依赖补测试。版本/依赖权威来源仍为 [_manifest.json](<../_manifest.json>)，不改 manifest/config 版本。用户研究报告另存不提交；本机报告、真实路径、私有模型 hash 日志、音频、credentials 与运行数据库不复制到 Git。
+
+---
+
+## 历史 0.5.0 验收摘要（仅程序修订 81203d7）
+
+以下记录核对于 2026-09-30，初审日期 2026-09-29；其中“当前”“完整”仅指该历史修订，不包括上方未发布 feature。
 
 - 最终完整测试：指定当前 Host/已安装 SDK 后 **359 passed**；独立模式未提供 Host 时，两项 Host 专属测试按约定跳过。
 - 实际 MaiBot 1.3.0 Runner/PluginLoader、SDK 2.8.2 在私有目录完成配置生成/补齐、加载、self-config 热更、代码重载、部分初始化取消、单项 close 抛错后的其余资源清理、卸载和关停。IPC、Host 能力响应与音乐候选为假体，不连接生产聊天。

@@ -257,3 +257,21 @@ def test_symlinked_or_incomplete_inventory_is_refused(tmp_path):
     with pytest.raises(inventory.InventoryError) as error:
         inventory.AssetInventory(paths, lambda: incomplete).build(source)
     assert error.value.code == 'runtime_version_missing'
+
+
+def test_selector_bytes_and_execution_path_are_runtime_identity(tmp_path):
+    paths=assets(tmp_path)
+    service=inventory.AssetInventory(paths,versions)
+    context=generation_context(tmp_path,paths)
+    first=service.build_runtime()
+    generation=inventory.runtime_generation(first,context)
+    assert first.hashes['excerpt_selection']==hashlib.sha256(paths.excerpt_selection.read_bytes()).hexdigest()
+    paths.excerpt_selection.write_bytes(b'changed deterministic selection implementation')
+    changed=service.build_runtime()
+    assert changed.hashes['excerpt_selection']!=first.hashes['excerpt_selection']
+    assert inventory.runtime_generation(changed,context)!=generation
+    relocated=copy.deepcopy(context)
+    relocated['execution_paths']['excerpt_selection']=tmp_path/'other-selector.py'
+    assert inventory.runtime_generation(first,relocated)!=generation
+    incomplete=copy.deepcopy(context);incomplete['execution_paths'].pop('excerpt_selection')
+    with pytest.raises(inventory.InventoryError):inventory.runtime_generation(first,incomplete)

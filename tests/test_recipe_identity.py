@@ -40,7 +40,7 @@ def test_identity_has_no_private_path_and_is_stable():
 
 @pytest.mark.parametrize('field',[('hashes','model'),('hashes','hubert'),('hashes','demucs_repo'),
     ('hashes','source'),('hashes','rvc_upstream'),('hashes','worker'),('versions','pyworld'),
-    ('versions','ffmpeg')])
+    ('versions','ffmpeg'),('hashes','excerpt_selection')])
 def test_every_asset_change_invalidates_existing_cache(field):
     doc,_,_=document()
     other=copy.deepcopy(doc)
@@ -60,7 +60,7 @@ def test_pitch_chunk_alignment_and_hubert_path_are_explicit():
     assert doc['steps'][chunk]['argv'][doc['steps'][chunk]['argv'].index('--hubert')+1]=='${HUBERT}'
     sep=next(step for step in doc['steps'] if step['name']=='separate')
     assert sep['argv'][sep['argv'].index('--demucs-repo')+1]=='${DEMUCS_REPO}'
-    assert doc['schema']=='sing-render-v2'
+    assert doc['schema']=='sing-render-v3' and doc['render_mode']=='full'
 
 
 def test_v1_recipe_or_unbound_demucs_stage_cannot_be_reused():
@@ -86,3 +86,60 @@ def test_missing_assets_and_url_are_rejected():
     with pytest.raises(recipe.RecipeError):
         recipe.recipe_document(provider='163',track_id='1',hashes=doc['hashes'],
                                versions=doc['versions'],steps=malformed,**args)
+
+
+def test_v3_modes_have_separate_identity_and_cannot_relabel_plan():
+    full,args,_=document()
+    excerpt=recipe.recipe_document(provider='163',track_id='22558968',
+        hashes=full['hashes'],versions=full['versions'],render_mode='excerpt',
+        steps=plan.build_plan(**args,frames=238*44100,render_mode='excerpt'),**args)
+    assert recipe.fingerprint(full)!=recipe.fingerprint(excerpt)
+    assert [step['name'] for step in excerpt['steps']]==[
+        'decode','separate','excerpt','convert_000','mix','encode','validate']
+    for original,wrong in ((full,'excerpt'),(excerpt,'full')):
+        changed=copy.deepcopy(original);changed['render_mode']=wrong
+        with pytest.raises(recipe.RecipeError):
+            recipe.fingerprint(changed)
+
+
+@pytest.mark.parametrize('mode',[None,True,1,[],{},'','FULL','short'])
+def test_v3_invalid_render_mode_is_value_error(mode):
+    doc,args,steps=document()
+    with pytest.raises(recipe.RecipeError,match='render mode'):
+        recipe.recipe_document(provider='163',track_id='1',hashes=doc['hashes'],
+            versions=doc['versions'],steps=steps,render_mode=mode,**args)
+
+
+def test_v2_fingerprint_is_readable_but_never_built_with_legacy_hashes():
+    doc,args,steps=document()
+    legacy=copy.deepcopy(doc)
+    legacy['schema']='sing-render-v2'
+    legacy.pop('render_mode');legacy['hashes'].pop('excerpt_selection')
+    before=copy.deepcopy(legacy)
+    assert len(recipe.fingerprint(legacy))==64 and legacy==before
+    with pytest.raises(recipe.RecipeError,match='digests'):
+        recipe.recipe_document(provider='163',track_id='1',hashes=legacy['hashes'],
+            versions=legacy['versions'],steps=steps,**args)
+    mixed=copy.deepcopy(legacy);mixed['hashes']['excerpt_selection']='f'*64
+    with pytest.raises(recipe.RecipeError):recipe.fingerprint(mixed)
+    current=copy.deepcopy(doc);current['hashes'].pop('excerpt_selection')
+    with pytest.raises(recipe.RecipeError):recipe.fingerprint(current)
+
+
+@pytest.mark.parametrize('mode',['full','excerpt'])
+@pytest.mark.parametrize('mutation',['missing','duplicate','wrong','missing_value'])
+def test_v3_rejects_argv_render_mode_disagreement(mode,mutation):
+    doc,args,_=document()
+    doc=recipe.recipe_document(provider='163',track_id='1',hashes=doc['hashes'],
+        versions=doc['versions'],render_mode=mode,
+        steps=plan.build_plan(**args,frames=238*44100,render_mode=mode),**args)
+    for step in doc['steps']:
+        if step['name'] not in ('separate','excerpt','mix'):continue
+        changed=copy.deepcopy(doc)
+        argv=next(item for item in changed['steps'] if item['name']==step['name'])['argv']
+        position=argv.index('--render-mode')
+        if mutation=='missing':del argv[position:position+2]
+        elif mutation=='duplicate':argv.extend(['--render-mode',mode])
+        elif mutation=='wrong':argv[position+1]='excerpt' if mode=='full' else 'full'
+        else:del argv[position+1:]
+        with pytest.raises(recipe.RecipeError):recipe.fingerprint(changed)
