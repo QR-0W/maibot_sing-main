@@ -1,6 +1,21 @@
 # MaiBot Plugin SDK 合规审计
 
-审计日期：2026-09-29
+最新核对：2026-09-30，程序修订 `81203d7`。初审日期：2026-09-29。
+
+## 当前验收摘要（替代下方历史状态）
+
+- 最终完整测试：指定当前 Host/已安装 SDK 后 **359 passed**；独立模式未提供 Host 时，两项 Host 专属测试按约定跳过。
+- 实际 MaiBot 1.3.0 Runner/PluginLoader、SDK 2.8.2 在私有目录完成配置生成/补齐、加载、self-config 热更、代码重载、部分初始化取消、单项 close 抛错后的其余资源清理、卸载和关停。IPC、Host 能力响应与音乐候选为假体，不连接生产聊天。
+- 当前 Host 的 Command builder/serializer、NapCat codec 和 Host route-attach 原样函数经 AST 提取执行，避免导入业务模块。独立安全复核接受 2 条合法群/私聊来源，将普通 WebUI 与虚拟 QQ 的 22 条 Command 全部拦截；零新增发送调用、搜索及任务。独立目标测试 **91 passed / 1 deselected**。
+- 原始文本明确带 `--auto-reply` 才能生成持久许可；同时要求当前受信任 NapCat/Host 元数据。全部 11 个 Command 在副作用前检查，失败不向该 stream 回复错误。旧缺来源标记的 pending 在扫描和原子 claim 处都被拒绝；标记不是密码学签名，不能防御有消息网关权限的恶意插件。当前普通 WebUI、虚拟 QQ 和缺元数据的旧适配器均拒绝，不宜用生产 WebUI 自动测试。
+- `/163cookie` 不再解析、应用、存储或回显聊天输入凭据；管理员应使用受保护配置/扫码流程。不能据此保证已经发到聊天历史的秘密被删除。
+- 真实媒体与 Runner 是分层验证：受限整曲冷运行、同 job/run-token/unit 的宿主中断恢复、不可变成品与目录重放已有独立证据；精确解码帧策略下，该整曲配方完全相同，17 个 stage 的已校验收据可复用。合成 44.99/300 秒音频确认规划与实际 PCM 帧数一致。正常媒体试验不替代输出超限/取消测试，后者单独验证了子进程与 reader 清理。
+- 一次早期 Runner 试验曾误导入 Host 业务模块并触发生产 SQLite 初始化检查，缺少事前快照，**不能证明没有写入**。后续在所有 Host import 前使用 SQLite/Python 写入审计，Host Command 改用 AST；最终 Runner 记录 46 次私有 SQLite 连接、0 次生产连接。Host 文件日志用无文件替身；父进程 Python 审计不覆盖子进程原生写入。此事故与模拟边界未被隐瞒或解释成始终只读。
+- 以上关闭的是已确认代码缺陷及相应隔离验收项，不等于完整 Host/QQ 网络端到端、真实音色身份、模型素材权利或用户所述沙哑已解决。部署仍需私有配置迁移、旧文件基线、单独产物根、平台可读性及健康核验；程序和依赖未变的文档提交可视为同一受测代码。
+
+原始测量和隔离脚本由维护者私有保存，不在公开插件仓库内分发真实配置、账号、数据库、音频或模型。以下保留初审快照以解释修复来源，不能把其中“未执行 Runner”或“仍接受 Cookie”等历史观察误当为当前状态。
+
+## 历史初审快照
 
 本清单以 MaiBot 官方 [Vibe Coding 插件开发指南](https://docs.mai-mai.org/plugin/vibe-coding)、[Manifest](https://docs.mai-mai.org/plugin/manifest)、[生命周期](https://docs.mai-mai.org/plugin/lifecycle) 和 [配置管理](https://docs.mai-mai.org/plugin/config) 为基线。它记录可复现证据和剩余风险，不是发布声明，也不把历史音频实验等同于当前架构验收。
 
