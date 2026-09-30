@@ -80,7 +80,63 @@ def command(stream='stream-1', msg='platform-message-1', *, user='user-1', text=
             'matched_groups': groups or {'query': 'Song - Artist'},
             'message': {'message_id': msg, 'platform': 'qq', 'session_id': stream,
                         'processed_plain_text': text, 'is_command': True,
-                        'message_info': {'user_info': {'user_id': user}}}}
+                        'message_info': {'user_info': {'user_id': user},
+                                          'group_info': {'group_id': 'trusted-group', 'group_name': 'test'},
+                                          'additional_config': {'self_id': 'test-bot',
+                                                                'platform_io_account_id': 'test-bot',
+                                                                'napcat_message_type': 'group',
+                                                                'platform_io_target_group_id': 'trusted-group'}}}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('handler,text,groups', [
+    ('handle_cover_command', '/翻唱 Song - Artist --auto-reply', {'query':'Song - Artist'}),
+    ('handle_cover_select', '/翻唱选择 ' + 'a'*32 + ' 1', {'job_id':'a'*32,'number':'1'}),
+    ('handle_cover_status', '/翻唱状态 ' + 'a'*32, {'job_id':'a'*32}),
+    ('handle_cover_cancel', '/翻唱取消 ' + 'a'*32, {'job_id':'a'*32}),
+    ('handle_speak_command', '/说 hello', {'text':'hello'}),
+    ('handle_list_models', '/音色列表', {}),
+    ('handle_qq_music_login', '/qq音乐登录', {}),
+    ('handle_netease_music_login', '/网易云音乐登录', {}),
+    ('handle_netease_cookie_login', '/163cookie secret', {'cookie':'secret'}),
+    ('handle_netease_login_test', '/163logintest', {}),
+    ('handle_qq_login_test', '/qqlogintest', {}),
+])
+async def test_virtual_webui_qq_group_spoof_has_zero_effects(plugin, handler, text, groups):
+    instance, sends = plugin
+    forged = command(text=text, groups=groups)
+    # The actual WebUI virtual identity path creates an internally consistent
+    # QQ person and arbitrary non-prefixed real group, but only at_bot metadata.
+    forged['message']['message_info']['group_info']['group_id'] = '123456789'
+    forged['message']['message_info']['additional_config'] = {'at_bot':True}
+    forged['matched_groups']['auto_reply'] = '--auto-reply'
+    result = await getattr(instance, handler)(**forged)
+    assert result[0] is False and sends == []
+    assert instance._jobs is None and instance._qq_login_task is None
+    assert instance._netease_login_task is None and instance._voice_sender is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tamper', ['no_account','wrong_account','wrong_group',
+                                    'virtual_group','private_group_mismatch'])
+async def test_gateway_route_metadata_requires_coherent_host_proof(plugin, tamper):
+    instance, sends = plugin
+    raw = command(text='/音色列表')
+    info = raw['message']['message_info']
+    extra = info['additional_config']
+    if tamper == 'no_account':
+        extra.pop('platform_io_account_id')
+    elif tamper == 'wrong_account':
+        extra['platform_io_account_id'] = 'not-the-NapCat-bot'
+    elif tamper == 'wrong_group':
+        extra['platform_io_target_group_id'] = 'other'
+    elif tamper == 'virtual_group':
+        info['group_info']['group_id'] = 'webui_virtual_group_123'
+        extra['platform_io_target_group_id'] = info['group_info']['group_id']
+    else:
+        extra['napcat_message_type'] = 'private'
+    assert not (await instance.handle_list_models(**raw))[0]
+    assert sends == []
 
 
 def install_cleanup_fakes(instance, monkeypatch, failure, error_type=OSError):
@@ -291,8 +347,8 @@ async def test_chat_cookie_is_never_applied_or_echoed(plugin):
             raise AssertionError('Chat secrets must never enter music client')
     instance._music = ForbiddenMusic()
     secret = 'MUSIC_U=unique-private-secret; __csrf=other-secret'
-    result = await instance.handle_netease_cookie_login(stream_id='stream-1',
-        matched_groups={'cookie': secret})
+    result = await instance.handle_netease_cookie_login(**command(
+        text=f'/163cookie {secret}', groups={'cookie': secret}))
     assert result[0] is False
     assert '安全配置' in sends[-1][0] and '扫码' in sends[-1][0]
     assert 'unique-private-secret' not in str(result) + str(sends)
@@ -536,8 +592,8 @@ async def test_speak_preserves_single_sender_receipt(plugin,outcome,message_id,e
         instance._run_speak=speech
         instance._resolve_model=lambda selector: 'fixed-test-model'
         before=len(sends)
-        result=await instance.handle_speak_command(
-            stream_id='stream-1',matched_groups={'text':'hello'})
+        result=await instance.handle_speak_command(**command(
+            text='/说 hello',groups={'text':'hello'}))
         assert len(sender.calls)==1 and result[0] is True
         if expected_text is None:
             assert 'platform-positive-id' in result[1] and len(sends)==before
@@ -562,7 +618,7 @@ async def test_model_list_uses_active_snapshot_and_never_sidecar(plugin):
         data=instance.get_plugin_config_data()
         data['local']['model_path']=str(Path(instance.ctx.paths.data_dir)/'changed-after-await.pth')
         instance.set_plugin_config(data)
-        result=await instance.handle_list_models(stream_id='stream-1')
+        result=await instance.handle_list_models(**command(text='/音色列表'))
         assert result[0] is True and active_name in sends[-1][0]
         assert 'changed-after-await.pth' not in sends[-1][0]
         assert '不代表角色身份、训练来源或使用权已经验证' in sends[-1][0]
@@ -577,7 +633,7 @@ async def test_model_list_reports_not_ready_without_sidecar(plugin):
         async def list_models(self):
             raise AssertionError('unready model listing must not access sidecar')
     instance._rvc=ForbiddenSidecar()
-    result=await instance.handle_list_models(stream_id='stream-1')
+    result=await instance.handle_list_models(**command(text='/音色列表'))
     assert result[0] is False and '尚未就绪或正在重载' in sends[-1][0]
 
 

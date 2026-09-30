@@ -28,7 +28,7 @@ from .artifact_store import ArtifactError, ArtifactStore, publish_job
 from .asset_inventory import (AssetInventory, InventoryError, RuntimeInventory,
                               RUNTIME_HASH_NAMES, runtime_generation)
 from .catalogue_service import CatalogueError, CatalogueService
-from .job_store import Job, JobConflict, JobStore
+from .job_store import TRUSTED_QQ_INGRESS, Job, JobConflict, JobStore
 from .media_probe import probe_download
 from .source_download import DownloadError, download_selected
 from .source_offer import CatalogueItem
@@ -203,7 +203,11 @@ def _delivery_candidates(store: JobStore, limit: int) -> list[tuple[str, str]]:
         with sqlite3.connect(store.path, timeout=5) as database:
             return [(str(job_id), str(stream_id)) for job_id, stream_id in database.execute(
                 "SELECT id,stream_id FROM jobs WHERE state='ready' "
-                "AND delivery_state='pending' ORDER BY created_at,id LIMIT ?", (limit,))]
+                "AND delivery_state='pending' AND consent_event IS NOT NULL "
+                "AND json_extract(request_json,'$.platform')='qq' "
+                "AND json_extract(request_json,'$.auto_reply')=1 "
+                "AND json_extract(request_json,'$.ingress_proof')=? "
+                "ORDER BY created_at,id LIMIT ?", (TRUSTED_QQ_INGRESS,limit))]
     except sqlite3.Error as exc:
         raise JobServiceError('delivery_scan_failed',
                               'Durable delivery scan failed') from exc

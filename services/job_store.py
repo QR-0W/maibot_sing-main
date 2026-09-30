@@ -16,6 +16,18 @@ import time
 import uuid
 
 
+# Only plugin-side validation of the current NapCat codec + registered Host
+# gateway may assign this version. A historic consent_event alone is unsafe.
+TRUSTED_QQ_INGRESS = 'napcat-host-route-v1'
+
+
+def trusted_delivery_request(request: Dict[str, Any]) -> bool:
+    return (isinstance(request, dict)
+            and request.get('ingress_proof') == TRUSTED_QQ_INGRESS
+            and request.get('platform') == 'qq'
+            and request.get('auto_reply') is True)
+
+
 class JobConflict(RuntimeError):
     """A stale actor, conflicting request or invalid transition cannot write."""
 
@@ -535,8 +547,9 @@ class JobStore:
             if not db.execute('''SELECT 1 FROM store_settings
                     WHERE namespace='artifact_store.v1' AND key='root' ''').fetchone():
                 raise JobConflict('Artifact root is not bound; delivery claim refused')
-            if not row['consent_event']:
-                raise JobConflict('No persisted authorization to auto-reply')
+            if (not row['consent_event']
+                    or not trusted_delivery_request(json.loads(row['request_json']))):
+                raise JobConflict('No verified QQ ingress and explicit authorization to auto-reply')
             return self._change(db,row,'delivery_claimed',delivery_state='dispatching',delivery_token=uuid.uuid4().hex)
 
     def delivery_result(self, job_id: str, delivery_token: str, outcome: str, *, message_id: Optional[str] = None) -> Job:

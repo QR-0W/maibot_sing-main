@@ -34,7 +34,7 @@ from .services.asset_inventory import AssetInventory, AssetPaths, RuntimeVersion
 from .services.catalogue_service import CatalogueService, CatalogueError
 from .services.delivery_outbox import CustomVoiceSender, DeliveryOutbox
 from .services.job_service import JobService, RenderRuntime, RENDER_PARAMETER_POLICY
-from .services.job_store import JobConflict, JobNotFound, JobStore
+from .services.job_store import TRUSTED_QQ_INGRESS, JobConflict, JobNotFound, JobStore
 from .services.ownership import OwnershipBusy, exclusive
 from .services.source_offer import normalized
 from .services.stage_coordinator import StageCoordinator
@@ -990,7 +990,43 @@ class SingPlugin(MaiBotPlugin):
                 or kwargs.get('text') != message.get('processed_plain_text')
                 or message.get('is_command') is not True):
             raise ValueError('宿主消息与会话/平台/用户不匹配，拒绝自动投递')
+        # Current trusted NapCat codec supplies self_id/message_type/target;
+        # Host's registered gateway adds its independently resolved account_id.
+        # WebUI virtual QQ supplies only at_bot, even with a real QQ group ID.
+        extra = info.get('additional_config')
+        if values['platform'] != 'qq' or not isinstance(extra, dict):
+            raise ValueError('不可信平台或缺少 QQ 网关证明')
+        self_id, account = extra.get('self_id'), extra.get('platform_io_account_id')
+        if (not isinstance(self_id, str) or not self_id.strip()
+                or len(self_id) > 256 or not isinstance(account, str)
+                or not account.strip() or self_id != account):
+            raise ValueError('QQ 网关账号证明不一致')
+        group = info.get('group_info')
+        message_type = extra.get('napcat_message_type')
+        if isinstance(group, dict):
+            group_id = group.get('group_id')
+            if (message_type != 'group' or not isinstance(group_id, str)
+                    or not group_id.strip() or len(group_id) > 256
+                    or group_id.startswith('webui_virtual_group_')
+                    or extra.get('platform_io_target_group_id') != group_id
+                    or extra.get('platform_io_target_user_id') is not None):
+                raise ValueError('QQ 群消息路由证明不一致')
+        elif group is None:
+            if (message_type != 'private'
+                    or extra.get('platform_io_target_user_id') != values['user_id']
+                    or extra.get('platform_io_target_group_id') is not None):
+                raise ValueError('QQ 私聊路由证明不一致')
+        else:
+            raise ValueError('QQ 消息群身份无效')
         return values
+
+    @staticmethod
+    def _trusted_command_identity(stream_id: str, kwargs: dict[str, Any]) -> Optional[dict[str, str]]:
+        """Fail closed before *any* send, even an error reply, or side effect."""
+        try:
+            return SingPlugin._command_identity(stream_id, kwargs)
+        except ValueError:
+            return None
 
     @staticmethod
     def _request_token(identity: dict[str, str]) -> str:
@@ -1034,6 +1070,8 @@ class SingPlugin(MaiBotPlugin):
     @Command('翻唱选择', description='选择已显示的准确歌曲版本',
              pattern=r'^(?P<pfx>\S)翻唱选择\s+(?P<job_id>[0-9a-f]{32})\s+(?P<number>\d{1,2})$')
     async def handle_cover_select(self, stream_id: str = '', **kwargs: Any) -> tuple[bool, str, bool]:
+        if self._trusted_command_identity(stream_id, kwargs) is None:
+            return False, '未验证的 QQ 命令来源', True
         try:
             active=self._require_active_cover()
             groups=kwargs.get('matched_groups') or {}
@@ -1050,6 +1088,8 @@ class SingPlugin(MaiBotPlugin):
     @Command('翻唱状态', description='查询持久化翻唱任务',
              pattern=r'^(?P<pfx>\S)翻唱状态\s+(?P<job_id>[0-9a-f]{32})$')
     async def handle_cover_status(self, stream_id: str = '', **kwargs: Any) -> tuple[bool, str, bool]:
+        if self._trusted_command_identity(stream_id, kwargs) is None:
+            return False, '未验证的 QQ 命令来源', True
         try:
             active=self._require_active_cover()
             job=await self._owned_job(
@@ -1067,6 +1107,8 @@ class SingPlugin(MaiBotPlugin):
     @Command('翻唱取消', description='取消任务及尚未开始的自动投递',
              pattern=r'^(?P<pfx>\S)翻唱取消\s+(?P<job_id>[0-9a-f]{32})$')
     async def handle_cover_cancel(self, stream_id: str = '', **kwargs: Any) -> tuple[bool, str, bool]:
+        if self._trusted_command_identity(stream_id, kwargs) is None:
+            return False, '未验证的 QQ 命令来源', True
         try:
             active=self._require_active_cover()
             job=await self._owned_job(
@@ -1086,8 +1128,10 @@ class SingPlugin(MaiBotPlugin):
 
     )
     async def handle_cover_command(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
+        identity = self._trusted_command_identity(stream_id, kwargs)
+        if identity is None:
+            return False, '未验证的 QQ 命令来源', True
         try:
-            identity=self._command_identity(stream_id,kwargs)
             active=self._require_active_cover()
             # Tool/kwargs groups cannot grant consent: parse the Host's original
             # Command text rather than trusting a separately supplied group.
@@ -1121,7 +1165,7 @@ class SingPlugin(MaiBotPlugin):
                      'instrumental':matched.get('instrumental')=='--with-instrumental',
                      'album':album,'source_id':source_id,'model_selector':model,
                      'model':active.default_model,'model_path':active.model_path,
-                     'auto_reply':auto_reply}
+                     'auto_reply':auto_reply,'ingress_proof':TRUSTED_QQ_INGRESS}
             token = self._request_token(identity)
             # Replayed Command RPCs reuse the exact persisted token; never repeat a
             # search or start a second worker when an offer/selection already exists.
@@ -1168,6 +1212,8 @@ class SingPlugin(MaiBotPlugin):
         timeout_ms=600_000,
     )
     async def handle_speak_command(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
+        if self._trusted_command_identity(stream_id, kwargs) is None:
+            return False, '未验证的 QQ 命令来源', True
         matched = kwargs.get("matched_groups")
         if not isinstance(matched, dict):
             matched = {}
@@ -1207,7 +1253,8 @@ class SingPlugin(MaiBotPlugin):
         pattern=r"^(?P<pfx>\S)音色列表$",
     )
     async def handle_list_models(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
-        del kwargs
+        if self._trusted_command_identity(stream_id, kwargs) is None:
+            return False, '未验证的 QQ 命令来源', True
         active=self._active_cover
         if active is None:
             message='持久化音色服务尚未就绪或正在重载。'
@@ -1227,6 +1274,8 @@ class SingPlugin(MaiBotPlugin):
         timeout_ms=60_000,
     )
     async def handle_qq_music_login(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
+        if self._trusted_command_identity(stream_id, kwargs) is None:
+            return False, '未验证的 QQ 命令来源', True
         self._start_qq_qrcode_login(stream_id)
         return True, "QQ 扫码登录已发起", True
 
@@ -1238,6 +1287,8 @@ class SingPlugin(MaiBotPlugin):
         timeout_ms=60_000,
     )
     async def handle_netease_music_login(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
+        if self._trusted_command_identity(stream_id, kwargs) is None:
+            return False, '未验证的 QQ 命令来源', True
         self._start_netease_qrcode_login(stream_id)
         return True, "网易云扫码登录已发起", True
 
@@ -1249,6 +1300,8 @@ class SingPlugin(MaiBotPlugin):
         timeout_ms=60_000,
     )
     async def handle_netease_cookie_login(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
+        if self._trusted_command_identity(stream_id, kwargs) is None:
+            return False, '未验证的 QQ 命令来源', True
         # Never parse, log, persist, or echo a secret pasted into group chat.
         await self.ctx.send.text('聊天 Cookie 登录已停用。请使用管理员安全配置或 /网易云音乐登录 扫码；若已发送凭据请立即撤回并轮换。', stream_id)
         return False, '聊天 Cookie 登录已停用', True
@@ -1261,6 +1314,8 @@ class SingPlugin(MaiBotPlugin):
         timeout_ms=60_000,
     )
     async def handle_netease_login_test(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
+        if self._trusted_command_identity(stream_id, kwargs) is None:
+            return False, '未验证的 QQ 命令来源', True
         if self._music is None:
             await self.ctx.send.text("音乐客户端未初始化", stream_id)
             return False, "未初始化", True
@@ -1281,6 +1336,8 @@ class SingPlugin(MaiBotPlugin):
         timeout_ms=60_000,
     )
     async def handle_qq_login_test(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
+        if self._trusted_command_identity(stream_id, kwargs) is None:
+            return False, '未验证的 QQ 命令来源', True
         if self._music is None:
             await self.ctx.send.text("音乐客户端未初始化", stream_id)
             return False, "未初始化", True

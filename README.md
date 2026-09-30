@@ -40,6 +40,8 @@ git clone https://github.com/QR-0W/maibot_sing-main.git maibot-sing
 - `/音色列表`：显示当前已接纳服务的固定本地模型文件名，不查询已停用的旧 sidecar；文件名不代表角色身份或素材权利已验证。
 - `/qq音乐登录`、`/网易云音乐登录`、`/163logintest`、`/qqlogintest`：仅 operator 使用的登录与诊断命令。
 
+**消息来源限制：**上述所有命令（包括列表、登录测试、扫码及停用 Cookie 告知）仅在当前 NapCat 网关发送的 QQ 原消息与 Host 路由账号/目标元数据同时可验证时执行；否则不向该会话发任何文本、图片或语音，包括拒绝消息。普通 WebUI 和 WebUI 虚拟 QQ 身份不能用于生产翻唱/说话自动测试，虚拟 QQ 自填真实群号尤其可能触发真实 QQ 出站。旧记录即使有 `--auto-reply`，缺少版本化可信 QQ 来源证明也不会被自动投递；请由真实 QQ 用户重新发起新请求。详见 [配置契约](docs/CONFIG_CONTRACT.md)。
+
 插件还声明了供 LLM 发现的翻唱与说话 Tool，但当前 Host 的 Tool 参数缺少可信原始消息锚点：它们只给出原会话 Command 指引，不凭自由会话 ID 入队或发送，默认也不要提升为核心工具。`/163cookie` 已停止解析和应用聊天输入中的秘密，仅指向配置或扫码流程；不要在聊天粘贴凭证。实际启用前请核对 [SDK 合规审计](docs/SDK_COMPLIANCE.md) 和[配置契约](docs/CONFIG_CONTRACT.md)中的边界。
 
 ## 模型来源与限制

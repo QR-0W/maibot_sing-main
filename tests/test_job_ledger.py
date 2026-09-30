@@ -30,16 +30,19 @@ def catalogue():
             Item('163','second','Creep','Radiohead','The Best Of',237.923)]
 
 
-def queued(store, token='message-1', stream='stream-a', consent=True):
-    job, created = store.submit(stream,token,{'query':'radiohead creep'},
+def queued(store, token='message-1', stream='stream-a', consent=True, trusted=True):
+    request = {'query':'radiohead creep', 'platform':'qq', 'auto_reply':consent}
+    if trusted:
+        request['ingress_proof'] = ledger.TRUSTED_QQ_INGRESS
+    job, created = store.submit(stream,token,request,
                                 auto_reply=consent, consent_event=token if consent else None)
     assert created
     job = store.offer(job.id,stream,catalogue(),expected_revision=job.revision)
     return store.select(job.id,stream,job.offer_id,1)
 
 
-def ready(store, consent=True):
-    job = queued(store,consent=consent)
+def ready(store, consent=True, trusted=True):
+    job = queued(store,consent=consent,trusted=trusted)
     running = store.claim_next()
     assert running.id == job.id
     store.progress(job.id,running.run_token,stage='publishing',done=1,total=1)
@@ -281,6 +284,25 @@ def test_crash_during_send_becomes_unknown_never_automatically_resent(store):
     late=reopened.delivery_result(job.id,claimed.delivery_token,'sent',message_id='platform-123')
     assert late.message_id=='platform-123' and late.artifact_key=='a'*64
     assert reopened.claim_delivery(job.id,job.stream_id) is None
+
+
+def test_legacy_pending_consent_is_never_scanned_or_claimed(store):
+    legacy = ready(store, trusted=False)
+    assert legacy.delivery_state == 'pending' and legacy.consent_event
+    root = ROOT.parent
+    project = importlib.util.spec_from_file_location(
+        'ledger_project_test', root/'__init__.py',
+        submodule_search_locations=[str(root)])
+    package = importlib.util.module_from_spec(project)
+    sys.modules[project.name] = package
+    project.loader.exec_module(package)
+    scanner = importlib.import_module(
+        'ledger_project_test.services.job_service')._delivery_candidates
+    assert scanner(store, 32) == []
+    with pytest.raises(JobConflict, match='verified QQ ingress'):
+        store.claim_delivery(legacy.id, legacy.stream_id)
+    unchanged = store.get(legacy.id, legacy.stream_id)
+    assert unchanged.delivery_state == 'pending' and unchanged.delivery_token is None
 
 
 def test_delivery_ledger_requires_positive_platform_ack_and_consistent_message_id(store):

@@ -36,7 +36,8 @@ def ready(store, *, token='message-1', stream='stream-a', consent=True):
     job, created = store.submit(
         stream,
         token,
-        {'query': 'radiohead creep'},
+        {'query': 'radiohead creep', 'platform':'qq', 'auto_reply':consent,
+         'ingress_proof':ledger.TRUSTED_QQ_INGRESS},
         auto_reply=consent,
         consent_event=token if consent else None,
     )
