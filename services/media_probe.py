@@ -50,64 +50,93 @@ async def _count_pcm(stream, max_bytes):
             raise _DecodedTooLong
 
 
-def _consume_task(task):
-    if not task.cancelled():
+async def _drain_pipe(stream):
+    try:
+        while await stream.read(256*1024):
+            pass
+    except (BrokenPipeError,ConnectionError,RuntimeError):
+        pass
+
+
+def _close_pipe_transport(stream):
+    transport=getattr(stream,'_transport',None)
+    if transport is not None:
         try:
-            task.exception()
+            transport.close()
         except BaseException:
             pass
 
 
-async def _cleanup_owned(process, operation):
-    """Kill our child and bound caller wait while reaping continues if needed."""
+async def _cleanup_owned(process, readers, waited):
+    """Kill, drain and reap our one child without leaving reader/wait tasks."""
+    async def settle_reader(task,stream):
+        await asyncio.gather(task,return_exceptions=True)
+        at_eof=getattr(stream,'at_eof',None)
+        if at_eof is None or not at_eof():
+            await _drain_pipe(stream)
+
     async def finish():
         if process.returncode is None:
             try:
                 process.kill()
-            except ProcessLookupError:
+            except OSError:
                 pass
-        if not operation.done():
-            operation.cancel()
-        await asyncio.gather(operation,return_exceptions=True)
-        if process.returncode is None:
-            await process.wait()
-
-    cleanup=asyncio.create_task(finish())
-    loop=asyncio.get_running_loop()
-    deadline=loop.time()+_PROCESS_CLEANUP_S
-    while not cleanup.done():
-        remaining=deadline-loop.time()
-        if remaining<=0:
-            cleanup.add_done_callback(_consume_task)
-            return False
+        output,errors=readers
+        settling=[asyncio.create_task(settle_reader(output,process.stdout),
+                                      name='media-probe-clean-stdout'),
+                  asyncio.create_task(settle_reader(errors,process.stderr),
+                                      name='media-probe-clean-stderr')]
         try:
-            await asyncio.wait_for(asyncio.shield(cleanup),remaining)
-        except asyncio.CancelledError:
-            # Preserve the caller's original cancellation after bounded cleanup.
-            continue
+            await asyncio.wait_for(
+                asyncio.gather(*settling,waited,return_exceptions=True),
+                _PROCESS_CLEANUP_S)
         except asyncio.TimeoutError:
-            cleanup.add_done_callback(_consume_task)
-            return False
+            # A killed child can still have a paused pipe transport. Close both
+            # transports before cancelling our tasks so no protocol task remains.
+            _close_pipe_transport(process.stdout)
+            _close_pipe_transport(process.stderr)
+            transport=getattr(process,'_transport',None)
+            if transport is not None:
+                try:
+                    transport.close()
+                except BaseException:
+                    pass
+            for task in (*settling,*readers,waited):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*settling,*readers,waited,return_exceptions=True)
+
+    cleanup=asyncio.create_task(finish(),name='media-probe-cleanup')
+    # A second caller cancellation must not interrupt ownership cleanup. The
+    # cleanup coroutine itself is bounded and leaves no background reaper.
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
     await asyncio.gather(cleanup,return_exceptions=True)
-    return process.returncode is not None
 
 
 async def _execute(argv, output_reader, *, timeout_s, pipe_limit):
     process=await asyncio.create_subprocess_exec(*argv,
         stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,limit=pipe_limit)
-
-    async def collect():
-        output=asyncio.create_task(output_reader(process.stdout))
-        errors=asyncio.create_task(_read_limited(process.stderr,_STDERR_LIMIT))
-        waited=asyncio.create_task(process.wait())
-        values=await asyncio.gather(output,errors,waited)
-        return values[0],values[1],values[2]
-
-    operation=asyncio.create_task(collect())
+    output=asyncio.create_task(output_reader(process.stdout),
+                               name='media-probe-stdout')
+    errors=asyncio.create_task(_read_limited(process.stderr,_STDERR_LIMIT),
+                               name='media-probe-stderr')
+    waited=asyncio.create_task(process.wait(),name='media-probe-wait')
+    owned=(output,errors,waited)
     try:
-        return await asyncio.wait_for(operation,timeout_s)
+        async with asyncio.timeout(timeout_s):
+            done,_=await asyncio.wait(owned,return_when=asyncio.FIRST_EXCEPTION)
+            for task in done:
+                exception=task.exception()
+                if exception is not None:
+                    raise exception
+            values=await asyncio.gather(*owned)
+            return values[0],values[1],values[2]
     except BaseException:
-        await _cleanup_owned(process,operation)
+        await _cleanup_owned(process,(output,errors),waited)
         raise
 
 

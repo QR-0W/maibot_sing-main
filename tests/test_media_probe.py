@@ -92,6 +92,25 @@ def normal_processes(container_duration,frames):
             FakeProcess(FakeStream(total=frames*8)))
 
 
+def capture_real_processes(monkeypatch):
+    original=module.asyncio.create_subprocess_exec
+    created=[]
+    async def create(*argv,**kwargs):
+        process=await original(*argv,**kwargs)
+        created.append(process)
+        return process
+    monkeypatch.setattr(module.asyncio,'create_subprocess_exec',create)
+    return created
+
+
+async def assert_real_cleanup(created):
+    await asyncio.sleep(0)
+    assert created and all(process.returncode is not None for process in created)
+    assert not [task for task in asyncio.all_tasks()
+                if task is not asyncio.current_task()
+                and task.get_name().startswith('media-probe-') and not task.done()]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('container_duration,frames,expected_error',[
     (999.,round(238.64*44100),None),
@@ -186,12 +205,73 @@ async def test_cancellation_kills_and_reaps_only_owned_child(tmp_path,monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_cancellation_wait_is_bounded_while_killed_child_reaps_late(tmp_path,monkeypatch):
+async def test_real_large_stderr_limit_kills_drains_and_reaps(monkeypatch):
+    created=capture_real_processes(monkeypatch)
+    script=("import os,time\n"
+            "block=b'x'*65536\n"
+            "for _ in range(32): os.write(2,block)\n"
+            "time.sleep(10)\n")
+    with pytest.raises(module._OutputLimit):
+        await module._execute([sys.executable,'-c',script],
+            lambda stream:module._read_limited(stream,module._STDOUT_LIMIT),
+            timeout_s=2,pipe_limit=module._STDOUT_LIMIT)
+    await assert_real_cleanup(created)
+    assert created[0].stderr.at_eof()
+
+
+@pytest.mark.asyncio
+async def test_real_high_pcm_limit_kills_drains_and_reaps(monkeypatch):
+    created=capture_real_processes(monkeypatch)
+    script=("import os,time\n"
+            "block=b'\\0'*262144\n"
+            "for _ in range(32): os.write(1,block)\n"
+            "time.sleep(10)\n")
+    with pytest.raises(module._DecodedTooLong):
+        await module._execute([sys.executable,'-c',script],
+            lambda stream:module._count_pcm(stream,8192),
+            timeout_s=2,pipe_limit=256*1024)
+    await assert_real_cleanup(created)
+    assert created[0].stdout.at_eof()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode',['cancel','timeout'])
+async def test_real_paused_pipe_cancel_or_timeout_has_no_transport_tasks(monkeypatch,mode):
+    created=capture_real_processes(monkeypatch)
+    monkeypatch.setattr(module,'_PROCESS_CLEANUP_S',.1)
+    blocked=asyncio.Event()
+    async def blocked_reader(stream):
+        await blocked.wait()
+    script=("import os,time\n"
+            "block=b'x'*262144\n"
+            "for _ in range(32): os.write(1,block)\n"
+            "time.sleep(10)\n")
+    timeout=10 if mode=='cancel' else .05
+    operation=asyncio.create_task(module._execute(
+        [sys.executable,'-c',script],blocked_reader,
+        timeout_s=timeout,pipe_limit=65536))
+    if mode=='cancel':
+        while not created:
+            await asyncio.sleep(0)
+        await asyncio.sleep(.05)
+        operation.cancel()
+        expected=asyncio.CancelledError
+    else:
+        expected=asyncio.TimeoutError
+    with pytest.raises(expected):
+        await asyncio.wait_for(operation,1)
+    await assert_real_cleanup(created)
+    transport=getattr(created[0],'_transport',None)
+    assert transport is None or transport.is_closing()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_cleanup_timeout_leaves_no_background_owner_tasks(tmp_path,monkeypatch):
     src=tmp_path/'source.audio';src.write_bytes(b'blocked media')
     started=asyncio.Event();gate=asyncio.Event()
     class SlowReap(FakeProcess):
         def kill(self):
-            self.killed=True  # Simulate delayed child-watcher acknowledgement.
+            self.killed=True  # Simulate a watcher that ignores the bounded reap window.
     process=SlowReap(FakeStream(gate=gate,started=started),
                      stderr=FakeStream(gate=gate),block_wait=True,started=started)
     install(monkeypatch,process)
@@ -202,8 +282,6 @@ async def test_cancellation_wait_is_bounded_while_killed_child_reaps_late(tmp_pa
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task,.2)
     assert asyncio.get_running_loop().time()-before<.15 and process.killed
-    process.exit.set()
-    for _ in range(100):
-        if process.returncode is not None:break
-        await asyncio.sleep(.005)
-    assert process.returncode is not None
+    assert not [task for task in asyncio.all_tasks()
+                if task is not asyncio.current_task()
+                and task.get_name().startswith('media-probe-') and not task.done()]
