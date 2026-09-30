@@ -40,6 +40,7 @@ LOGGER = logging.getLogger(__name__)
 RENDER_PARAMETER_POLICY = {
     'schema': 'sing-render-policy-v1',
     'source_binding': 'selected-provider-track-id',
+    'source_frame_policy': 'ffmpeg-map0-a0-44100-stereo-pcm-f32le-stream-count-v1',
     'sample_rate_hz': 44100,
     'chunk_seconds': 20,
     'tail_fold_seconds': 5,
@@ -774,12 +775,13 @@ class JobService:
         if self._inventory_generation(inventory.hashes,inventory.versions)!=self.generation:
             raise JobServiceError('configuration_changed',
                                   '任务配置资产在冻结前发生变化；未启动媒体阶段。')
-        duration = report.get('duration_s')
         frames = report.get('frames')
-        if type(frames) is not int:
-            if isinstance(duration, bool) or not isinstance(duration, (int, float)):
-                raise JobServiceError('source_probe_invalid', 'Media probe omitted a usable duration')
-            frames = round(float(duration) * 44100)
+        sample_rate = report.get('sample_rate')
+        if (type(frames) is not int or type(sample_rate) is not int
+                or sample_rate != 44100
+                or not 30*sample_rate <= frames <= self.runtime.max_duration_s*sample_rate):
+            raise JobServiceError('source_probe_invalid',
+                                  'Media probe omitted exact normalized source frames')
         request = job.request
         instrumental = request.get('instrumental', False)
         steps = self.plan_builder(**self._runtime_args(workspace), frames=frames,

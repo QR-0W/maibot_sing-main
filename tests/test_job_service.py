@@ -172,7 +172,8 @@ def make_service(tmp_path, *, store=None, catalogue=None, coordinator=None,
 
     async def fake_probe(path, chosen, **kwargs):
         assert path.read_bytes() == b'S' * 4096
-        return {'duration_s': 31.0, 'audio_streams': 1,
+        return {'duration_s': 31.0, 'container_duration_s': 31.04,
+                'frames': 31*44100, 'sample_rate': 44100, 'audio_streams': 1,
                 'provider': chosen.provider, 'source_id': chosen.track_id}
 
     def fake_publish(job_store, artifacts, *, job_id, stream_id, run_token,
@@ -219,7 +220,48 @@ async def test_selected_job_returns_queued_then_runs_without_search_or_persisted
     assert 'private-token' not in persisted and 'signed.invalid' not in persisted
     assert recipe['provider'] == '163' and recipe['track_id'] == 'track-42'
     assert recipe['hashes']['source'] == __import__('hashlib').sha256(b'S' * 4096).hexdigest()
+    assert sum(step['name'].startswith('convert_') for step in plan['steps'])==2
+    assert service_module.RENDER_PARAMETER_POLICY['source_frame_policy'].startswith(
+        'ffmpeg-map0-a0-44100-stereo-pcm-f32le')
     assert finished.artifact_key == recipes.fingerprint(recipe)
+
+
+@pytest.mark.asyncio
+async def test_exact_probe_frames_override_container_padding_at_chunk_boundary(tmp_path):
+    instance,store,catalogue,coordinator,downloads=make_service(tmp_path)
+    async def boundary_probe(path,chosen,**kwargs):
+        return {'duration_s':45.035102,'container_duration_s':45.035102,
+                'frames':1984059,'sample_rate':44100,'audio_streams':1,
+                'provider':chosen.provider,'source_id':chosen.track_id}
+    instance.probe=boundary_probe
+    queued,_=await instance.submit_selected(
+        'stream-frame-boundary','rpc-frame-boundary',{'instrumental':False},
+        selected('frame-boundary'))
+    assert (await instance.run_once()).state=='ready'
+    plan=json.loads((instance.runtime.work_root/queued.id/'plan.json').read_text())
+    assert sum(step['name'].startswith('convert_') for step in plan['steps'])==2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('probe_report',[
+    {'duration_s':31.,'sample_rate':44100},
+    {'duration_s':31.,'frames':31*44100},
+    {'duration_s':31.,'frames':31*48000,'sample_rate':48000},
+    {'duration_s':31.,'frames':True,'sample_rate':44100},
+    {'duration_s':31.,'frames':301*44100,'sample_rate':44100},
+])
+async def test_prepare_requires_exact_44100_frame_evidence(tmp_path,probe_report):
+    instance,store,catalogue,coordinator,downloads=make_service(tmp_path)
+    async def invalid_probe(path,chosen,**kwargs):
+        return dict(probe_report,provider=chosen.provider,source_id=chosen.track_id)
+    instance.probe=invalid_probe
+    queued,_=await instance.submit_selected(
+        'stream-invalid-frames','rpc-invalid-frames',{'instrumental':False},
+        selected('invalid-frames'))
+    failed=await instance.run_once()
+    assert failed.id==queued.id and failed.state=='failed'
+    assert failed.error['code']=='source_probe_invalid'
+    assert coordinator.calls==[]
 
 
 @pytest.mark.asyncio
