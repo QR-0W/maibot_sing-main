@@ -1,7 +1,7 @@
 # 示例仅展示无凭证配置；插件默认禁用，启用须经维护者审查。
 [plugin]
 enabled = false
-config_version = "0.5.0"
+config_version = "0.6.0"
 
 [local]
 backend = "local"
@@ -25,6 +25,14 @@ max_duration_s = 300
 max_download_bytes = 67108864
 # 仅供维护者受控回归；普通歌曲请求不接受本地路径。
 local_source_allowlist = []
+# 媒体阶段及其所有子进程共享独立 systemd user 服务预算；OOM 终止整个服务。
+# 单位是 MiB；MemoryHigh 自动取75%，swap=0。不保证其它服务不会耗尽容器。
+# 启动前及服务内取得共享锁后检查真实祖先 cgroup 余量，不从 MemTotal 猜容量。
+memory_max_mb = 2048
+# 启动任何阶段前要求保留的宿主空闲内存；不足直接返回 resource_budget_exhausted，不启动。
+memory_headroom_mb = 512
+cpu_quota_percent = 150
+media_tasks_max = 64
 
 [rvc]
 # 历史 sidecar 兼容字段；本地后端不启动旧 sidecar。

@@ -14,10 +14,14 @@ import shutil
 import time
 import uuid
 
-from ..runtime.recipe_identity import fingerprint, SCHEMA
+from ..runtime.recipe_identity import fingerprint, SCHEMA, READABLE_SCHEMAS
+from ..runtime.artifact_manifest import validate_excerpt_evidence, validate_manifest
 from ..runtime.stage_receipts import StageReceipts, CheckpointError
 from . import library_catalog
 from .ownership import exclusive
+from .source_offer import CatalogueItem
+from .media_probe import verify_source_preflight
+from .catalogue_service import CatalogueError
 
 
 class ArtifactError(RuntimeError):
@@ -71,8 +75,8 @@ class ArtifactStore:
         """Reopen committed media without relying on a surviving job workspace."""
         try:
             data,path=library_catalog._verify(self.root,key,max_bytes=self.max_bytes)
-            if data.get('recipe_schema')!=SCHEMA:
-                raise ValueError('Not a current committed recipe')
+            if data.get('recipe_schema') not in READABLE_SCHEMAS:
+                raise ValueError('Not a supported committed recipe')
             return Artifact(key,path,data['sha256'],data['bytes'])
         except (OSError,KeyError,TypeError,ValueError,AttributeError) as exc:
             raise ArtifactError('artifact_invalid','Existing artifact is invalid; never overwrite it') from exc
@@ -89,13 +93,26 @@ class ArtifactStore:
                 or final['inputs']!=['cover.mp3'] or final['outputs']!=['cover.mp3']):
             raise ArtifactError('validation_missing','Recipe lacks the required full decoding stage')
         evidence=None
+        excerpt_receipt=None
         for step in recipe['steps']:
             files=receipts._files(step['inputs'])
             hashes={name:entry['sha256'] for name,entry in files.items()}
             evidence=receipts.verify(step['name'],hashes)
             if evidence is None or set(evidence['outputs'])!=set(step['outputs']):
                 raise ArtifactError('stage_unverified','Every planned media stage must have a valid receipt')
-        return evidence
+            if step['name']=='excerpt':
+                excerpt_receipt=evidence
+        selection=None
+        if recipe.get('render_mode')=='excerpt':
+            path=workspace/'selection.json'
+            try:
+                if path.is_symlink() or not path.is_file() or not 0<path.stat().st_size<=65536:
+                    raise ValueError('Unsafe or oversized selection document')
+                selection=json.loads(path.read_text(encoding='utf-8'))
+                validate_excerpt_evidence(recipe,key,selection,excerpt_receipt)
+            except (OSError,ValueError,TypeError,RecursionError) as exc:
+                raise ArtifactError('selection_invalid','Excerpt selection evidence is invalid') from exc
+        return evidence,selection,excerpt_receipt
 
     def publish(self,workspace: Path,recipe: dict,*,title: str,artist: str,album: str=''):
         """Retry-safe commit. No URLs, stream IDs, consent or private paths stored.
@@ -106,6 +123,8 @@ class ArtifactStore:
         # Freeze caller-owned dictionaries before hashing/copying.
         recipe=json.loads(json.dumps(recipe,allow_nan=False))
         key=fingerprint(recipe)
+        if recipe['schema']!=SCHEMA:
+            raise ArtifactError('recipe_read_only','Legacy recipes can only reopen committed artifacts')
         with exclusive(self.root/'.publish.lock'):
             final=self.root/key
             if final.exists() or final.is_symlink():
@@ -119,7 +138,7 @@ class ArtifactStore:
             artist=library_catalog._label(artist)
             album=library_catalog._label(album) if album else ''
             try:
-                evidence=self._evidence(workspace,recipe,key)
+                evidence,selection,excerpt_receipt=self._evidence(workspace,recipe,key)
             except (OSError,CheckpointError) as exc:
                 raise ArtifactError('stage_unverified','Media receipts or bytes could not be verified') from exc
             record=evidence['outputs']['cover.mp3']
@@ -157,11 +176,14 @@ class ArtifactStore:
                 raise ArtifactError('recipe_invalid','Render recipe has no mixing stage')
             metadata={'status':'completed','key':key,'sha256':record['sha256'],'bytes':size,
                 'title':title,'artist':artist,'album':album,
-                'recipe_schema':SCHEMA,'recipe':recipe,'validation':evidence,
+                'recipe_schema':recipe['schema'],'recipe':recipe,'validation':evidence,
                 'source':{'type':'provider-track','platform':recipe['provider'],'identifier':recipe['track_id']},
                 'model_sha256':recipe['hashes']['model'],'index_sha256':recipe['hashes']['index'],
                 'parameters':{'policy':SCHEMA},'instrumental':'--instrumental' in mix['argv'],
                 'completed_at':time.time()}
+            if selection is not None:
+                metadata.update(selection=selection,excerpt_receipt=excerpt_receipt)
+            validate_manifest(metadata,key,size)
             with (staging/'metadata.json').open('x',encoding='utf-8') as output:
                 json.dump(metadata,output,sort_keys=True,ensure_ascii=False,allow_nan=False)
                 output.flush()
@@ -206,7 +228,20 @@ def publish_job(store,artifacts: ArtifactStore,*,job_id,stream_id,run_token,work
             result=artifacts.verify(key)
         else:
             attempts=store.stage_attempts(job.id,stream_id)
-            if (job.state not in ('running','cancel_requested') or job.active_step!='validate'
+            if job.state=='cancel_requested':
+                raise JobConflict('Cancellation requested before publication; no new artifact may be copied')
+            if job.state!='running':
+                raise JobConflict('Only a running job may begin publication')
+            if attempts and attempts[0]['step']=='source_probe':
+                if (attempts[0]['status']!='completed'
+                        or any(a['step']=='source_probe' for a in attempts[1:])):
+                    raise JobConflict('Only one completed leading source probe is permitted')
+                try:
+                    verify_source_preflight(workspace,CatalogueItem(**selected),recipe)
+                except (CatalogueError,OSError,CheckpointError,ValueError,TypeError,KeyError) as exc:
+                    raise JobConflict('Source probe evidence is not bound to the audio recipe') from exc
+                attempts=attempts[1:]
+            if (job.state!='running' or job.active_step!='validate'
                     or [a['step'] for a in attempts]!=[s['name'] for s in recipe['steps']]
                     or any(a['status']!='completed' for a in attempts)):
                 raise JobConflict('All planned units must be settled before publication')

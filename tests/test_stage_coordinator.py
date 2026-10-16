@@ -20,11 +20,28 @@ Step=importlib.import_module('coord_test_pkg.runtime.render_plan').Step
 
 
 class StubUnitRunner:
-    def __init__(self,state):self.current=state;self.starts=0
+    def __init__(self,state):
+        self.current=state;self.starts=0
+        # Mirrors the real UnitRunner so the pre-launch memory gate has a budget.
+        self.budget=importlib.import_module(
+            'coord_test_pkg.services.resource_budget').ResourceBudget.from_config()
     async def state(self,unit): return self.current
     async def run(self,*args):
         self.starts+=1
         raise AssertionError('Must never start a second unverified unit')
+
+
+@pytest.fixture(autouse=True)
+def healthy_host(monkeypatch):
+    """Pretend the host has plenty of free memory for the launch-path tests.
+
+    The real gate reads this container's cgroup, which is usually too full in a
+    test run; the refusal path has its own dedicated test below.
+    """
+    monkeypatch.setattr(coordinator,'cgroup_limits',lambda path=None:{
+        'path':str(path),'memory_max_bytes':8*1024**3,'memory_current_bytes':0,
+        'memory_high_bytes':8*1024**3,'memory_swap_max_bytes':0,'memory_peak_bytes':0})
+
 
 
 @pytest.fixture
@@ -302,3 +319,34 @@ async def test_inherited_flock_survives_parent_close(tmp_path):
             assert child.returncode==0
     with ownership.exclusive(path):
         pass
+
+
+@pytest.mark.asyncio
+async def test_insufficient_host_memory_refuses_launch_without_receipt(work, monkeypatch):
+    """A stage that cannot fit beside the running host must not start."""
+    store,run,folder,step=work
+    monkeypatch.setattr(coordinator,'cgroup_limits',lambda path=None:{
+        'path':str(path),'memory_max_bytes':8*1024**3,'memory_current_bytes':7*1024**3,
+        'memory_high_bytes':8*1024**3,'memory_swap_max_bytes':0,'memory_peak_bytes':0})
+    runner=StubUnitRunner('absent')
+    with pytest.raises(runner_module.UnitError) as exc:
+        await coordinator.StageCoordinator(store,runner).run_step(
+            run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
+    assert exc.value.code=='resource_budget_exhausted'
+    assert runner.starts==0
+    assert not (folder/'unit-logs').exists()
+    assert store.get(run.id,run.stream_id).state=='interrupted'
+
+
+@pytest.mark.asyncio
+async def test_unreadable_cgroup_refuses_launch(work, monkeypatch):
+    store,run,folder,step=work
+    budget=importlib.import_module('coord_test_pkg.services.resource_budget')
+    def missing(path=None):
+        raise budget.CgroupUnavailable('cgroup 路径不可读')
+    monkeypatch.setattr(coordinator,'cgroup_limits',missing)
+    runner=StubUnitRunner('absent')
+    with pytest.raises(runner_module.UnitError) as exc:
+        await coordinator.StageCoordinator(store,runner).run_step(
+            run.id,run.stream_id,run.run_token,step,folder,folder/'plan.json','a'*64)
+    assert exc.value.code=='cgroup_unavailable' and runner.starts==0

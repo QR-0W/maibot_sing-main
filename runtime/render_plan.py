@@ -6,6 +6,11 @@ resource limits, in-service lock, checkpoints and total job deadline separately.
 from dataclasses import dataclass
 from pathlib import Path
 
+if __package__:
+    from .context_window import freeze_context, full_context
+else:
+    from context_window import freeze_context, full_context
+
 
 @dataclass(frozen=True)
 class Step:
@@ -22,37 +27,62 @@ class Step:
 
 
 def build_plan(workspace, worker_python, worker_script, rvc_script, model, index,
-               hubert, frames, *, demucs_repo, rate=44100, instrumental=False):
+               hubert, frames, *, render_mode='full', demucs_repo, rate=44100,
+               instrumental=False):
     paths = [Path(p) for p in (workspace,worker_python,worker_script,rvc_script,model,index,hubert,demucs_repo)]
     if any(not p.is_absolute() for p in paths):
         raise ValueError('Runtime paths must be absolute')
-    if type(frames) is not int or rate != 44100 or not 30*rate <= frames <= 300*rate:
-        raise ValueError('Plan requires decoded full-source length within 30–300 seconds')
+    if type(render_mode) is not str or render_mode not in ('full', 'excerpt'):
+        raise ValueError('Render mode must be full or excerpt')
+    maximum_seconds = 300 if render_mode == 'full' else 900
+    if (type(frames) is not int or rate != 44100 or
+            not 30*rate <= frames <= maximum_seconds*rate):
+        raise ValueError(
+            f'Plan requires decoded {render_mode} source length within 30–{maximum_seconds} seconds')
     if type(instrumental) is not bool:
         raise ValueError('Instrumental must be explicit bool')
+    context = freeze_context(frames) if render_mode == 'excerpt' else full_context(frames)
+    context_start = context['start_frame']
+    context_end = context['end_frame']
     work, python, worker, rvc, model, index, hubert, demucs_repo = map(str,paths)
-    # Match worker.chunk_bounds: fold tails shorter than five seconds.
-    starts=list(range(0,frames,20*rate))
-    if len(starts)>1 and frames-starts[-1]<5*rate:
-        starts.pop()
-    count=len(starts)
+    # Preserve the original full-song timeline and worker.chunk_bounds policy:
+    # 20-second chunks, folding only tails strictly shorter than five seconds.
+    if render_mode == 'full':
+        starts=list(range(0,frames,20*rate))
+        if len(starts)>1 and frames-starts[-1]<5*rate:
+            starts.pop()
+        count=len(starts)
+    else:
+        # Selection determines the actual length of one bounded 12–18 s chunk.
+        count=1
     chunks=tuple('vocal_%03d.wav'%n for n in range(count))
     converted=tuple('vocal_%03d_converted.wav'%n for n in range(count))
-    opts=('--scratch',work,'--model',model,'--index',index)
-    steps=[Step('decode',('ffmpeg','-nostdin','-v','error','-xerror','-threads','1',
-        '-i',work+'/source.audio','-map','0:a:0','-ar','44100','-ac','2','-c:a','pcm_f32le',
-        work+'/original.wav'),120,('source.audio',),('original.wav',)),
+    opts=('--scratch',work,'--model',model,'--index',index,'--render-mode',render_mode,
+          '--source-frames',str(frames),'--context-start-frame',str(context_start),
+          '--context-end-frame',str(context_end))
+    decode=('ffmpeg','-nostdin','-v','error','-xerror','-threads','1',
+            '-i',work+'/source.audio','-map','0:a:0')
+    if render_mode == 'excerpt':
+        decode += ('-af',f'aresample=44100,atrim=start_sample={context_start}:end_sample={context_end},asetpts=PTS-STARTPTS')
+    decode += ('-ar','44100','-ac','2','-c:a','pcm_f32le',work+'/original.wav')
+    steps=[Step('decode',decode,120,('source.audio',),('original.wav',)),
         Step('separate',(python,worker,'separate',*opts,'--demucs-repo',demucs_repo),600,('original.wav',),
-             ('vocals.wav','backing.wav',*chunks))]
+             ('vocals.wav','backing.wav',*(chunks if render_mode == 'full' else ())))]
+    if render_mode == 'excerpt':
+        steps.append(Step('excerpt',(python,worker,'excerpt',*opts),60,
+            ('vocals.wav','backing.wav'),('selection.json',*chunks,'excerpt_backing.wav')))
     for number,(original,output) in enumerate(zip(chunks,converted)):
         steps.append(Step('convert_%03d'%number,(python,rvc,'--model',model,'--index',index,
             '--hubert',hubert,'--input',work+'/'+original,'--output',work+'/'+output,'--limit-seconds','25',
             '--pitch','0','--f0-method','harvest','--index-rate','0.5','--filter-radius','3',
             '--rms-mix-rate','0.25','--protect','0.33','--seed','20260928','--resample-sr','44100'),
-            180,(original,),(output,)))
+            180,('selection.json',original) if render_mode == 'excerpt' else (original,),
+            (output,)))
+    mix_inputs=(('selection.json','excerpt_backing.wav') if render_mode == 'excerpt'
+                else ('vocals.wav','backing.wav'))
     steps.extend([
         Step('mix',(python,worker,'mix',*opts,*(('--instrumental',) if instrumental else ())),
-             60,('vocals.wav','backing.wav',*chunks,*converted),('mixed.wav',)),
+             60,(*mix_inputs,*chunks,*converted),('mixed.wav',)),
         Step('encode',('ffmpeg','-nostdin','-v','error','-xerror','-threads','1','-i',work+'/mixed.wav',
              '-c:a','libmp3lame','-b:a','192k',work+'/cover.mp3'),90,('mixed.wav',),('cover.mp3',)),
         Step('validate',('ffmpeg','-nostdin','-v','error','-xerror','-threads','1','-i',work+'/cover.mp3',

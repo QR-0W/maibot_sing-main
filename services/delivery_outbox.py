@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Optional, Protocol
 import asyncio
 
-from .job_store import Job, JobConflict, JobStore
+from .job_store import Job, JobConflict, JobStore, request_modes
 
 
 class CommittedArtifact(Protocol):
@@ -29,7 +29,9 @@ class DeliveryReceipt:
     """Normalized platform acknowledgement.
 
     ``sent`` is intentionally stricter than a truthy SDK result: a platform
-    message id is required. ``failed`` means the platform explicitly reported
+    message id is required, including file sends. An upload-success response
+    without that id remains unknown; it never authorizes a retry.
+    ``failed`` means the platform explicitly reported
     that it did not accept the message. Everything else is ``unknown``.
     """
 
@@ -53,8 +55,27 @@ def classify_ack(result: Any) -> DeliveryReceipt:
     return DeliveryReceipt('unknown')
 
 
+def custom_media_payload(path: Path, delivery_mode: str) -> tuple[str, dict[str, str]]:
+    """Build exactly one Host custom-message payload; never choose a fallback."""
+    path = Path(path)
+    if not path.is_absolute():
+        raise ValueError('Committed artifact path must be absolute')
+    uri = path.as_uri()
+    if delivery_mode == 'voice':
+        return 'voiceurl', {'url':uri}
+    if delivery_mode == 'file':
+        # Host FileComponent.from_payload keeps url/name. The registered NapCat
+        # encoder selects url as the OneBot file reference and preserves name.
+        return 'file', {'url':uri,'name':path.name}
+    raise ValueError('Invalid delivery mode')
+
+
 class CustomVoiceSender:
-    """Adapter for ``ctx.send.custom`` using the SDK's detailed receipt mode."""
+    """Single-attempt file/voice adapter using the SDK detailed receipt mode.
+
+    The historic class name remains for plugin compatibility. Transport is
+    selected only from the persisted request and never changed after an error.
+    """
 
     def __init__(
         self,
@@ -68,12 +89,11 @@ class CustomVoiceSender:
         self._rpc_timeout_ms = rpc_timeout_ms
 
     async def send(self, job: Job, artifact: CommittedArtifact) -> Any:
-        path = Path(artifact.path)
-        if not path.is_absolute():
-            raise ValueError('Committed artifact path must be absolute')
+        delivery_mode, _, _ = request_modes(job.request)
+        message_type, content = custom_media_payload(Path(artifact.path),delivery_mode)
         return await self._send_custom(
-            'voiceurl',
-            {'url': path.as_uri()},
+            message_type,
+            content,
             job.stream_id,
             return_details=True,
             timeout_ms=self._rpc_timeout_ms,

@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.6.1 — 有界来源上下文
+
+### 主要功能
+- 所有 excerpt 请求统一为完整来源受控流式计帧 → 唯一中心原音频上下文（至多90秒）→ 分离 → 12–18秒选择；完整来源最短30秒、上限900秒，full仍受配置且最多300秒。没有整曲分离、跨窗口扫描或重试。
+- Tool 自动冻结准确过滤后的首个候选，包含 Live；首项不可访问/超限时明确拒绝，不跳到后项。Command保留显式版本选择。
+
+### 细节
+- 统一歌名、艺人、专辑的文本安全与比对：支持内部斜杠、AC/DC、D:ream、引号、省略号、Unicode和前导连字符，拒绝路径、URL及控制字符。CLI文本用单个 --key=value 参数传递。
+- 新 sing-render-v4、probe-v2、selection-v2 冻结完整源帧数和中心窗口；44.1k重采样后按半开帧界裁剪，选择证据使用原来源绝对帧。v2/v3历史recipe与v1 selection含义/指纹保持；旧已claim单元先核对，不用新代码续跑旧计划。
+- 维持2048/1536MiB媒体预算、流式64MiB下载、完整EOF计帧与至多一次outbox。本轮仅纯回归和用户授权重载，不运行真实模型或QQ音频验收。
+- pytest临时文件、basetemp、缓存及pycache全部指定到MaiBot数据盘，每文件独立512/384MiB有限服务，记录实际cgroup峰值与事件；不使用tmpfs。
+
+## 0.6.0（未发布 — feat/conversational-singing）
+
+此功能分支尚未合并、尚未部署；manifest 与配置模型/模板版本同步为 `0.6.0`，不修改运行实例配置。下方原 `0.5.0` 记录保留为历史基线，不是本分支全量通过声明。
+
+### 功能
+- `/翻唱` 仅作为 slash Command；自然聊天用正常 deferred `cover_song` Tool，由 LLM 填独立 title/artist。两者共享 JobService 搜索/接纳，不借 Hook，不改 MaiBot 核心或计算聊天流 ID。
+- Command 默认 full/伴奏/file，Tool 默认 excerpt（12–18 秒）/干声/voice，三个维度可独立覆盖。多个版本让用户本人选择，不选第一项，不按时长猜 studio。
+- 请求翻唱就授权完成后最多一次投递，无需 `--auto-reply`；旧 flag 只兼容，旧无许可作业不升级。Tool 活动作业复用、终态60秒重放复用，之后允许重唱；Command 原消息去重。新增 owner-only `cover_song_status`。
+- 配置可见媒体硬限默认2048MiB/软限1536MiB/swap0/CPU150%/Tasks64，预算快照启动前冻结；检查真实目标有限祖先，并在服务内部共享锁后、模型前复核。整unit终止，拒绝无预算fallback；确认OOM后无半成品发布或自动重试。
+- 来源探测也进入原StageCoordinator/UnitRunner，有独立request/plan/receipt，Host只读受限JSON；不再裸启动ffprobe/ffmpeg。整曲render recipe不混入probe元数据。
+- 失败/中断文本用独立许可账本claim-before-send；positive详细ack加message_id才sent，异常/取消/重启dispatching→unknown，不重发、不污染媒体outbox。
+- 删除入口旧LocalBackend/sidecar/RVCClient/Pipeline/TTS/voicecache执行与生命周期。`/说` / `speak_voice`明确不支持，无合成、参考读取或fallback；音乐登录/二维码/固定音色列表保留。
+- excerpt仍为整曲分离后RMS/flatness声学选段、至多两段按原序、保留短换气、淡入淡出与有限归一、一次RVC；不声称语义乐句、副歌识别或音质改善。v3精确源帧/收据与旧v2完成成品只读边界保留。
+- 新增官方开发规则，按用户参考重写README，合同/部署/SDK文档区分当前与历史证据。
+
+### 授权与验证边界
+- Command保留raw直接text、QQ账号/路由/原消息检查与派生/虚拟来源拒绝，标记napcat-direct-text-v2；Tool按SDK/MaiCore/LLM一致QQ用户/会话信任，标记napcat-tool-session-v1，不声称原消息强锚点或密码学签名。旧proof pending不升级，sent/unknown不重发。
+- 媒体file/voice最多一次详细发送，须sent=True且有效message_id才确认；未知不换格式、不重试。本次不部署或QQ试发，未完成平台端到端。
+- 当前新预算模块定向80项通过（请求512MiB隔离服务，systemd报告peak34.7M）；后续协调器组因不足1GiB余量拒绝，未执行。其它新源码测试、合成OOM、真实Runner/媒体/最终全量待验收；旧191/340/432/866/1011等不作为当前结果。
+- Aris私有历史峰值略超默认2048MiB，不能声明兼容；模型/音质/角色权利及哼唱语义需独立复核，未运行新训练/下载。研究报告、真实路径、模型hash日志、audio与credentials不提交。
+
+操作、复现命令与细节见 [对话式翻唱](<docs/CONVERSATIONAL_SINGING.md>)、[配置契约](<docs/CONFIG_CONTRACT.md>) 和 [SDK 合规审计](<docs/SDK_COMPLIANCE.md>)；遵循 [MaiBot 官方 Vibe Coding 指南](https://docs.mai-mai.org/plugin/vibe-coding)。
+
 ## 0.5.0（dev 发布候选，启用前须迁移配置）
 
 程序修订 `81203d7` 已通过 359 项测试、真实 Runner/SDK 的隔离生命周期与原始消息桥接验收，以及独立代码审查。真实整曲冷运行和同任务/同 unit 重启恢复、精确帧配方相等后的检查点复用分别验证；这些不是生产 QQ 投递或音质验收。发布源码不等于已启用现网，沙哑、speaker 身份和素材权利限制仍保留。

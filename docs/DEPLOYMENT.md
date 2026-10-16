@@ -1,79 +1,76 @@
-# 0.5.0 部署、验收与数据保留
+# 0.6.1 部署边界、隔离验证与数据保留
 
-## 状态与边界
+本更新统一excerpt为完整源30–900秒、中心上下文≤90秒、选段12–18秒；full仍≤配置上限且最多300秒。仅在用户明确授权后更新/重载现有插件，不改运行配置、核心或依赖，不试发QQ。
 
-当前为隔离开发版本，**不是上线指令**。只有在最终提交完成插件、真实 Runner、受限整曲、恢复、永久发布和独立审查后，才由维护者决定启用。验证过程不能向真实 QQ 群发送试验消息，也不应修改 MaiBot 核心、核心依赖或全局缓存。
+安全应用：在监听目录之外完整staging，纯目标串行验证后检查现网文件未并发变化、配置字节一致和同一磁盘文件系统，再原子交换整个插件目录；保留旧目录回滚。若目录交换不能保证内部文件事件，补一次入口文件mtime事件，让原生watcher读取完整版本。必须用Supervisor重启完成、组加载失败=0及0.6.1/source-window-v4实际加载标记核实，不以复制成功宣称加载。
 
-开发基线是 MaiBot 官方 [Vibe Coding 指南](https://docs.mai-mai.org/plugin/vibe-coding)。详见[配置契约](CONFIG_CONTRACT.md)、[SDK 合规清单](SDK_COMPLIANCE.md)及[部署边界](DEPLOYMENT_BOUNDARY.md)。历史 0.4.0 音频实验不能替代新版验收。
+当前是未发布功能分支，**不是上线指令**。不修改 MaiBot 核心、核心依赖、运行配置、全局缓存或无关服务；不在现有 profile 安装/启用，不向真实 QQ 试发。只有用户另行授权维护窗口后，才考虑生产部署。
 
-## 安装前检查
+## 安装前审阅
 
-1. 确认插件位于独立的 `plugins/<plugin-name>/` 仓库，具有入口、Manifest、许可证和 README。不要把插件文件复制进主程序 `src/`。
-2. 使用 Manifest 声明检查 Host/SDK 兼容及插件依赖；当前下界为 Host 1.3.0、SDK 2.8.2。禁止用强制兼容或修改核心环境来掩盖契约不符。
-3. 从容器 cgroup 检查实际内存限制，不能以宿主机器总内存为依据。必须能为 4 GiB 模型服务与其他常驻进程留足余量。
-4. 准备独立推理 Python、管理员固定的模型/index/HuBERT、受审查 RVC wrapper 和真正对应的 upstream。模型和独立环境不随插件包分发，许可 tag 不代表声音素材权利齐备。
-5. 建立专用本地 Demucs repo，只含受支持的 bag 与签名 checkpoint。不要把整个全局缓存目录作为 repo，也不要为迁移变动或清空全局缓存。
-6. 确认 `systemd --user` 可用、共享推理锁一致、输出目录持久且空间足够。NapCat 发送端必须能读到输出路径；不会为测试启动替代 QQ 服务。
+1. 插件是 `plugins/<plugin-name>/` 下独立仓库；[Manifest](<../_manifest.json>)、[入口](<../plugin.py>)、许可证及 [README](<../README.md>)齐备。依赖以 Manifest 为准，当前下界 Host 1.3.0 / SDK 2.8.2，不强制兼容，不复制文件进主程序。
+2. Runner 管理运行配置；[示例](<../config.example.toml>)仅供审阅，不覆盖当前实例。字段变化由新配置版本表达，不擅自加迁移 Hook。具体字段见[配置契约](<CONFIG_CONTRACT.md>)。
+3. 准备已审查的独立推理 Python、固定模型/index/HuBERT、wrapper 与对应 upstream、专用本地 Demucs repo。没有权重/许可证的自动下载或默认缓存回退；模型许可 tag 不证明声音素材权利。
+4. 确认 cgroup v2、systemd 用户管理器、全服务 OOM 策略及共享锁可用；默认媒体 max=2048 MiB、high=1536 MiB、swap=0、CPU=150%、Tasks=64。Worker 必须核实实际限制，缺失/不符拒绝加载模型。
+5. 每个有限共享祖先启动前须有完整媒体预算加默认 512 MiB reserve，锁内再检查；不能读 MemTotal 猜容量，也不能把 root 与子 cgroup 用量相加。其它服务增长仍可能导致全容器不足，不能因此调整或停止它们。
+6. 永久目录与私有工作区必须持久且有足够磁盘。实际 NapCat 进程须能读取最终文件；路径可读性及 QQ file/voice 端到端未验收，不通过试发探测未知历史发送。
 
-## 从 0.4.0 迁移
+## 行为变化
 
-### 先记录，不覆盖
+- `/翻唱 歌名 - 艺人` 默认 full/伴奏/file；自然聊天走正常 deferred `cover_song`，默认 excerpt/干声/voice。各维度独立覆盖，曲目 title/artist 保持结构化。
+- **请求翻唱就授权完成后最多一次投递，不再要求 `--auto-reply`。** 旧 flag 仅兼容，旧无许可作业不升级。
+- Tool自动冻结准确过滤后的首项（含Live），首项阻塞拒绝而非跳到后项；Command保留多版本显式选择。Tool 是按 SDK/MaiCore/LLM 会话信任工作的入口，不声称原消息强锚点，不改核心、不计算聊天流 ID。`cover_song_status` 只读当前用户本会话。
+- Tool 活动作业复用，终态更新时间后 60 秒重放复用，之后允许重唱；Command 原消息去重。
+- 媒体发送与终态错误文本分别有 durable ledger，claim 后再 RPC，正向详细 ack 加消息 ID 才确认送达，其余 unknown 不重发。
+- `/说` / `speak_voice` 及旧后处理没有当前受限实现，明确不支持；不生成/读取参考音频或回退旧 sidecar。音乐登录、二维码与固定音色列表保留；`/163cookie` 不应用聊天携带的秘密。
 
-- 在维护窗口前记录已安装插件 commit、当前配置版本、服务健康、所有永久成品及可浏览别名的 SHA-256、inode、权限。
-- 真实配置、登录态和数据库备份放在管理员私有目录，权限限制为仅当前账号可读；不提交到 Git，也不写进公开发布包。
-- 旧成品目录保持原位置。首次升级显式选择独立的 `covers-v2/` 根，不把 v2 成品写进旧 `covers/`：新 reader 虽能验证 legacy，回滚后的旧 reader 并不认识 v2 配方。新账本在首次接纳前固定绑定库根，后续改根须走单独审查的数据迁移，不能只热更 `output_dir`。旧非空且未绑定库根的开发期 SQLite 账本也不会被自动采用。
-- 旧单 worker 请求记录与新版 SQLite 作业账本不同，**不自动导入或重发旧任务**。旧的运行中/未知 unit 必须先由其归属证据对账，不得因改版直接删掉日志或强行释放推理锁。
+## 测试：先门槛，再逐个有限服务
 
-### 再补齐配置
+测试使用已有依赖，不为测试修改 MaiBot 环境或安装包。所有测试必须经过独立服务；禁止裸 shell 全量 pytest、并发重型测试、提高预算凑通过。
 
-Runner 负责生成和补齐配置模型，管理员负责给新增字段提供正确值；不要复制 [config.example.toml](../config.example.toml) 覆盖真实配置。
+### 纯目标测试
 
-新增关键字段为 `local.hubert_path`、`local.demucs_repo_path`、`local.rvc_upstream_path`。RVC upstream 必须是所配置 wrapper 同目录下的 `upstream`。模型/索引、解释器、脚本和推理锁仍须为本机实际绝对路径；不要复制其他机器的用户名路径。
+- 起前测目标用户服务 cgroup 的每个有限共享祖先；**至少 1 GiB 实测余量**，没有则记录未运行。
+- 服务固定 `MemoryMax=512M MemoryHigh=384M MemorySwapMax=0 CPUQuota=100% TasksMax=64 RuntimeMaxSec=180 KillMode=control-group OOMPolicy=kill`。
+- 在服务内部读取自己的cgroup并核实max/high/swap/CPU/Tasks/OOMPolicy/KillMode及有限时限；逐文件/有界用例运行，每次全新进程。TMPDIR/TEMP/TMP、pytest basetemp、缓存与pycache显式落在经stat核实的磁盘数据目录，禁用pytest缓存或指定磁盘路径；不使用/tmp或/run/user存放测试文件。
+- stdout 应记录实际 charged peak、退出原因与时间；成功 unit 已被回收后再次 `systemctl show` 可能返回默认 infinity，不能把它当该次应用限额或 peak。
+- 如某测试缺依赖或触及上限，说明范围与未通过原因，不追加安装或扩大额度。
 
-`local.timeout_s=900` 是历史兼容字段，不再控制整曲任务。新版 decode/separate/convert/mix/encode/validate 各自有有限的 stage/unit deadline，不能靠增加这个配置修复阶段错误。
+泛化示例（**管理员须先完成祖先余量检查**，并将路径替换为已有隔离环境；不是一键执行指令）：
 
-### 行为变化必须告知用户
-
-```text
-/翻唱 歌名 - 艺人名
-/翻唱 歌名 - 艺人名 --with-instrumental --auto-reply
+```bash
+systemd-run --user --wait --pipe --unit=<唯一测试unit> \
+  -p MemoryMax=512M -p MemoryHigh=384M -p MemorySwapMax=0 \
+  -p CPUQuota=100% -p TasksMax=64 -p RuntimeMaxSec=180 \
+  -p KillMode=control-group -p OOMPolicy=kill \
+  --working-directory=/path/to/plugin \
+  /path/to/isolated-python /path/to/private-test-wrapper.py
 ```
 
-第一种仅保存；第二种显式同意完成后向原会话自动回复，`--auto-reply` 必须在最后。多候选通过 `/翻唱选择 任务ID 序号` 确认，状态/取消通过相应命令处理。任务耗时不占用一次整曲 Command RPC。
+wrapper 先核实实际 cgroup，再用 `pytest -p no:cacheprovider <一个目标文件或小组>`，最后读取 still-live cgroup 的 peak。若指定 `MAIBOT_TEST_HOST_ROOT`，只读实际 Host checkout，不导入会初始化生产数据库的业务模块；测试 IPC/发送必须是假体。
 
-当前 Tool 缺少可信原始用户消息身份，因此只返回 Command 指引，不使用自由参数中的会话 ID 授权发送。旧 `/163cookie` 不再应用聊天输入中的秘密；应使用受保护配置或 operator 扫码流程。
+### 合成 OOM
 
-## 数据与资源生命周期
+仅在独立 128 MiB 服务运行小分配器，验证 systemd `oom-kill`、整组子进程退出、外部 coordinator 存活、槽在停止证据后释放，以及无 publish/send/auto-retry。不得用真实模型制造 OOM，也不得把任意 SIGKILL 判为 OOM。此项尚待执行。
 
-- SDK `data_dir` 内的新账本为 `jobs.sqlite3`，私有工作区为 `jobs/<job-id>/`；不要将其当作可随时删除的临时缓存。
-- 永久成品默认位于 `data_dir/covers/<recipe-key>/`；`songs/`、目录索引与 README 是可重建的浏览视图，不应以重建为由改写 MP3。
-- 下载的 `.part`、未完成阶段输出和 unit 日志保留用于诊断。已完成收据证明的字节复用；当前没有自动清空失败作业工作区的保留期任务，管理员须监测磁盘增长。
-- 每个模型阶段是独立有限 systemd 用户服务，限制 `MemoryMax=4G`、`MemoryHigh=3G`、`MemorySwapMax=0`、`CPUQuota=150%`、`TasksMax=64`；服务内取得共享推理锁并自检限制。
-- 正常卸载停止本进程调度和投递观察，关闭客户端；已运行的有限阶段服务可能独立完成并写收据，重载后按同一持久 unit 对账。不得让两个实例同时调度同一目录。
-- 各资源先从活动状态摘除，再独立、有界地尝试关闭；单项关闭失败不能跳过其余资源。错误会保留并传播或聚合，不能把“已尝试清理”误报成所有资源都成功关闭。
-- 同步磁盘 offload 可能在等待者取消后继续结束单次 I/O；重复的锁描述符保留其所有权，直到最后一个持有者关闭。不能通过提前解锁换取“卸载完成”的假象。
-- active、未知或缺失启动证据均不许可重新启动同一阶段。没有公开重试 API 时，不能通过换 unit 名称、删除收据或改 SQLite 伪造重试。
+### 可选真实媒体
 
-## 投递及未知结果
+另需用户许可；预算 max=2048 MiB/high=1536 MiB/swap=0/CPU=150%/Tasks=64，有限 runtime，起前每个有限祖先至少 **2.5 GiB 余量**。服务内部取得共享 inference.lock，严格串行；最多一个冻结分离窗口 A/B，不下载权重，不在失败后扩大预算，不更改原模型/音频或向 QQ 发送。已有 Aris 旧峰值略超默认上限，不能保证该试验能完成；无需为验收强行运行。
 
-每份明确许可最多启动一次自动平台调用，不是“保证恰好送达一次”。发出前先持久化 `dispatching`，正向平台回执加非空消息 ID 才记录 `sent`。SDK 的否定结果、超时、断连也可能发生在平台已接受之后，因此保持 `unknown`，不自动重发。
+安装也必须是独立有限服务，服务内持有同一共享锁；本次没有安装授权。具体实验规则以用户更具体的批准预算为准，而不是历史 4 GiB 命令。
 
-在 claim 与真正发送之间崩溃可能零次送达；重启仍不能把未知结果退回 pending。发送失败不回滚本地成品。不要通过真实群测试来“探测”是否曾经送达。
+## 数据与恢复
 
-## 验收分层
+- 迁移前私下记录旧 commit、配置版本、健康、永久成品 SHA/inode/权限，备份登录态及账本；不提交它们。
+- 旧成品保持原位置；新库根首次绑定后不能靠热更搬迁。早期单-worker 作业不自动导入或补许可，运行/未知 unit 必须先对账归属，不删日志释放槽。
+- 私有 `jobs.sqlite3`、`jobs/<job-id>/`、source `.part`、未封存阶段输出及 unit 日志是恢复证据，不作自动清理。
+- 永久 MP3、metadata、songs 硬链接和浏览索引分别保存；重新建索引不能修改 MP3。来源探测也必须通过同一阶段 coordinator/UnitRunner，不能在 SDK Runner 裸启动媒体子进程。
+- 正常卸载关闭本进程调度与平台观察；已有有限 stage 可能独立完成，重载沿同 job/unit 对账。未知/活跃子进程未证明停止前不能放槽或起替代 unit。
+- 音频与文本通知的 dispatching 在恢复时记 unknown，不重试；历史许可不升级。失败不回滚已有已校验字节。
+- 回滚先停新接纳、等待/对账自有 unit，保留新版账本与全部未知记录；只在另行授权的维护窗口恢复旧代码/配置。禁止 `git clean`、删库、清空产物或杀无关进程来“修复”。
 
-1. **静态与离线测试**：Manifest、实际 SDK Schema、函数导入、固定选择、持久状态、并发/取消/旧成品保留。
-2. **隔离 Runner**：使用真实 Runner/PluginLoader 执行加载、配置生成/补齐、热更、重载、卸载；模拟 IPC/平台调用必须明确标注，测试禁止连接现网数据库或网络。
-3. **真实媒体链路**：固定已获准本地输入、真实资产 inventory、JobService 与 stage coordinator、资源限制、同 job/unit 的宿主中断恢复、最终全量解码与私有库提交/重放。使用本地下载 fixture不等于在线来源已验证。
-4. **授权传输**：离线验证原始 Command 与许可、出箱 claim、回执及未知不重发；真正 QQ 使用只能由用户明确触发，不能自动发送回归音频。
-5. **启用后检查**：核查插件加载、后台健康、MaiBot/NapCat 状态、旧成品基线；不把“服务进程还活着”当作所有业务已成功。
+## 当前验收范围
 
-## 回滚
+当前新预算模块 80 项定向测试通过（systemd 报告 peak 34.7M）；随后协调器组因不足 1 GiB 余量拒绝启动，未运行。来源探测、入口清理与新文本通知还在整合；当前全量、真实 Runner、合成 OOM、媒体及 QQ 端到端均未通过最终验收。历史测试/音频实验不能替代本次结果。
 
-- 先停止接受新任务，并等待/对账本插件实际拥有的有限 unit。不要停止无关服务或仅凭进程名杀进程。
-- 保留新版账本、收据、日志及永久产物，防止回滚后丢失未知发送记录。
-- 恢复先前审查过的插件 commit 和对应私有配置备份，通过宿主支持的插件生命周期执行卸载/重载；确需重启宿主时，应在用户授权的维护窗口进行。
-- 复核旧成品的哈希/inode/权限和服务健康。不可用 `git clean`、删除输出目录或清空 SQLite 来修复回滚问题。
-- 后续重新升级时重新对账，不把遗留 `dispatching/unknown` 当作未发送。
-
-音质与角色身份、训练来源权利仍是独立验收项；不能因管线完成或样本未削波就声称沙哑已解决。
+角色身份、训练录音权利与用户报告的音质/哼唱损失需独立人工复核，不能由有限值或无削波替代。

@@ -2,7 +2,8 @@
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional
 import math
-import unicodedata
+
+from ..runtime.catalogue_text import normalized_catalogue_text as normalized
 
 
 @dataclass(frozen=True)
@@ -35,10 +36,6 @@ class CatalogueItem:
     def document(self) -> Dict:
         # No raw provider response, playback URL, cookie or headers are persisted.
         return asdict(self)
-
-
-def normalized(value: str) -> str:
-    return ' '.join(unicodedata.normalize('NFKC',value).casefold().split())
 
 
 def default_row(items: List[CatalogueItem], *, mode: str,

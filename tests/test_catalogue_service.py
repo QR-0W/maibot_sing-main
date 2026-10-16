@@ -153,6 +153,33 @@ async def test_unknown_duration_is_visible_and_known_overlimit_is_marked():
         await client.close()
 
 
+@pytest.mark.asyncio
+async def test_exact_318186_ms_first_source_is_excerpt_eligible_but_not_full():
+    calls = []
+    def handler(request):
+        calls.append(request.url.path)
+        if request.url.path == '/api/search/get/web':
+            return httpx.Response(200, json={'code':200, 'result':{'songs':[
+                song(1, duration=318186), song(2, duration=200000)]}})
+        return httpx.Response(200, json={'code':200, 'data':[
+            {'id':1, 'url':'https://cdn.example/first.mp3', 'freeTrialInfo':None}]})
+    client, gateway = await setup(handler)
+    try:
+        full = await gateway.search('creep', max_duration_s=300)
+        excerpt = await gateway.search('creep', max_duration_s=900)
+        assert [item.track_id for item in excerpt] == ['1', '2']
+        assert full[0].duration_s == excerpt[0].duration_s == 318.186
+        assert full[0].availability == 'over_limit'
+        assert excerpt[0].availability == 'unknown'
+        with pytest.raises(service.CatalogueError) as error:
+            await gateway.resolve(full[0])
+        assert error.value.code == 'source_duration_limit'
+        assert (await gateway.resolve(excerpt[0])).song_id == '1'
+        assert calls.count('/api/song/enhance/player/url') == 1
+    finally:
+        await client.close()
+
+
 def test_only_explicit_version_tags_are_classified():
     assert service.explicit_version('Live Forever')=='unspecified'
     assert service.explicit_version('Creep (Live at BBC)')=='live'

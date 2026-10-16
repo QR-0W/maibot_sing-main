@@ -13,14 +13,17 @@ import re
 from ..runtime.stage_receipts import CheckpointError, StageReceipts
 from .job_store import JobConflict, JobStore
 from .ownership import exclusive, OwnershipBusy
+from .resource_budget import (CgroupUnavailable, InsufficientMemoryError,
+                              check_headroom, cgroup_limits)
 from .stage_errors import classify_failure, failure_document, INTERRUPTED_CODES
 from .unit_runner import UnitError, UnitRunner
 
 
 class StageCoordinator:
-    def __init__(self, store: JobStore, runner: UnitRunner):
+    def __init__(self, store: JobStore, runner: UnitRunner, cgroup_root: Path = Path('/sys/fs/cgroup')):
         self.store=store
         self.runner=runner
+        self.cgroup_root=Path(cgroup_root)
 
     def lock_path(self, job_id):
         if not isinstance(job_id,str) or not re.fullmatch('[0-9a-f]{32}',job_id):
@@ -182,10 +185,22 @@ class StageCoordinator:
         if state!='absent':
             raise UnitError('unit_status_unknown','Existing unit lacks a launch record')
         try:
+            # Refuse to start a stage that cannot fit beside the running host.
+            # No receipt is written and the slot is released as interrupted.
+            check_headroom(self.runner.budget, cgroup_limits(self.cgroup_root))
+        except InsufficientMemoryError:
+            return await self._settle(owner,workspace,recipe,step,'resource_budget_exhausted')
+        except CgroupUnavailable:
+            return await self._settle(owner,workspace,recipe,step,'cgroup_unavailable')
+        try:
             result=await self.runner.run(unit,plan,step,workspace,ownership_fd=ownership_fd)
         except UnitError as exc:
             state=await self.runner.state(unit)
-            if state=='stopped' or (state=='absent' and UnitRunner.launch_finished(workspace,unit)):
+            # Destination admission failed before the launcher created a log.
+            # An absent unit + no launch witness/log proves no media was started.
+            refused = (exc.code in ('resource_budget_exhausted', 'cgroup_unavailable')
+                       and state == 'absent' and not log.exists())
+            if refused or state=='stopped' or (state=='absent' and UnitRunner.launch_finished(workspace,unit)):
                 return await self._settle(owner,workspace,recipe,step,exc.code)
             raise
         state=await self.runner.state(unit)

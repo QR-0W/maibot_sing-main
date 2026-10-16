@@ -1,88 +1,73 @@
-# 0.5.0 配置契约（开发中，尚未部署）
+# 0.6.1 配置与请求契约
 
-本契约描述当前隔离分支，不是启用指令。配置结构以 [plugin.py](../plugin.py) 的 `SingPluginConfig` 为准，依赖与版本范围以 [_manifest.json](../_manifest.json) 为准。遵循 MaiBot 官方[配置管理](https://docs.mai-mai.org/plugin/config)与[生命周期](https://docs.mai-mai.org/plugin/lifecycle)约定。
+配置结构版本仍为0.6.0；本更新没有修改运行配置或新增迁移Hook。生产应用须获用户授权，真实媒体与QQ送达另行验收。
 
-## 配置来源与兼容性
+本契约对应 `feat/conversational-singing`，不是启用或生产 QQ 试发许可。配置结构以 [入口配置模型](<../plugin.py>) 为准，依赖与兼容范围以 [Manifest](<../_manifest.json>) 为准；[示例配置](<../config.example.toml>)仅供审阅，不能覆盖 Runner 管理的运行配置。遵循 [MaiBot Vibe Coding 指南](https://docs.mai-mai.org/plugin/vibe-coding)。
 
-- Runner 根据 `config_model` 生成、补齐当前安装实例的运行配置；插件不复制模板覆盖它。
-- [config.example.toml](../config.example.toml) 只用于审阅。`plugin.enabled=false`，`plugin.config_version="0.5.0"`；启用需管理员明确决定。
-- 当前验证环境为 Host 1.3.0 / SDK 2.8.2，Manifest 下界与此一致。不要开启强制兼容来绕过缺少的原始消息或详细发送回执契约。
-- 0.4.0 的六个路径不足以启动新版。新增 HuBERT、本地 Demucs 仓库、RVC 上游目录；字段补齐为空不等于完成配置。
+## 配置来源
 
-## `[local]` 字段
+- `PluginConfigBase + Field` 定义源码契约；Runner 生成、补齐当前安装实例的配置。插件不自行复制模板或新增配置迁移 Hook。
+- 默认 `plugin.enabled=false`。当前兼容下界为 Host 1.3.0 / SDK 2.8.2；没有验证所有声明范围内的版本。
+- 模型、独立推理环境、声音素材权利不随插件分发；不要修改 MaiBot 核心依赖或全局模型缓存。
 
-| 字段 | 当前契约 |
+## `[local]` 关键字段
+
+| 字段 | 契约 |
 |---|---|
-| `backend` | 只允许 `local` 的持久化受限渲染，不回退旧 sidecar。 |
-| `output_dir` | 空字符串使用 SDK `ctx.paths.data_dir/covers`；覆盖值必须为绝对非符号链接目录。新账本首次接纳前持久绑定库根，此后改变根会明确拒绝，不会搬迁旧成品或消耗待投递许可。0.4 升级应首次即选择独立 `covers-v2` 根以便回滚。 |
-| `model_path` / `index_path` | 管理员固定配置的 RVC checkpoint 与 FAISS 索引绝对路径；请求不能提供任意模型或本地输入路径。 |
-| `hubert_path` | 显式 HuBERT 绝对路径，不采用外部脚本的开发者默认路径。 |
-| `demucs_repo_path` | 专用本地目录，只含 `htdemucs.yaml` 与 `955717e8-8726e21a.th`。bag 内容为 `models: ['955717e8']`，不得使用符号链接或加入其他模型。真实执行调用 `get_model('htdemucs', repo=...)`，不读默认远程仓库或缺失时联网补权重。 |
-| `rvc_script` | 经管理员审查的固定 RVC wrapper 绝对路径。此插件针对当前 wrapper 契约，不执行任意聊天命令。 |
-| `rvc_upstream_path` | 必须等于 `rvc_script` 同目录下的 `upstream`，对应 wrapper 真正导入的源码树；不能填另一份无关源码来伪造资产指纹。 |
-| `worker_python` | 包含推理依赖的隔离 Python 绝对路径；本机验证为 Python 3.9。虚拟环境解释器的正常符号链接可以使用，不要替换成会失去虚拟环境语义的裸系统解释器。 |
-| `inference_lock` | 与本机其他模型实验共享的绝对锁路径；模型服务内部取得，不能每个任务换一把锁。 |
-| `max_queue` | 默认 2，范围 0–8。当前总未终结任务容量为 `max(1, max_queue + 1)`，计入搜索、候选等待、排队、运行和取消待对账；不是仅统计等待推理的队列。 |
-| `max_duration_s` | 默认 300，配置范围 30–300；固定最短输入为 30 秒。 |
-| `max_download_bytes` | 默认及最大 64 MiB，配置最小 1 MiB；还校验响应和流式累计字节。 |
-| `timeout_s` | 保留的历史字段，不控制新版持久化阶段，也不是整曲 RPC 等待时长。不要通过增大它修复阶段问题。 |
-| `musicdl_python` / `local_source_allowlist` | 历史兼容/维护者回归字段。新版在线翻唱使用同一登录态的 CatalogueService 精确 ID 取链，正常聊天不提供本地路径入口。 |
+| `backend` | 当前只支持 `local` 的持久受限渲染；不回退旧 sidecar。 |
+| `output_dir` | 空值使用 `ctx.paths.data_dir/covers`；覆盖值须为绝对、非符号链接目录。账本首次绑定后不能靠热更搬迁库根。 |
+| `model_path` / `index_path` | 管理员固定的 RVC 权重和索引绝对路径；用户不能指定任意模型或输入路径。 |
+| `hubert_path` | 显式 HuBERT 路径，无开发机默认值。 |
+| `demucs_repo_path` | 专用本地仓库，仅含受支持的 `htdemucs.yaml` 与签名 checkpoint；缺失即失败，不联网补权重。 |
+| `rvc_script` / `rvc_upstream_path` | 固定、受审查 wrapper；upstream 必须是 wrapper 同目录的 `upstream`，与实际导入一致。 |
+| `worker_python` | 包含已有推理依赖的隔离解释器；正常 venv 解释器符号链接可用。媒体运行时代码须兼容该解释器。 |
+| `inference_lock` | 与本机其它重型实验共享的绝对锁路径；在媒体服务内部取得，不允许按作业换锁。 |
+| `memory_max_mb` | 默认 **2048 MiB**，范围 512–6144；1 MiB=1,048,576 字节。限制整个独立媒体服务及所有子进程，不是共享 SDK Runner 的对象内存。 |
+| `memory_headroom_mb` | 默认 512 MiB，范围 256–4096；每个有限共享祖先必须容纳完整媒体预算加此余量。 |
+| `cpu_quota_percent` | 默认 150，范围 25–400；是 systemd CPU 配额，不代表线程数。 |
+| `media_tasks_max` | 默认 64，范围 8–512，限制整个媒体服务的任务数。 |
+| `max_queue` | 默认 2，范围 0–8；总未终结容量为 `max(1,max_queue+1)`，包括待选择、排队、运行及取消待对账。 |
+| `max_duration_s` | 仅控制full完整来源，默认/上限300秒，最短30秒；excerpt完整来源统一30–900秒，所有片段仅分离唯一中心≤90秒原音频上下文。完整来源仍须成功EOF流式计帧，不能用90秒截断冒充完整源校验。 |
+| `max_download_bytes` | 默认/上限 64 MiB；响应声明及流式累计字节都校验。 |
+| `timeout_s` | 历史兼容字段，不控制新版阶段或整曲 RPC。 |
+| `musicdl_python` / `local_source_allowlist` | 历史兼容字段，不提供普通聊天本地输入入口；在线来源由同一登录态按精确平台 ID 解析。 |
 
-不随插件分发权重或推理环境。外部环境依赖与插件 Runner 自身的 Manifest Python 依赖分开管理；不要为部署插件改变 MaiBot 核心依赖。
+资源设置在生命周期首次 await 前验证并冻结，媒体单元通过环境获得同一快照，无缺字段时的旧 4 GiB 回退。`MemoryHigh` 自动取硬限的 75%，`MemorySwapMax=0`，`KillMode=control-group`，`OOMPolicy=kill`。Worker 验证实际 cgroup 的硬/软限、swap、CPU、任务数及 `memory.oom.group`。
 
-## 请求、选曲和明确许可
+启动前读取真实容器及目标用户服务 cgroup 的有限祖先容量/用量；在共享锁内、启动媒体子进程前再次检查。未知容量、不可读 cgroup 或余量不足明确拒绝，不悄悄缩小预算。用量包括被计费的文件缓存，不等于不可回收进程 RSS。其它服务仍可能增长，**本策略不保证整个容器永不 OOM**，也不会停止或修改它们。
 
-```text
-/翻唱 准确歌名 - 艺人名
-/翻唱 准确歌名 - 艺人名 --album 专辑名 --source-id 平台曲目ID --with-instrumental --auto-reply
-/翻唱选择 任务ID 序号
-/翻唱状态 任务ID
-/翻唱取消 任务ID
-```
+## 两个入口，一份接纳实现
 
-- `--auto-reply` 必须位于最后；仅该显式参数表示同意在完成后向原会话自动发送一次。没有该参数时仅保存结果，不请求自动投递。
-- 所有可能向 stream 回复的 Command（含 `/说`、音色列表、扫码、登录态和停用 Cookie 错误响应）在任何发送、搜索、模型或任务入队前，先核原始宿主消息 ID、QQ 平台、会话、用户和文本；缺可信来源时连拒绝消息也**不向该 stream 发送**。当前只接受当前 NapCat codec 的 `additional_config.self_id`/`napcat_message_type`/目标群或用户字段，与已注册 Host gateway 添加的非空 `platform_io_account_id` 自洽；显式拒绝 `webui_virtual_group_`。缺字段的旧适配器 QQ 消息将安全拒绝，不允许降级；普通 WebUI 和 WebUI 虚拟 QQ 均不作为生产测试沙箱。这是固定版本的当前 Host/NapCat 信任边界，不是抵御有网关 RPC 权限恶意插件的加密签名。
-- `--auto-reply` 从可信原始文本解析；候选约束与许可参与请求内容一致性检查。持久 request 必须带固定 `napcat-host-route-v1` 来源证明。旧无此证明的 `pending` 即使存有消息 ID/许可，在候选扫描及单事务 `claim_delivery` 中双重拒绝，不追认、不自动发 QQ；若需继续，只能由真正 QQ 用户重新发送新命令。
-- 多个候选保留展示顺序，由用户选择；选定后只解析该平台和曲目 ID。不可下载、仅试听或过长时不换另一条录音。标注时长只能检查媒体长度一致性，不能证明 studio 或使用权。
-- 候选快照默认有效 600 秒。接纳前及调度周期会有界回收过期候选和遗留半提交搜索（每轮至多 100 项），保留记录并撤销待投递许可；重复同一消息不会延长有效期。过期后请发起新请求，不选择旧快照。
-- 当前 Host 的 Tool 参数不是可信原始消息身份，因此 Tool 只给出原会话 Command 指引，不凭模型参数入队或投递。不能把“自然语言默认第一候选”的纯选择函数误称为已完成可信 Tool 自动任务集成。
-- 取消不会撤回已开始的平台发送；`dispatching`、`unknown`、`sent` 不允许再次自动发送。当前没有公开的中断阶段重试命令，不能通过手改 SQLite、删除日志或换 unit ID 绕过所有权。
-- `/163cookie` 已停止应用聊天携带的凭证。请通过受保护配置或 operator 扫码流程登录；不要在聊天中粘贴 token/cookie。
+| 入口 | 参数来源 | 默认长度 | 默认伴奏 | 默认投递 |
+|---|---|---|---|---|
+| `/翻唱 歌名 - 艺人` | 校验后的 Host 原始直接文本 | full | 有 | file |
+| 自然语言 → `cover_song` | LLM 填格式化 `title` / `artist` | 12–18 秒 excerpt | 无 | voice |
 
-## 存储与恢复
+Command 仅匹配 `/翻唱`，不拦截自然句式。Tool 是正常 deferred 工具，必须由 MaiCore/LLM 发现并调用，不设置 `core_tool=True`，不借 Hook 建另一条入口。两者都调用 [JobService](<../services/job_service.py>) 的结构化接纳；只在目录搜索边界拼接 query，不再拆回 title/artist，也不禁止字段内部合法的 ` - `。
 
-SDK 数据根目录内：
+- Command 的 `--full/--excerpt`、`--with-instrumental/--without-instrumental`、`--file/--voice` 独立覆盖，每个维度只能出现一次；支持 `--album`、`--source-id`、`-v`，未知/重复/矛盾选项拒绝。
+- Tool 的可选参数为 `render_mode`、`instrumental`、`delivery_mode`、`album`、`source_id`；歌名或艺人未知时应先问用户，不能编造。
+- **明确请求翻唱即授权完成后向当前原会话最多尝试一次投递，不需要 `--auto-reply`。** 旧旗标只兼容；历史不带许可的作业不升级。
+- Tool自动冻结准确过滤后的首个候选（包含Live）；首项超限/不可访问明确拒绝，不跳后项。Command多个候选仍由本人 `/翻唱选择 任务ID 序号` 选择。不会按时长推断studio或权利；默认候选期限600秒。
+- `/翻唱状态`、`/翻唱取消` 保留；`cover_song_status(job_id)` 只读本会话当前用户的任务。
+- Tool 返回 `success/job_id/state/code/content`，可附 `choices/delivery_state`。这是接纳或状态结果，不等待整曲，不把已接纳等同已渲染或已发送。
 
-```text
-.durable-scheduler.lock
-jobs.sqlite3                  # jobs / offers / stage attempts / delivery
-jobs/<job-id>/                 # 私有输入、配方、计划、阶段收据、日志
-covers/<recipe-key>/           # 永久 cover.mp3 + metadata.json
-covers/songs/                  # 可浏览硬链接
-covers/library-index.json
-covers/README.md
-```
+## 信任与重放
 
-- 服务准备阶段先固定库根，再按真实非 source 文件哈希、运行时版本、执行路径、输出根和参数策略形成稳定 `service_generation`。请求接纳把该代际写入账本；配置变化后的旧未冻结任务明确终止为 `configuration_changed`，不悄悄换用新模型。
-- 请求、候选快照及单候选入队在同一 SQLite 事务中完成。入口通过 JobService 的接纳接口操作，不留下可见的半提交搜索，也不延长同一原始消息的候选有效期。
-- 进程级 scheduler 锁防止两个实例同时恢复同一队列；线程 offload 持有重复文件描述符，卸载不能提前释放尚未结束的同步操作所有权。
-- 每个阶段先持久化唯一 unit 身份，再执行受限服务。重启先对账既有 unit，不以“当前没查到进程”猜测上次已经失败。
-- 缺少启动证据、systemd 状态未知或锁被占用时保留任务槽；`coordinator-error.json` 提供受限原因并指数退避，不能通过自动重试掩盖未知状态。
-- 官方取链若返回 HTTP CDN 地址，只允许白名单验证后的单向 HTTPS 升级，保持 authority、path 和 signed query 不变；每次重定向同样校验。TLS 失败不会回到明文 HTTP，也不会换曲目 ID。
-- source 在全量接收、文件 fsync 后以不覆盖的 link 提交。提交前取消可留下 `.part`；提交后取消保留完整 source，后续仍须探测校验。取消不是回滚已完成的磁盘提交。
-- 完成阶段的收据和字节保留，不把成功分块当临时缓存删除。永久 MP3 只在来源、配方及全部计划收据验证后原子提交。
-- 配方 `sing-render-v2` 绑定真实源码、权重、本地 Demucs 仓库和实际 argv；忽略可再生成的 `.git`/`__pycache__`，不忽略源码。记录的依赖版本不等于整个操作系统/二进制环境的可复现指纹。
-- 旧 0.4.0 成品走独立 legacy 验证，保持原字节与位置；旧开发配方不作为 v2 缓存使用。不删除旧成品来“修复”新版本校验。
-- 当前没有自动删除失败任务中间件或永久音频的保留期任务。管理员须监测磁盘；清理前证明没有活跃/未知 worker 并备份证据。
+Command 校验当前 NapCat/Host 原始消息 ID、QQ 账号/目标/已注册路由及直接 text，拒绝引用、@、语音/ASR、转发、notify 和 WebUI 虚拟 QQ。原始消息 ID 参与持久去重，许可标记为 `napcat-direct-text-v2`。
 
-## 有界执行和投递
+Tool 校验 SDK/MaiCore 提供的一致 `stream_id/chat_id`、QQ 平台及用户，并拒绝虚拟会话。按用户接受的 Host/LLM 会话信任边界工作，标记为 `napcat-tool-session-v1`；**不是原始消息锚点或密码学签名**，本分支不修改核心，也不自行计算真实聊天流 ID。
 
-每个模型阶段独立 `systemd-run --user`：`MemoryMax=4G MemoryHigh=3G MemorySwapMax=0 CPUQuota=150% TasksMax=64 TimeoutStopSec=15`。模型进程自检 cgroup，并在服务内部持有共享推理锁。
+Tool 的完整用户/会话/参数意图在 SQLite 事务中绑定随机任务 token：活动任务复用，终态更新时间后 60 秒内重放复用，此后允许新请求。未提交搜索预约也有限期；不是永久禁止用户再唱同一首歌。Command 保持原消息去重。旧 v1/缺标记的 pending 不自动投递，sent/unknown 不重发。
 
-阶段软期限：decode 120 秒、separate 600 秒、每个 convert 180 秒、mix 60 秒、encode 90 秒、validate 60 秒；unit 额外给予 30 秒退出/写证据余量。RVC 单次音频至多 25 秒。没有一次整曲 900 秒 RPC，也不承诺固定整曲完成时间。
+## 执行、持久成品与错误通知
 
-固定基线参数：`pitch=0 f0_method=harvest index_rate=0.5 filter_radius=3 rms_mix_rate=0.25 protect=0.33 seed=20260928`，无自动变调。`protect=0.50` 在该上游实现中禁用保护，不是更强保护。
+- 每阶段一个有限用户服务；模型工作严格串行。只有证明旧 unit 及子进程已停止，才释放运行槽。
+- decode/separate/convert/mix/encode/validate 的阶段时限分别为 120/600/180/60/90/60 秒，unit 另加 30 秒退出余量。RVC 单次输入至多 25 秒；没有整曲 900 秒 RPC。
+- 永久 MP3 在全部字节、来源、配方和阶段收据验证后发布。成品及可浏览硬链接不自动删除；工作区、日志、未封存输出保留诊断。
+- 音频 outbox：`pending → dispatching → sent/unknown`。只有 `sent=True` 加有效平台消息 ID 才确认送达；超时/异常/布尔回执为 unknown，永不自动重发。
+- 失败/中断的公开文本通知使用独立 `(job_id,kind)` 账本，仅新接纳且明确许可的作业获得资格。claim 在 RPC 前持久化；重载的 dispatching 转 unknown，不重发、不影响媒体投递字段。消息只使用公开错误码/文案，不输出私有异常。
+- SIGKILL 本身不等于 OOM；只有 systemd 明确 `oom-kill` 才报告 `unit_oom`。确认 OOM 后终止整个媒体服务、不发布/发送未完成音频、不自动重试，已验证的旧阶段产物保留。
+- `/说` / `speak_voice` 的 TTS 与旧后处理尚未纳入当前受限链路，明确不支持；不合成、不读取参考音频，不回退未受限路径。音乐登录/二维码与固定音色列表保留。
 
-消息投递只消费持久许可：`pending → dispatching → sent/unknown`。只有正向回执且非空平台消息 ID 才能证明 `sent`；当前 SDK 的 `False` 也可能出现在平台成功后的存储异常，故按未知处理。重启不会把未知发送退回 pending。它是“最多尝试一次”，不是恰好送达一次；在 claim 与实际发送之间崩溃，可能零次送达。
-
-音色身份、训练素材权利及用户反馈的沙哑问题仍需单独评估；基础设施验收不等于音质修复。
+音质、角色身份及训练素材权利是独立验收项。私有 Aris 测量峰值稍高于 2048 MiB，不据此声称它能在默认额度内完成。更多说明见[对话式翻唱](<CONVERSATIONAL_SINGING.md>)与[部署验收](<DEPLOYMENT.md>)。

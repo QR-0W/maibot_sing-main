@@ -11,9 +11,11 @@ import pytest
 root=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('probe_test_pkg',root/'__init__.py',submodule_search_locations=[str(root)])
 pkg=importlib.util.module_from_spec(spec);sys.modules[spec.name]=pkg;spec.loader.exec_module(pkg)
-module=importlib.import_module('probe_test_pkg.services.media_probe')
+# Exercise the one standard-library algorithm now inside the hashed worker.
+module=importlib.import_module('probe_test_pkg.runtime.worker')
 item=importlib.import_module('probe_test_pkg.services.source_offer').CatalogueItem
-errors=importlib.import_module('probe_test_pkg.services.catalogue_service')
+from types import SimpleNamespace
+errors=SimpleNamespace(CatalogueError=module.ProbeError)
 
 
 class FakeStream:

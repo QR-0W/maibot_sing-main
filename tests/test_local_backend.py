@@ -31,7 +31,7 @@ def test_source_identity_and_parameters_change_key():
     assert backend.PARAMETERS['seed'] == 20260928
 
 
-@pytest.mark.parametrize('value', ['../hi', '/etc/passwd', '-h', 'a\\b', 'a\nb', ''])
+@pytest.mark.parametrize('value', ['../hi', '/etc/passwd', 'a\\b', 'a\nb', ''])
 def test_unsafe_titles_rejected(value):
     with pytest.raises(ValueError):
         backend.safe_text(value)

@@ -1,3 +1,7 @@
+# Project-local private assets and administrator-provisioned third-party code
+/.local/
+/engines/rvc/upstream/
+
 # Local configuration and credentials
 /config.toml
 .env

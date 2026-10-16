@@ -30,36 +30,75 @@ def voice_file(tmp_path):
     ({'sent': False, 'message_id': None}, 'unknown'),
     (False, 'unknown'),
 ])
-async def test_exactly_one_detailed_voiceurl_attempt(tmp_path, result, expected):
+@pytest.mark.parametrize('mode', [None, 'voice', 'file'], ids=['legacy', 'voice', 'file'])
+async def test_exactly_one_detailed_voiceurl_attempt(tmp_path, result, expected, mode):
+    options = {} if mode is None else {'delivery_mode': mode}
+    kind = 'file' if mode == 'file' else 'voiceurl'
     calls = []
     async def fake_custom(*args, **kwargs):
         calls.append((args, kwargs))
         return result
     sender = SingleVoiceSender(fake_custom, rpc_timeout_ms=1234)
-    receipt = await sender.send_file(voice_file(tmp_path), 'stream-1')
+    receipt = await sender.send_file(voice_file(tmp_path), 'stream-1', **options)
     assert receipt.outcome == expected
-    assert calls == [(('voiceurl', {'url': (tmp_path / 'speech.wav').as_uri()}, 'stream-1'),
+    content = {'url': (tmp_path / 'speech.wav').as_uri()}
+    if mode == 'file':
+        content['name'] = 'speech.wav'
+    assert calls == [((kind, content, 'stream-1'),
                       {'return_details': True, 'timeout_ms': 1234})]
 
 
 @pytest.mark.asyncio
-async def test_post_platform_host_store_exception_or_raise_never_falls_back(tmp_path):
+async def test_explicit_file_mode_uses_file_payload_once(tmp_path):
+    calls=[]
+    async def fake_custom(*args,**kwargs):
+        calls.append((args,kwargs))
+        return {'sent':True,'message_id':'file-id'}
+    path=voice_file(tmp_path)
+    receipt=await SingleVoiceSender(fake_custom,rpc_timeout_ms=4321).send_file(
+        path,'stream',delivery_mode='file')
+    assert receipt.outcome=='sent'
+    assert calls==[(('file',{'url':path.as_uri(),'name':'speech.wav'},'stream'),
+                    {'return_details':True,'timeout_ms':4321})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('invalid', ['record', '', None, True, 1, [], {}])
+async def test_invalid_delivery_mode_is_rejected_without_transport(tmp_path, invalid):
+    calls=[]
+    async def fake_custom(*args,**kwargs):
+        calls.append(args)
+        return False
+    sender=SingleVoiceSender(fake_custom)
+    with pytest.raises(ValueError,match='delivery mode'):
+        await sender.send_file(voice_file(tmp_path),'stream',delivery_mode=invalid)
+    assert not calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', [None, 'voice', 'file'], ids=['legacy', 'voice', 'file'])
+async def test_post_platform_host_store_exception_or_raise_never_falls_back(tmp_path, mode):
+    options = {} if mode is None else {'delivery_mode': mode}
+    kind = 'file' if mode == 'file' else 'voiceurl'
     calls = []
     async def fake_custom(*args, **kwargs):
         calls.append(args[0])
         return False  # Host caught a post-platform store/hook exception.
     sender = SingleVoiceSender(fake_custom)
-    assert (await sender.send_file(voice_file(tmp_path), 'stream')).outcome == 'unknown'
-    assert calls == ['voiceurl']
+    assert (await sender.send_file(voice_file(tmp_path), 'stream', **options)).outcome == 'unknown'
+    assert calls == [kind]
     async def raising(*args, **kwargs):
         calls.append(args[0]); raise RuntimeError('post-send hook failed')
     sender = SingleVoiceSender(raising)
-    assert (await sender.send_file(voice_file(tmp_path), 'stream')).outcome == 'unknown'
-    assert calls == ['voiceurl', 'voiceurl']  # one per independent request
+    assert (await sender.send_file(voice_file(tmp_path), 'stream', **options)).outcome == 'unknown'
+    assert calls == [kind, kind]  # one per independent request
 
 
 @pytest.mark.asyncio
-async def test_timeout_observes_late_ack_without_sending_text(tmp_path):
+@pytest.mark.parametrize('mode', [None, 'voice', 'file'], ids=['legacy', 'voice', 'file'])
+async def test_timeout_observes_late_ack_without_sending_text(tmp_path, mode):
+    options = {} if mode is None else {'delivery_mode': mode}
+    kind = 'file' if mode == 'file' else 'voiceurl'
     gate = asyncio.Event()
     seen = []
     calls = []
@@ -68,30 +107,33 @@ async def test_timeout_observes_late_ack_without_sending_text(tmp_path):
         return {'sent': True, 'message_id': 'late-id'}
     sender = SingleVoiceSender(fake_custom, acknowledgement_timeout_s=0.01,
                                late_receipt=seen.append)
-    assert (await sender.send_file(voice_file(tmp_path), 'stream')).outcome == 'unknown'
+    assert (await sender.send_file(voice_file(tmp_path), 'stream', **options)).outcome == 'unknown'
     gate.set()
     await asyncio.wait_for(asyncio.gather(*tuple(sender._watchers)), 1)
     assert [(item.outcome, item.message_id) for item in seen] == [('sent', 'late-id')]
-    assert calls == ['voiceurl']
+    assert calls == [kind]
 
 
 @pytest.mark.asyncio
-async def test_cancellation_and_shutdown_are_bounded_and_never_retry(tmp_path):
+@pytest.mark.parametrize('mode', [None, 'voice', 'file'], ids=['legacy', 'voice', 'file'])
+async def test_cancellation_and_shutdown_are_bounded_and_never_retry(tmp_path, mode):
+    options = {} if mode is None else {'delivery_mode': mode}
+    kind = 'file' if mode == 'file' else 'voiceurl'
     started = asyncio.Event()
     calls = []
     async def fake_custom(*args, **kwargs):
         calls.append(args[0]); started.set()
         await asyncio.Event().wait()
     sender = SingleVoiceSender(fake_custom)
-    attempt = asyncio.create_task(sender.send_file(voice_file(tmp_path), 'stream'))
+    attempt = asyncio.create_task(sender.send_file(voice_file(tmp_path), 'stream', **options))
     await started.wait()
     attempt.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(attempt, 0.2)
     await asyncio.wait_for(sender.shutdown(timeout_s=0.01), 0.2)
-    assert calls == ['voiceurl']
+    assert calls == [kind]
     with pytest.raises(RuntimeError, match='closed'):
-        await sender.send_file(voice_file(tmp_path), 'stream')
+        await sender.send_file(voice_file(tmp_path), 'stream', **options)
 
 
 @pytest.mark.asyncio

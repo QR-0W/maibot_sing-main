@@ -12,6 +12,8 @@ import re
 import uuid
 
 from ..runtime.stage_receipts import StageReceipts, CheckpointError
+from .resource_budget import (CgroupUnavailable, InsufficientMemoryError,
+                              ResourceBudget, check_ancestors)
 
 _UNIT = re.compile(r'maibot-sing-[0-9a-f]{32}-[a-z][a-z0-9_-]{0,63}\Z')
 
@@ -65,14 +67,54 @@ def save_plan(path: Path, *, workspace: Path, recipe: str,
 
 
 class UnitRunner:
-    def __init__(self, stage_executor: Path, python: Path):
-        if (not stage_executor.is_absolute() or not stage_executor.is_file() or
-                stage_executor.is_symlink() or not python.is_absolute() or not python.is_file()):
-            raise ValueError('Configured stage executor and Python must be existing files')
-        # A venv/bin/python is normally a symlink to its interpreter; this is
-        # an administrator-supplied path, unlike the untrusted job workspace.
+    def __init__(self, stage_executor: Path, python: Path,
+                 budget: Optional[ResourceBudget] = None):
+        if not stage_executor.is_absolute() or not python.is_absolute():
+            raise ValueError('Configured stage executor and Python require absolute paths')
+        # Recovery observes durable units without reading today's execution assets.
+        # Their existence and symlink policy are checked only at the launch fence.
         self.executor=stage_executor
         self.python=python
+        self.budget=budget if budget is not None else ResourceBudget.from_config()
+
+    def _unit_properties(self, step) -> list:
+        """Budget-derived ``-p`` properties with this stage's own runtime cap."""
+        return [item if not item.startswith('RuntimeMaxSec=')
+                else 'RuntimeMaxSec=%d' % min(step.unit_limit_s, self.budget.runtime_max_seconds)
+                for item in self.budget.systemd_properties()] + [
+                    '-p', 'KillMode=control-group', '-p', 'OOMPolicy=kill']
+
+    def _unit_environment(self, unit: str) -> str:
+        """Tell the in-unit worker which budget was actually applied."""
+        return ('MAIBOT_SING_UNIT=' + unit +
+                ' MAIBOT_SING_BUDGET_MEMORY_MAX=' + str(self.budget.memory_max_bytes) +
+                ' MAIBOT_SING_BUDGET_MEMORY_HIGH=' + str(self.budget.memory_high_bytes) +
+                ' MAIBOT_SING_BUDGET_TASKS_MAX=' + str(self.budget.tasks_max) +
+                ' MAIBOT_SING_BUDGET_CPU_PERCENT=' + str(self.budget.cpu_quota_percent) +
+                ' MAIBOT_SING_BUDGET_HEADROOM=' + str(self.budget.headroom_bytes))
+
+    async def check_destination_budget(self) -> None:
+        """The media unit belongs to the user manager, not MaiBot's own leaf."""
+        proc = await asyncio.create_subprocess_exec(
+            'systemctl', '--user', 'show', '--property=ControlGroup', '--value', '--', '-.slice',
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        try:
+            raw, _ = await asyncio.wait_for(proc.communicate(), 10)
+        except asyncio.TimeoutError as exc:
+            proc.kill()
+            await proc.wait()
+            raise UnitError('cgroup_unavailable', '无法查询媒体服务的目标 cgroup，未启动') from exc
+        relative = raw.decode('utf-8', 'strict').strip()
+        if proc.returncode or not relative.startswith('/') or '..' in Path(relative).parts:
+            raise UnitError('cgroup_unavailable', '媒体服务目标 cgroup 无效，未启动')
+        root = Path('/sys/fs/cgroup')
+        target = root / relative.lstrip('/') / 'app.slice'
+        try:
+            await asyncio.to_thread(check_ancestors, self.budget, target, root=root)
+        except InsufficientMemoryError as exc:
+            raise UnitError('resource_budget_exhausted', str(exc)) from exc
+        except (CgroupUnavailable, OSError) as exc:
+            raise UnitError('cgroup_unavailable', '无法验证媒体服务祖先内存限制，未启动') from exc
 
     @staticmethod
     def name(run_token: str, step: str) -> str:
@@ -142,6 +184,22 @@ class UnitRunner:
         Cancellation deliberately does not kill the independent user service;
         the reconciler must inspect it on reload before any retry.
         """
+        # Refuse before querying/launching subprocesses or creating launch logs.
+        # A venv interpreter symlink is administrator supplied and remains valid;
+        # executable stage code and its witness helper must be regular files.
+        launcher=self.executor.with_name('unit_launcher.py')
+        try:
+            valid=(self.executor.is_file() and not self.executor.is_symlink()
+                   and self.python.is_file())
+            helper_valid=launcher.is_file() and not launcher.is_symlink()
+        except OSError as exc:
+            raise UnitError('execution_config_invalid',
+                            'Configured execution files cannot be inspected; no launch') from exc
+        if not valid:
+            raise UnitError('execution_config_invalid',
+                            'Configured executor or Python is missing or invalid; no launch')
+        if not helper_valid:
+            raise UnitError('launcher_missing','Configured launch witness helper is missing')
         name=_safe_unit(unit)
         if not plan_path.is_absolute() or not plan_path.is_file() or not workspace.is_absolute():
             raise ValueError('Private plan or workspace missing')
@@ -151,6 +209,7 @@ class UnitRunner:
         if prior!='absent':
             raise UnitError('unit_reconcile_required',
                 'Existing unit must be reconciled before launch: '+prior)
+        await self.check_destination_budget()
         logs=workspace/'unit-logs'
         logs.mkdir(mode=0o700,exist_ok=True)
         StageReceipts._safe(logs)
@@ -158,14 +217,9 @@ class UnitRunner:
         fd=os.open(logfile,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
         try:
             argv=['systemd-run','--user','--wait','--pipe','--unit',unit,
-                '-p','MemoryMax=4G','-p','MemoryHigh=3G','-p','MemorySwapMax=0',
-                '-p','CPUQuota=150%','-p','TasksMax=64','-p','TimeoutStopSec=15',
-                '-p','RuntimeMaxSec='+str(step.unit_limit_s),
-                '-p','Environment=MAIBOT_SING_UNIT='+unit,
+                *self._unit_properties(step),'-p','TimeoutStopSec=15',
+                '-p','Environment='+self._unit_environment(unit),
                 str(self.python),str(self.executor),'--plan',str(plan_path),'--stage',step.name]
-            launcher=self.executor.with_name('unit_launcher.py')
-            if not launcher.is_file() or launcher.is_symlink():
-                raise UnitError('launcher_missing','Configured launch witness helper is missing')
             os.fstat(ownership_fd)
             command=[str(self.python),str(launcher),'--lock-fd',str(ownership_fd),
                 '--result',str(logs/(unit+'.exit.json')),

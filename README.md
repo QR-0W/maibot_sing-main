@@ -1,98 +1,131 @@
 # maibot-sing
 
-MaiBot 插件：通过音乐来源搜索与 RVC 本地处理生成歌曲翻唱。此仓库是 [xiaocutedog/maibot_sing-main](https://github.com/xiaocutedog/maibot_sing-main) 的 QR-0W fork；上游原有的说话/MiMo TTS 等能力及致谢信息见下文。当前 dev 分支的本地后端、持久化及安全约束以 [部署与数据说明](docs/DEPLOYMENT.md)、[配置契约](docs/CONFIG_CONTRACT.md) 和 [SDK 合规审计](docs/SDK_COMPLIANCE.md) 为准；本说明不表示插件已在任何运行实例启用，也不表示当前重构已经通过完整 Host 加载验收。
+让 MaiBot 用管理员配置的 RVC 音色翻唱已有歌曲：搜索准确来源、分离人声、保留原旋律转换，并把成品长期保存在可浏览音频库。
 
-## 功能概览
+本项目是 [xiaocutedog/maibot_sing-main](https://github.com/xiaocutedog/maibot_sing-main) 的 [QR-0W fork](https://github.com/QR-0W/maibot_sing-main)。**0.6.1 为有界上下文更新**；生产应用与重载只在用户授权后进行。源码、隔离测试与成功加载不等于真实媒体、生产 QQ 或音质验收；不会向 QQ 试发回归音频。
 
-- 请求已知歌曲并进行人声分离、RVC 转换，可选混回伴奏。
-- 本地后端复用已有 Natsume Iroha RVC v1 模型/index，不重新训练或声称存在英语版 Iroha CV。
-- 完成的翻唱持久保存为 MP3 与 provenance 元数据；临时下载、分离 stems 等 scratch 与成品分开管理。
-- 新任务使用 SQLite 持久账本：搜索/候选等待、queued、running、ready、failed、cancelled、interrupted；渲染与消息投递分别记录，不能把 ready 说成平台已送达。
-- 旧 sidecar 仅为兼容路径，不会成为本地后端失败后的隐式无界 fallback；以契约规定为准。
+[使用](#使用) · [配置](#配置) · [运行边界](#运行边界) · [文档](#文档) · [开发](#开发与验证)
 
-> 运行环境、隔离要求、输出目录和部署前检查见 [DEPLOYMENT.md](docs/DEPLOYMENT.md)。操作前先审阅 [config.example.toml](config.example.toml) 与当前 [CONFIG_CONTRACT.md](docs/CONFIG_CONTRACT.md)。不要把包含凭证的真实 `config.toml` 提交到版本库。
+## 为什么使用它
 
-## 安装与启用
+- **正常说话，也能请求翻唱。** 自然聊天由 LLM 调用格式化 `cover_song` Tool；确定性操作仍可用 `/翻唱`。
+- **三维独立选择。** 整曲或片段、有无伴奏、文件或语音条互不捆绑，用户请求不需要再加 `--auto-reply`。
+- **任务不占整曲 RPC。** SQLite 记录接纳、候选、排队、阶段与取消；接纳返回任务 ID，渲染与投递状态分开。
+- **内存额度看得见。** 默认媒体硬限 2048 MiB，整个独立服务和子进程受限；余量不足明确失败，不偷降预算或走旧后端。
+- **成品找得到。** 永久 MP3、真实来源与配方 metadata、可浏览硬链接和索引；不会自动删除用户音频。
+- **不重复试发。** 音频和失败文本分别持久 claim，只有明确平台回执及消息 ID 才确认送达，未知结果不重发。
 
-本插件遵循 MaiBot 官方的 [Vibe Coding 插件开发指南](https://docs.mai-mai.org/plugin/vibe-coding)、[Manifest](https://docs.mai-mai.org/plugin/manifest)、[生命周期](https://docs.mai-mai.org/plugin/lifecycle) 与 [配置管理](https://docs.mai-mai.org/plugin/config) 约定。将仓库作为独立插件目录放入 MaiBot 的 `plugins/` 下；不要复制文件到 MaiBot 的 `src/`、`dashboard/` 或全局 `config/`：
+这些是实现设计，不是角色身份、音质提升、素材权利或保证送达的承诺。
+
+## 安装与审阅
+
+遵循 [MaiBot 官方插件指南](https://docs.mai-mai.org/plugin/vibe-coding)，在 MaiBot 的 `plugins/` 下保留独立仓库，不向核心目录复制源码。下例仅展示仓库布局，不授权现网安装或启用：
 
 ```bash
-cd /path/to/MaiBot/plugins
-git clone https://github.com/QR-0W/maibot_sing-main.git maibot-sing
+git clone https://github.com/QR-0W/maibot_sing-main.git /path/to/MaiBot/plugins/maibot-sing
 ```
 
-重启 MaiBot 后，在插件管理界面确认 manifest 校验与依赖解析没有报错，再由管理员显式启用。插件默认 `plugin.enabled = false`；在受限本地后端的模型路径、隔离 Python、推理锁和输出路径完成审查前，不应启用渲染。
+先检查 [Manifest](<_manifest.json>)、[配置契约](<docs/CONFIG_CONTRACT.md>)与[部署验收](<docs/DEPLOYMENT.md>)。当前最低 Host 1.3.0 / SDK 2.8.2；没有验证整个声明版本范围。插件默认禁用。
+
+模型、索引、HuBERT、本地 Demucs repo、受审查 RVC wrapper 和独立推理环境由管理员提供，不随插件分发，不自动下载权重或读全局模型缓存。不能为插件修改 MaiBot 核心依赖。
+
+## 使用
+
+### 正常聊天
+
+```text
+你能唱一下朴树的生如夏花吗？
+```
+
+MaiCore/LLM 发现并调用 `cover_song(title="生如夏花", artist="朴树")`。不知道曲目或艺人应先询问，不编造；想听原唱时应使用播放功能，不误触翻唱。Command 不再抢先拦截自然句式，Tool 不强制提升为核心工具。
+
+### 斜杠命令
+
+```text
+/翻唱 生如夏花 - 朴树
+/翻唱 生如夏花 - 朴树 --excerpt --without-instrumental --voice
+/翻唱选择 <任务ID> <序号>
+/翻唱状态 <任务ID>
+/翻唱取消 <任务ID>
+```
+
+| 入口 | 长度默认 | 伴奏默认 | 投递默认 |
+|---|---|---|---|
+| `/翻唱 歌名 - 艺人` | full 整曲 | 有 | file 文件 |
+| `cover_song` Tool | excerpt，12–18 秒 | 干声 | voice 语音条 |
+
+长度 `--full/--excerpt`、伴奏 `--with-instrumental/--without-instrumental`、格式 `--file/--voice` 独立覆盖，每个维度最多一次，重复/矛盾/未知选项拒绝。Tool 对应 `render_mode/instrumental/delivery_mode` 参数；两者可用专辑和准确来源 ID 缩小候选，Command 另有固定音色别名 `-v`。
+
+**请求翻唱就是授权完成后最多一次投递，无需 `--auto-reply`。** 旧 flag 仅作兼容；历史没有许可的任务不会被升级。Tool自动冻结准确过滤后的首项（可含Live），首项阻塞时拒绝，不跳到下一项；Command仍可显式选择版本，不按时长猜studio。
+
+Tool 返回 `success/job_id/state/code/content`，必要时附候选列表；这是接纳/状态，不是整曲已完成。`cover_song_status(job_id)` 限本会话当前用户读取。活动 Tool 任务复用，终态更新时间后的 60 秒内重放复用，之后可以重新请求同一首歌；Command 保持原消息 ID 去重。
+
+其他可见入口：固定音色列表、仅 operator 的 QQ/网易云扫码登录与状态检查。`/163cookie` 不应用聊天携带的秘密。**`/说` 与 `speak_voice` 暂不支持**：TTS/旧后处理没有进入当前受限链路，因此不合成、不读取参考音频、不回退旧 sidecar。
 
 ## 配置
 
-配置结构和默认值唯一由 `plugin.py` 中的 `config_model` 定义。Runner 首次加载时在已安装插件目录生成 `config.toml`，后续模型新增字段也由 Runner 补齐；仓库中的 [config.example.toml](config.example.toml) 仅供审阅，不是运行时配置源。请通过 WebUI 或 Runner 管理的运行时配置修改当前实例，不要提交生成的 `config.toml`、登录态、密钥或数据库。
+[入口](<plugin.py>)的 `config_model` 是结构/默认值来源；Runner 管理运行配置。[示例](<config.example.toml>)只供审阅，不能复制覆盖真实配置或提交其中的凭证。
 
-关键部署字段及边界见 [配置契约](docs/CONFIG_CONTRACT.md)。`local.backend` 应保持为受限的 `local`；模型、索引、HuBERT、Demucs、RVC 脚本、隔离解释器和共享推理锁均由管理员提供绝对路径。旧 sidecar 配置不能替代受限本地执行路径。
-
-## 命令与 Tool
-
-- `/翻唱 <准确歌名> - <艺人名>`：搜索并创建持久任务，默认仅保存、不自动发送；可追加 `--album` 或 `--source-id` 缩小候选。
-- 在上述命令**最后**追加 `--auto-reply`：显式授权完成后向原会话最多发起一次自动投递；如需伴奏，将 `--with-instrumental` 放在它前面。
-- `/翻唱选择 <任务ID> <序号>`：从插件已显示的候选快照中选择版本。
-- `/翻唱状态 <任务ID>`：查询渲染与投递状态。
-- `/翻唱取消 <任务ID>`：持久化取消请求；不能撤回已被平台接受的发送。
-- `/说 <文本>`：按管理员的 MiMo 配置生成语音，仅发起一次文件 URI 投递；未知回执不换消息类型重发。
-- `/音色列表`：显示当前已接纳服务的固定本地模型文件名，不查询已停用的旧 sidecar；文件名不代表角色身份或素材权利已验证。
-- `/qq音乐登录`、`/网易云音乐登录`、`/163logintest`、`/qqlogintest`：仅 operator 使用的登录与诊断命令。
-
-**消息来源限制：**上述所有命令（包括列表、登录测试、扫码及停用 Cookie 告知）仅在当前 NapCat 网关发送的 QQ 原消息与 Host 路由账号/目标元数据同时可验证时执行；否则不向该会话发任何文本、图片或语音，包括拒绝消息。普通 WebUI 和 WebUI 虚拟 QQ 身份不能用于生产翻唱/说话自动测试，虚拟 QQ 自填真实群号尤其可能触发真实 QQ 出站。旧记录即使有 `--auto-reply`，缺少版本化可信 QQ 来源证明也不会被自动投递；请由真实 QQ 用户重新发起新请求。详见 [配置契约](docs/CONFIG_CONTRACT.md)。
-
-插件还声明了供 LLM 发现的翻唱与说话 Tool，但当前 Host 的 Tool 参数缺少可信原始消息锚点：它们只给出原会话 Command 指引，不凭自由会话 ID 入队或发送，默认也不要提升为核心工具。`/163cookie` 已停止解析和应用聊天输入中的秘密，仅指向配置或扫码流程；不要在聊天粘贴凭证。实际启用前请核对 [SDK 合规审计](docs/SDK_COMPLIANCE.md) 和[配置契约](docs/CONFIG_CONTRACT.md)中的边界。
-
-## 模型来源与限制
-
-使用的角色模型候选是《碧蓝档案》枣伊吕波（Natsume Iroha），不是《魔法纪录》环彩羽（Tamaki Iroha）。现有公开材料倾向于日语语料，但作者没有公开训练集清单，因此训练语言与内容仍属未完全核实；“国际服”不等同英语配音，也不代表英语CV或英语训练数据存在。模型卡上的许可 tag 不等于游戏录音、声优表演或所有相关声音素材均获授权，更不构成商业使用许可。使用者须自行确认适用权利及许可。
-
-详尽来源、哈希、许可边界及尚未核实事项见 audio-lab 内的模型研究报告（本插件仓库不包含模型文件）。性能因歌曲时长、分离、CPU、内存限制及运行环境而异；不承诺固定处理时间或“几分钟内完成”。
-
-## 依赖与安全
-
-插件依赖的唯一权威来源是 [_manifest.json](_manifest.json) 的 `dependencies`。MaiBot Host 负责检查冲突并安装缺失依赖；不要依据 `requirements.txt` 手工改动 MaiBot 核心环境，也不要把该文件当成插件加载契约。不得把密钥、登录态、模型、歌曲音频、日志、SQLite 数据库或运行配置提交到仓库。推理和资源限制要求见 [DEPLOYMENT.md](docs/DEPLOYMENT.md)。
-
-## 上游说明与鸣谢
-
-本项目基于 [xiaocutedog/maibot_sing-main](https://github.com/xiaocutedog/maibot_sing-main)，上游 README 中的原始功能介绍与致谢如下。此 fork 的后端和运行约束可能与上游说明不同；请勿据上游旧部署步骤覆盖本仓库文档。
-
-- [ling-tts-bot](https://github.com/Ling-LA/ling-tts-bot) — MaiBot 的 Xiaomi MiMo v2.5 音色克隆语音回复插件。
-- [maibot-music](https://github.com/pan-ice/maibot-music) — MaiBot 音乐插件，支持搜索点歌、解析音乐链接、发送语音音频。
-- [Retrieval-based-Voice-Conversion-WebUI (RVC)](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) — 语音音色转换框架。
-- [Ultimate Vocal Remover (UVR5)](https://github.com/leebufan/Ultimate-Vocal-Remover) — 人声/伴奏分离工具。
-
-## 验证
-
-独立仓库测试：
-
-```bash
-python -m pytest tests -q
+```toml
+[local]
+memory_max_mb = 2048       # MiB，不是十进制 MB
+memory_headroom_mb = 512
+cpu_quota_percent = 150
+media_tasks_max = 64
 ```
 
-如需调用指定 MaiBot checkout 的真实 `ManifestValidator`，并用当前解释器中实际安装的 `maibot_sdk` 生成配置 Schema，请显式提供只读 Host 根目录并使用该 Host 的 Python 环境：
+`MemoryHigh` 自动取 75%（默认 1536 MiB），swap 固定为 0。管理员还须填写模型/索引/HuBERT/Demucs、wrapper/upstream、worker Python 与共享锁等实际绝对路径；默认不包含开发者机器路径。当前旧 RVC/TTS 兼容配置在 UI 明确标为退休，仅固定模型显示名仍使用 `rvc.default_model`。
 
-```bash
-MAIBOT_TEST_HOST_ROOT=/path/to/MaiBot \
-  /path/to/MaiBot/.venv/bin/python -m pytest tests/test_manifest.py -q
+永久输出默认是 SDK 数据目录中的 `covers/`；覆盖值须为非符号链接绝对目录，首次绑定后不能靠热更搬迁。配置细节及迁移边界见[配置契约](<docs/CONFIG_CONTRACT.md>)。
+
+## 架构与运行边界
+
+```text
+LLM Tool 参数校验 ─┐
+                   ├→ JobService 搜索/选曲/持久接纳
+/翻唱 原文解析 ────┘              ↓
+                     StageCoordinator → 有限媒体服务
+                              ↓
+                     字节收据 → 永久产物 → 单次 outbox
 ```
 
-该测试只导入插件定义、校验 manifest 并构建配置 Schema；不会调用 `create_plugin()`、`on_load()`、模型推理或消息发送。未设置 `MAIBOT_TEST_HOST_ROOT` 时，独立仓库会跳过 Host 专属校验，而不是猜测本机目录。本次审计实际覆盖 Host `1.3.0` 与 SDK `2.8.2`；manifest 的最低版本已收紧到这两个实测版本，因为可信 Command 原始消息 payload 与 detailed send `return_details` 是授权投递所需契约。此结果不承诺更旧版本兼容，也不等于正式 Runner 加载验收。完整的已验证项和待验项见 [SDK 合规审计](docs/SDK_COMPLIANCE.md)。
+所有可达媒体，包括来源探测、解码、分离、转换、混音、编码和校验，共用独立单元预算与阶段所有权；SDK Runner 不加载模型或读取完整音频。服务内部取得共享 inference lock，模型工作严格串行。启动前检查真实有限祖先 cgroup，锁内、模型加载前再查；不能从宿主 MemTotal 猜容器容量。
 
-### 历史 v0.4.0 音频实验
+预算不足/不可验证就明确拒绝，不启动媒体。`KillMode=control-group` 与 `OOMPolicy=kill` 终止整个自有服务；只有真实 `oom-kill` 证据才报告 OOM，SIGKILL 不冒充 OOM。前一 unit 与子进程未证明停止前不释放槽；保留成功收据和字节，不发布或发送半成品，不自动重试。
 
-旧实现曾完成片段、202 秒整曲及两段 30 秒试听，记录峰值内存约 1.83–1.94 GiB，详见 [历史验证记录](docs/VALIDATION.md)。这些结果仅说明当时的音频实验与资源测量，不证明当前持久化队列、Runner 生命周期、配置热重载、Host 加载或授权投递已经验收通过。
+本策略不能保证其它服务增长时全容器永不 OOM，也不会调整它们。音频与失败通知都最多尝试一次，不保证恰好送达；claim 后崩溃可能零次。发送超时、布尔回执或缺消息 ID 为 unknown，重启不重发。
 
-## 常见问题
+Command 检查当前 NapCat/Host 直接文本、原消息与路由，拒绝引用、转发、语音/ASR、@、notify 和虚拟 QQ。Tool 按用户接受的 SDK/MaiCore/LLM 会话信任工作，一致 QQ 用户/stream/chat 检查不等于原消息强锚点或密码学签名；本分支不修改核心，也不自行计算聊天流 ID。
 
-- **插件未出现在管理界面**：先查看 Host 的 manifest 校验错误，确认目录根部包含 `_manifest.json` 与 `plugin.py`，并检查 Host/SDK 版本是否落在 manifest 的闭区间内。
-- **依赖冲突或缺包**：以 `_manifest.json` 的 `dependencies` 为准排查 Host 依赖解析结果；不要手工把 `requirements.txt` 安装进 MaiBot 核心环境来掩盖冲突。
-- **没有生成 `config.toml`**：确认 Runner 已成功导入入口并识别 `config_model`。该文件应由 Runner 在安装目录生成，不要从仓库复制真实配置。
-- **配置页面无法渲染**：运行上面的 Host 专属 manifest/Schema 测试，检查 `PluginConfigBase` 字段是否都有默认值、`plugin.config_version` 是否存在。
-- **任务无法开始**：确认插件仍为管理员有意启用，并逐项检查受限本地后端所需的绝对路径、systemd user service、共享推理锁与资源限制；不要回退到无隔离推理。
-- **发送结果不确定**：不要自动重发。保留 JobStore 与私有日志供协调器对账，只有平台明确确认后才标记送达。
+## 音频与已知限制
 
-## 已知限制
+- 所有片段请求统一先完整受控流式计帧，冻结唯一中心原音频上下文（至多90秒），只分离此上下文，再以RMS/flatness选12–18秒，最多两段按原序拼接，仅一次RVC。完整来源允许30–900秒；full仍为30–配置上限且最多300秒。不是副歌识别或语义乐句检测，不扫描多窗口、不回退整曲。
+- 保留原音高；`sing-render-v4`配方冻结真实资产、helper/selector hash、完整源帧数、上下文及全部实际argv。selection-v2使用原来源绝对帧；旧v2/v3完成成品只读兼容，不续跑旧计划。目录毫秒标签只是舍入显示。
+- 当前保留 Natsume Iroha（《碧蓝档案》枣伊吕波）基线，不是《魔法纪录》环彩羽；国际服不等于英语配音。模型卡许可不授予所有录音/声音素材权利。
+- Aris 私有历史推理峰值略高于 2048 MiB，不能宣称默认预算可完成。RMS、高频、有限值、无削波和加载成功不能证明哼唱保留、音质好、角色身份或训练充分。
+- 原有沙哑、高音及分离丢失限制尚未宣称修复；模型替代与自训练还需权利、干净数据、设备和人工听辨。
+- 当前分支未完成真实 QQ file/voice 送达与最终整链路验收；离线 serializer/ledger 不等于生产平台结果。
 
-当前权重在部分高音区会唱不上去或出现破音，《Aoi》开头等片段还原也不理想；这是尚未修复的音质问题，不是下载或编码缺陷。历史音质结果不能替代当前架构的整曲、生命周期与投递验收；在 [SDK 合规审计](docs/SDK_COMPLIANCE.md) 的待验项完成前，不应宣称新架构已经发布就绪。
+## 文档
+
+- [对话式翻唱](<docs/CONVERSATIONAL_SINGING.md>)：结构化参数、选择、精确帧与投递。
+- [配置契约](<docs/CONFIG_CONTRACT.md>)：默认值、许可、预算与留存。
+- [部署验收](<docs/DEPLOYMENT.md>)：隔离验证门槛、迁移与回滚。
+- [SDK 合规记录](<docs/SDK_COMPLIANCE.md>)：当前与历史证据范围。
+- [变更记录](<CHANGELOG.md>) · [项目开发规则](<AGENTS.md>)。
+
+## 开发与验证
+
+先按[项目规则](<AGENTS.md>)和[部署验收](<docs/DEPLOYMENT.md>)测实际余量，再在已有限额的专用服务中逐目标文件验证，每文件新进程。TMPDIR/TEMP/TMP、basetemp、缓存与pycache必须显式位于经stat验证的磁盘数据目录，禁用pytest缓存或指定磁盘路径，不使用/tmp与/run/user存放测试文件。纯目标测试固定 512 MiB 硬限/384 MiB 软限、零 swap、有限时限，并须至少 1 GiB 祖先余量；禁止裸全量 pytest、并发重型测试、安装依赖或涨预算凑通过。
+
+0.6.1本次磁盘隔离验证按成功日志去重：30个定向文件、1262项通过，无当前跳过；其中媒体阶段仅执行75个有界用例，17个其它参数变体未重新执行，**不宣称全量通过**。范围含曲名/首候选、900秒来源、90秒上下文、recipe/probe/selection绑定、历史身份、旧claim恢复、生命周期、只读Host AST及mock单次投递。成功unit最高实际charged peak为385.9MiB，OOM计数为0，预算未提高。首次断言/导入错误和180秒timeout日志均保留；媒体拆分独立窗口进程，reload-race修正mock签名并加有限等待后通过。已有缓存依赖只供隔离测试读取，没有安装依赖、audio-lab测试或真实模型推理；真实QQ及音频质量仍未验收。只按用户明确授权应用/重载，不发送QQ回归音频。
+
+欢迎通过 [Issues](https://github.com/QR-0W/maibot_sing-main/issues)提交可复现问题；说明插件/Host/SDK 版本、公开错误码与验证层，不公开 token、cookie、数据库、用户音频或个人日志。
+
+## 致谢与许可证
+
+感谢上游 [maibot_sing-main](https://github.com/xiaocutedog/maibot_sing-main)、[ling-tts-bot](https://github.com/Ling-LA/ling-tts-bot)、[maibot-music](https://github.com/pan-ice/maibot-music)、[RVC](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)、[UVR5](https://github.com/leebufan/Ultimate-Vocal-Remover)与 [Demucs](https://github.com/facebookresearch/demucs)。上游历史步骤不替代本 fork 的资源/许可契约。
+
+README 信息层次参考 [Codewhale 中文 README](https://github.com/Hmbown/Codewhale/blob/main/README.zh-CN.md)，文本与架构说明针对本项目原创；没有虚构截图、徽章或音质结论。
+
+[MIT](<LICENSE>)仅覆盖相应源码；模型、歌曲录音与声音素材的权利须单独确认。

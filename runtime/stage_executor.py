@@ -59,7 +59,8 @@ def stop_group(child):
     child.wait(timeout=5)
 
 
-def execute(root, recipe, stage, argv, inputs, outputs, *, timeout_s, lock_path, lock_wait_s=10):
+def execute(root, recipe, stage, argv, inputs, outputs, *, timeout_s, lock_path,
+            lock_wait_s=10, admission_check=None):
     """Run a step or verify its receipt; never overwrite unsealed evidence.
 
     inputs/outputs are relative file names. Input hashes are calculated inside
@@ -103,6 +104,8 @@ def execute(root, recipe, stage, argv, inputs, outputs, *, timeout_s, lock_path,
                 if time.monotonic() >= deadline:
                     raise StageFailure('inference_busy', 'Inference lock busy; no stage launched')
                 time.sleep(.1)
+        if admission_check is not None:
+            admission_check()
         # Shared input files are checked within the service after acquiring
         # the inference lock; resume verifies their current hashes.
         input_fingerprints = receipts._files(list(inputs)) if inputs else {}
@@ -149,7 +152,7 @@ def execute(root, recipe, stage, argv, inputs, outputs, *, timeout_s, lock_path,
 
 
 def main():
-    from worker import verify_limits
+    from worker import verify_host_headroom, verify_limits
     parser = argparse.ArgumentParser()
     parser.add_argument('--plan', type=Path, required=True)
     parser.add_argument('--stage', required=True)
@@ -165,7 +168,7 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     execute(Path(plan['workspace']), plan['recipe'], step['name'], step['argv'],
             step['inputs'], step['outputs'], timeout_s=step['timeout_s'],
-            lock_path=plan['inference_lock'])
+            lock_path=plan['inference_lock'], admission_check=verify_host_headroom)
 
 
 if __name__ == '__main__':

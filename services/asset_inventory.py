@@ -36,6 +36,8 @@ class AssetPaths:
     worker: Path
     render_plan: Path
     stage_executor: Path
+    excerpt_selection: Path
+    context_window: Path
 
     def documents(self) -> Dict[str, Path]:
         return {name: Path(getattr(self, name)) for name in HASH_NAMES if name != 'source'}
@@ -45,7 +47,7 @@ RUNTIME_HASH_NAMES = tuple(name for name in HASH_NAMES if name != 'source')
 RUNTIME_EXECUTION_PATH_NAMES = (
     'model', 'index', 'hubert', 'demucs_repo', 'rvc_script', 'rvc_upstream',
     'media_stage', 'worker', 'render_plan', 'stage_executor', 'worker_python',
-    'worker_script', 'inference_lock',
+    'worker_script', 'inference_lock', 'excerpt_selection', 'context_window',
 )
 RUNTIME_CONTEXT_NAMES = ('execution_paths', 'artifact_root', 'limits', 'parameter_policy')
 RUNTIME_LIMIT_NAMES = ('max_duration_s', 'max_download_bytes')
@@ -270,7 +272,7 @@ class RuntimeVersionProbe:
         self.worker_python = Path(worker_python)
         self.ffmpeg = ffmpeg
         self.timeout_s = timeout_s
-        if (not self.worker_python.is_absolute() or not self.worker_python.is_file()
+        if (not self.worker_python.is_absolute()
                 or type(timeout_s) is not int or not 1 <= timeout_s <= 60):
             raise ValueError('Invalid isolated runtime probe')
 
@@ -286,6 +288,10 @@ class RuntimeVersionProbe:
         return result.stdout
 
     def __call__(self) -> Dict[str, str]:
+        # Storage recovery can construct this probe without today's interpreter;
+        # only a new live generation may inspect or execute it.
+        if not self.worker_python.is_file():
+            raise InventoryError('runtime_probe_failed', 'Isolated runtime version probe failed')
         script = r'''
 import importlib.metadata as m, json, sys
 names = {

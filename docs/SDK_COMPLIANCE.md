@@ -1,93 +1,52 @@
-# MaiBot Plugin SDK 合规审计
+# SDK 合规与验证证据（0.6.1）
 
-最新核对：2026-09-30，程序修订 `81203d7`。初审日期：2026-09-29。
+有界上下文更新：excerpt源30–900秒、唯一中心上下文≤90秒、选择12–18秒；recipe-v4/probe-v2/selection-v2。旧v2/v3完成成品与v1 selection保持只读，不以新代码续跑旧计划。用户授权的生产重载与真实媒体/QQ验收分开记录，历史测试数字不代表当前字节。
 
-## 当前验收摘要（替代下方历史状态）
+本文件区分当前源码契约、历史验证和本次待验收范围。不把旧版本通过数字、fake IPC 或 serializer 契约当生产送达；仅按用户明确授权应用/重载，不试发、不改MaiBot核心。
 
-- 最终完整测试：指定当前 Host/已安装 SDK 后 **359 passed**；独立模式未提供 Host 时，两项 Host 专属测试按约定跳过。
-- 实际 MaiBot 1.3.0 Runner/PluginLoader、SDK 2.8.2 在私有目录完成配置生成/补齐、加载、self-config 热更、代码重载、部分初始化取消、单项 close 抛错后的其余资源清理、卸载和关停。IPC、Host 能力响应与音乐候选为假体，不连接生产聊天。
-- 当前 Host 的 Command builder/serializer、NapCat codec 和 Host route-attach 原样函数经 AST 提取执行，避免导入业务模块。独立安全复核接受 2 条合法群/私聊来源，将普通 WebUI 与虚拟 QQ 的 22 条 Command 全部拦截；零新增发送调用、搜索及任务。独立目标测试 **91 passed / 1 deselected**。
-- 原始文本明确带 `--auto-reply` 才能生成持久许可；同时要求当前受信任 NapCat/Host 元数据。全部 11 个 Command 在副作用前检查，失败不向该 stream 回复错误。旧缺来源标记的 pending 在扫描和原子 claim 处都被拒绝；标记不是密码学签名，不能防御有消息网关权限的恶意插件。当前普通 WebUI、虚拟 QQ 和缺元数据的旧适配器均拒绝，不宜用生产 WebUI 自动测试。
-- `/163cookie` 不再解析、应用、存储或回显聊天输入凭据；管理员应使用受保护配置/扫码流程。不能据此保证已经发到聊天历史的秘密被删除。
-- 真实媒体与 Runner 是分层验证：受限整曲冷运行、同 job/run-token/unit 的宿主中断恢复、不可变成品与目录重放已有独立证据；精确解码帧策略下，该整曲配方完全相同，17 个 stage 的已校验收据可复用。合成 44.99/300 秒音频确认规划与实际 PCM 帧数一致。正常媒体试验不替代输出超限/取消测试，后者单独验证了子进程与 reader 清理。
-- 一次早期 Runner 试验曾误导入 Host 业务模块并触发生产 SQLite 初始化检查，缺少事前快照，**不能证明没有写入**。后续在所有 Host import 前使用 SQLite/Python 写入审计，Host Command 改用 AST；最终 Runner 记录 46 次私有 SQLite 连接、0 次生产连接。Host 文件日志用无文件替身；父进程 Python 审计不覆盖子进程原生写入。此事故与模拟边界未被隐瞒或解释成始终只读。
-- 以上关闭的是已确认代码缺陷及相应隔离验收项，不等于完整 Host/QQ 网络端到端、真实音色身份、模型素材权利或用户所述沙哑已解决。部署仍需私有配置迁移、旧文件基线、单独产物根、平台可读性及健康核验；程序和依赖未变的文档提交可视为同一受测代码。
+## 接口基线
 
-原始测量和隔离脚本由维护者私有保存，不在公开插件仓库内分发真实配置、账号、数据库、音频或模型。以下保留初审快照以解释修复来源，不能把其中“未执行 Runner”或“仍接受 Cookie”等历史观察误当为当前状态。
+以 [MaiBot Vibe Coding 指南](https://docs.mai-mai.org/plugin/vibe-coding)为开发基线；实际最低 Host 1.3.0 / SDK 2.8.2，Manifest v2。依赖与版本以 [Manifest](<../_manifest.json>)为准，不更改核心依赖来补契约。
 
-## 历史初审快照
+| 项目 | 当前实现 / 限制 |
+|---|---|
+| 入口 | [plugin.py](<../plugin.py>)包含 config_model、on_load/on_unload/on_config_update 和 create_plugin；不新增 Action、迁移 Hook 或副作用入口。 |
+| 配置 | PluginConfigBase + Field，Runner 生成/补齐配置；[模板](<../config.example.toml>)只供审阅。源码契约变化升为 0.6.0，不修改现网配置。 |
+| Command | 严格 slash `/翻唱`，原始直接文字/QQ账号路由验证；自然文本不拦截，不使用模型匹配组替换原文。 |
+| Tool | 正常 deferred cover_song，明确 title/artist、默认 excerpt/dry/voice 与独立覆写；不默认 core_tool=True，不声称 ALWAYS 保证发现。 |
+| 接纳与状态 | 两入口共享 [JobService](<../services/job_service.py>)；Tool 返回结构化 job_id/state/code/content/choices，cover_song_status 只读本会话当前用户。 |
+| Tool 信任 | SDK/MaiCore/LLM 一致 stream/chat/QQ用户与非虚拟检查，按用户接受的上下文边界；不是原始消息强锚点，不计算真实流 ID，不改核心。 |
+| 幂等 | Command 原消息 ID；Tool 活动复用、终态更新时间后60秒重放复用、此后允许新请求。不是永久去重或原消息 exactly-once。 |
+| 明确许可 | 请求翻唱即许可最多一次最终投递，无需 --auto-reply；历史无许可/旧proof不升级。Tool准确过滤后的首项自动冻结且不跳过阻塞项；Command保留本人版本选择。 |
+| 预算 | 默认2048MiB、高水位1536MiB、swap0、CPU150%、Tasks64；冻结快照，实际cgroup核实，目标祖先启动前及共享锁内检查，整unit OOM终止。 |
+| 来源探测 | 也通过原StageCoordinator/UnitRunner，冻结全recipe前有独立source_probe receipt/plan；Host只读<=64KiB report，无裸ffprobe/ffmpeg回退。 |
+| 生命周期 | 独占调度所有权，未确认unit/children停止不放槽；卸载收敛后台task/客户端，已有有限unit按同identity恢复，不删除证据。 |
+| 媒体投递 | 独立outbox claim-before-RPC，一次send.custom(return_details=True)；voiceurl或file，正向sent加有效message_id才sent，否则unknown不重发。 |
+| 失败文本 | 独立(job_id,kind)ledger，新明确许可任务才有资格；send.text(return_details=True)，RPC15s/总20s，restartdispatching→unknown，不污染media字段。 |
+| 退休路径 | 旧LocalBackend/sidecar/Pipeline/TTS/voicecache实例从入口删除。/说和speak_voice明确不支持，无合成、参考读取或fallback；音乐登录/二维码保留。 |
+| 音频身份 | sing-render-v4，真实source/engine/helper/selector/mode/完整argv，完整源帧及冻结上下文；已完成legacy v2/v3只读，不升级运行中plan，旧claim先核对。 |
 
-本清单以 MaiBot 官方 [Vibe Coding 插件开发指南](https://docs.mai-mai.org/plugin/vibe-coding)、[Manifest](https://docs.mai-mai.org/plugin/manifest)、[生命周期](https://docs.mai-mai.org/plugin/lifecycle) 和 [配置管理](https://docs.mai-mai.org/plugin/config) 为基线。它记录可复现证据和剩余风险，不是发布声明，也不把历史音频实验等同于当前架构验收。
+上述是源码核对，不是当前接口已经通过自动化或真实 Runner 的证明。
 
-状态含义：
+## 当前已经执行的范围
 
-- **通过**：已有源码或自动化证据支持该项。
-- **部分通过**：静态结构存在，但版本下界、Host 生命周期或端到端行为尚未完整证明。
-- **未完成**：当前仍有明确缺口；启用或发布前必须处理。
+- 新预算模块定向 **80 passed**；独立服务请求 max512MiB/high384MiB/swap0/CPU100/Tasks64/runtime180s，systemd 报告 peak 34.7M、swap0。
+- 随后 primitive 协调器组因真实root余量不足1GiB，门槛拒绝，**没有运行**。
+- 新入口清理、Tool绑定/status、failure ledger及source_probe测试仍待隔离执行；diff whitespace检查通过，不等于编译/导入/测试通过。
+- 当前没有最终全量、合成OOM、真实Runner、真实媒体或QQ端到端验收。不将旧191/340/432/866/1011等历史或目标集合相加为当前结果。
 
-## 审计边界
+## 历史基线（不能套到当前工作树）
 
-- 本次只审阅插件独立仓库、当前只读 MaiBot Host checkout 和其已安装 SDK。
-- 没有修改 MaiBot 主程序、真实 `config.toml`、模型、QQ/网易云登录态或线上插件。
-- Host 专属测试不调用 `create_plugin()`、`on_load()`、模型推理或发送接口。
-- 当前入口和持久化服务仍在集成；下列 Host/SDK 结果是一次静态导入与 Schema 构建证据，不能替代 Runner 实际加载、热重载、卸载和故障恢复测试。
+历史0.5.0修订81203d7曾记录359项及真实Runner/PluginLoader配置、加载、热更、卸载等隔离契约；IPC、平台与搜索为假体，不是生产QQ。更早迁移/整曲/恢复、旧自然Command审查亦属当时字节。当前structured Tool与source_probe改变了边界，旧审查不构成新GO。旧安全发现及原始证据见[历史安全审查](<SECURITY_REVIEW_CONVERSATIONAL.md>)顶部范围警告。
 
-## 逐项清单
+## 后续验收
 
-| 项目 | 状态 | 证据 | 未完成/后续动作 |
-|---|---|---|---|
-| 独立插件目录 | 通过 | 仓库根目录含 `_manifest.json`、`plugin.py`、`README.md`、`.gitignore`、`tests/`、`docs/`。安装说明要求放入 `plugins/maibot-sing/`，不修改 Host `src/`、`dashboard/` 或全局配置。 | 尚未在干净 Host 的实际 `plugins/` 安装目录完成加载验收。 |
-| Manifest v2 严格结构 | 通过 | `_manifest.json` 使用 `manifest_version: 2`、严格三段版本、HTTP(S) URL、Host/SDK 闭区间、`zh-CN` 默认语言。当前 Host `ManifestValidator` 已真实解析通过。 | 每次 manifest 或 Host 校验器变化后重跑 `tests/test_manifest.py`。 |
-| Host 兼容区间 | **部分通过** | Manifest 下界已从未证明的 `1.0.0` 收紧到实测 Host `1.3.0`，上界为 `1.99.99`。当前入口的自动投递授权依赖该 Host 的 Command bridge 把完整原始消息字典传入 handler（含 `message_id`、`platform`、`session_id`、`message_info.user_info`、`processed_plain_text`、`is_command`），并逐项校验后才接受 consent。 | 当前 Host 源码与严格 validator 已核实，但还没有执行正式 Runner 加载/命令调用；不得再宣称兼容 Host 1.0.0，也不得把静态检查描述成端到端验收。 |
-| SDK 最低版本 | **部分通过** | Manifest 下界已从未证明的 `2.5.1` 收紧到当前实际安装 SDK `2.8.2`，上界为 `2.99.99`。2.8.2 能导入插件定义并由 `SingPlugin.build_config_schema()` 生成 Schema；授权投递依赖的 `ctx.send.custom(..., return_details=True)` 也在该版本中保留 `sent/message_id` 详细回执。 | 当前只核实 2.8.2；不得再声称 2.5.1 可用。正式 Runner capability bootstrap 与平台回执仍需实际加载验证。 |
-| 能力最小化 | 通过（当前 HostValidator） | Manifest 仅声明 live capability ID：`send.text`、`send.custom`、`send.image`；入口源码分别使用文本、定制语音和二维码图片发送，且当前 Host `ManifestValidator` 接受这些值。 | 官方示例中的概念性 `send_message` 字符串不替换当前 Host 的真实能力 ID。Runner capability bootstrap 仍需实际加载验证。 |
-| Python 依赖权威来源 | 通过（文档契约） | README 已明确 `_manifest.json.dependencies` 是唯一插件依赖来源；当前 Host 校验器也检查声明与运行环境/Host 约束。 | 仓库仍存在历史 `requirements.txt` 副本。它不是加载契约，未来应删除或由 manifest 自动生成，避免漂移；不要手工安装它来修改 Host 核心环境。 |
-| Runner 管理配置 | 通过（静态） | `SingPlugin.config_model = SingPluginConfig`；配置模型继承 `PluginConfigBase`，字段使用 `Field`，包含 `[plugin] enabled/config_version`。README 明确 Runner 生成/维护运行时 `config.toml`。 | 需要在安装目录验证首次生成、字段补齐与 WebUI 保存。 |
-| 配置 Schema | 通过（当前 SDK） | 显式设置 `MAIBOT_TEST_HOST_ROOT` 后，测试使用当前解释器实际安装的 SDK 调用 `build_config_schema()`；核对插件 ID、版本以及 `plugin.enabled=false`、`plugin.config_version=0.5.0`。 | Schema 可生成不代表所有字段的 UI/秘密输入体验合格；登录凭证字段仍需单独安全审阅。 |
-| 忽略本地配置/数据库/媒体 | 通过 | 插件目录 `.gitignore` 含精确 `/config.toml`，并忽略 SQLite 主文件及 `-wal`/`-shm`、日志、音频、权重和缓存；审计时未发现这些运行产物被 Git 跟踪。 | 发布前再次运行 tracked-file 检查，禁止提交私有日志、配置、数据库、音频、cookie 或 token。 |
-| 完整生命周期与工厂 | **部分通过** | 入口定义 `on_load()`、`on_unload()`、`on_config_update()`、`create_plugin()`；卸载源码包含后台任务、客户端和 durable services 清理。 | 当前只做静态导入，**未**让 Runner 注入真实 `PluginContext` 或调用生命周期。入口集成完成后必须验证 load → self-config reload → unload，并检查所有任务/连接/文件句柄关闭。 |
-| 组件选择 | 通过（静态） | 新入口使用 `@Command` 和 `@Tool`，未发现 `@Action`。Tool 没有被文档建议为 `core_tool`。 | 需要在实际 Host 验证组件同步、命令正则、权限和 Tool 发现。 |
-| 简体中文用户文本 | **部分通过** | 命令说明、主要成功/失败提示和持久阶段公开错误以简体中文书写。 | 多处提示把底层 `exc` 直接拼入用户消息，仍可能暴露英文或私有诊断；应建立稳定中文公开错误映射后再认定完全通过。 |
-| 网络超时与异常处理 | **部分通过** | 命令和部分客户端路径声明了超时并捕获异常。 | 本次未逐个复核所有 QQ/网易云/MiMo/RVC 网络调用；需专项检查每个请求都有有限超时、响应大小边界和取消清理。 |
-| 登录凭证处理 | **未完成** | `.gitignore` 排除真实配置/环境文件，运行时配置由 Runner 管理。 | `/163cookie` 接受聊天命令中的登录凭证，存在会话记录/日志暴露风险。生产环境不应使用；应在后续授权任务中改为受保护的配置或专用秘密输入，再删除聊天携密路径。 |
-| README 安装/配置/命令/排障 | 通过 | README 已补充官方规范链接、独立目录安装、Runner 配置职责、命令/Tool、依赖权威来源、验证命令和常见问题。 | 实际发布时需根据最终入口与 manifest 再核对命令列表和能力。 |
-| 历史 v0.4.0 音频报告 | 不作为当前通过项 | `docs/VALIDATION.md` 记录旧实现的片段、整曲和资源测量；README 已明确其仅为历史实验。 | 当前 durable lifecycle、授权投递、整曲产物、Host load/unload 必须各自重新验收，不能引用旧音质/整曲报告代替。 |
+依[项目规则](<../AGENTS.md>)与[部署验收](<DEPLOYMENT.md>)先检查实际有限祖先余量，再用有限服务逐文件/小组新进程测试；禁止裸全suite、并发重型测试、安装依赖或涨预算。
 
-## 自动化验证
+1. 先接口/账本/源码预算测试，再阶段/锁内复核/整组终止与恢复。
+2. 专用128MiB小分配器合成OOM，验证外部coordinator存活、槽位fence、无publish/send/retry，不能用真实模型制造OOM。
+3. 真实Runner只在私有隔离环境验证，不连接生产数据库/网关；真实工具发现需正常聊天流程证据，不能用直接handler调用冒充LLM发现。
+4. 真实媒体另需许可与至少2.5GiB余量；不保证Aris旧峰值能进入默认2048MiB。
+5. QQ端到端仅用户另行明确授权；file/voice路径可读性、详细回执、实际呈现与音质需单独验收。
 
-### 独立仓库模式
-
-```bash
-python -m pytest -q tests/test_manifest.py
-```
-
-预期：本地结构测试通过，两个 Host 专属测试在未设置环境变量时明确跳过。审计运行结果：`2 passed, 2 skipped`。
-
-### 指定只读 Host 与当前 installed SDK
-
-```bash
-MAIBOT_TEST_HOST_ROOT=/path/to/MaiBot \
-  /path/to/MaiBot/.venv/bin/python -m pytest -q tests/test_manifest.py
-```
-
-审计运行结果：`4 passed`。该命令真实调用指定 Host 的 `src.plugin_runtime.runner.manifest_validator.ManifestValidator`，并用执行测试的 Python 环境中实际导入的 `maibot_sdk` 调用配置 Schema 生成。环境变量未设置时不会猜测宿主目录；变量设置错误时测试会失败并指出缺少的验证器路径。
-
-### 当前分支全套测试
-
-```bash
-MAIBOT_TEST_HOST_ROOT=/path/to/MaiBot \
-  /path/to/MaiBot/.venv/bin/python -m pytest -q
-```
-
-入口、manifest 与协调器集成稳定后，审计运行结果为 `229 passed`。这仍是进程内自动化测试结果，不代表插件已在真实 Runner 中加载、连接聊天平台或完成新架构整曲验收。
-
-## 发布阻断项
-
-以下项目完成前，不应把插件描述为“新架构已通过官方 SDK/Host 验收”：
-
-1. 保持 manifest 下界不低于已核实的 Host `1.3.0` + SDK `2.8.2`；若未来要放宽到旧版本，必须先证明可信 Command payload 与 detailed send `return_details` 契约。
-2. 在干净 Host 安装目录执行真实 Runner load、配置生成、self-config 热重载和 unload。
-3. 完成真实执行资产绑定：阶段计划必须绑定管理员配置并已校验的 worker、模型、索引、HuBERT、Demucs/RVC 资产与可执行 argv；当前自动化通过不能替代该项。
-4. 验证所有后台任务、网络客户端、数据库句柄和 systemd 协调器在卸载/失败时按契约清理或保留。
-5. 移除聊天携带 `/163cookie` 凭证的生产路径，并复核所有用户可见异常映射。
-6. 完成当前架构的受限整曲、故障恢复、授权投递及“不重复发送”验收；旧 v0.4.0 音频报告不能替代。
+私有研究、模型hash日志、真实路径、audio、credentials和运行数据库不提交。RMS/F0/finite/no-clipping不能代替旋律/哼唱/质量/角色及权利判断。

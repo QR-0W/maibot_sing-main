@@ -26,6 +26,20 @@ def choose(candidates: list[SourceCandidate], **kwargs: object) -> SourceCandida
     return select_source(candidates, **options)
 
 
+@pytest.mark.parametrize('title,artist,album', [
+    ('Weird Fishes/Arpeggi', 'Radiohead', 'Parts/I'),
+    ('Weird Fishes / Arpeggi', 'Radiohead', 'Parts / I'),
+])
+def test_slash_formatting_is_shared_across_exact_metadata(title, artist, album):
+    candidate = SourceCandidate('163', 'slash', 'Weird Fishes / Arpeggi',
+                                artist, 'Parts / I', 120, 8000)
+    assert choose([candidate], title=title, artist=artist, album=album) == candidate
+    with pytest.raises(SourceUnavailable):
+        choose([candidate], title='Weird Fishes Arpeggi', artist=artist)
+    with pytest.raises(SourceUnavailable):
+        choose([candidate], title=title, artist='Other', source_id='slash')
+
+
 def test_exact_stable_id_duplicates_only() -> None:
     original = song("a")
     assert choose([original, original]) == original

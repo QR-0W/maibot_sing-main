@@ -1,13 +1,40 @@
-# 插件与 audio-lab 的边界（离线候选修复）
+# 插件、引擎与私有数据边界
 
-**结论：已发布的 0.3.1 不是可直接跨机器运行的 Linux 翻唱包。** 其运行时把维护者用户名、模型路径、隔离 Python、RVC 实验脚本和推理锁写在插件源码；这是部署缺陷，不能以“仍在 dev”解释。原 upstream 的音乐搜索/sidecar 路线本身也不是这个受限 Linux 推理后端。
+本文描述 0.6.0 候选源码的运行和交付契约，不是现网部署或媒体验收证明。项目目录及迁移规则见 [PROJECT_LAYOUT](<PROJECT_LAYOUT.md>)。
 
-本分支已在离线测试目录将这些**机器专有路径**从运行时代码移至 `local` 管理员配置：`model_path`、`index_path`、`worker_python`、`musicdl_python`、`rvc_script`、`inference_lock`。六者留空时必须明确失败；示例配置没有私人绝对路径。模型和 FAISS 索引存放位置由管理员决定；插件的长期成品、配置和缓存留在 SDK `ctx.paths.data_dir` 的 `covers` 目录（或管理员显式设置的绝对 `output_dir`）。本地实验的输入、分轨、对照结果、服务运行日志可留在开发者的 `audio-lab/work`，**不能作为通用插件安装协议**。可读成品硬链接在 `covers/songs/`，不依赖 `audio-lab`。
+## 发布内容
 
-受限引擎现仍为外部前置条件：RVC 推理脚本及其 HuBERT/模型支持资源、Demucs+RVC Python 依赖、musicdl 独立 Python、ffmpeg/ffprobe 和 systemd user manager。代码包没有捆绑声优训练语音、模型权重、任何账号凭据或这些引擎；这不是一键安装，也不应把他人模型和原曲重分发进 GitHub ZIP。管理员须核对每个模型及音源授权，运行对应 Python 离线自检；模型来源、训练材料和声音使用许可当前未完全查明，不能声称符合商业或公开分发授权。
+插件仓库交付 Manifest v2、SDK 入口、自有 services/runtime 模块、[RVC 适配器](<../engines/rvc/rvc_infer.py>)、测试和公开文档。适配器复用 runtime worker 的冻结预算校验；不是独立实验启动器，不应套用外部 rvc.sh 或 run_limited.sh。
 
-当前插件本地工作路径的运行条件是 Linux cgroup v2、`systemd-run --user` 可用、内存上限 4 GiB/high 3 GiB/无 swap、150% CPU、TasksMax=64、单实例串行推理，以及该脚本对当前 RVC 权重与 HuBERT 兼容。不允许不存在依赖时自动回退到无 cgroup 的转换。还应在候选版本上线前增加脚本/环境版本校验与安全打包核验，避免管理员给出错误的 `.py` 文件路径却能通过 `is_file()` 静态检查。
+第三方 RVC upstream、独立 Python 环境、RVC 权重、FAISS 索引、SHA 固定的 HuBERT 和离线 Demucs 资源由管理员准备，不自动下载。现有资产契约要求 `rvc_upstream_path` 等于 `rvc_script` 的同级 `upstream/`。使用仓库适配器时对应 `engines/rvc/upstream/`，该目录不跟踪、不进入插件发布包，管理员必须保留第三方 LICENSE 和 notices。适配器的 reference commit 是来源参考；实际源树字节由 AssetInventory 绑定，不能把常量当作已核验的 checkout。
 
-**QQ/NapCat 是另一个服务生命周期**：排查证据指向之前运行在临时 dsh-subprocess scope 的两个前台 screen 树一起收到 SIGTERM；不能拿插件用户服务代替 NapCat 的长期服务，更不能默认重登。需由管理员明确批准独立服务配置和维护窗口，才能在线复测语音发送。
+完整的引擎环境锁、传递依赖许可证审查和新适配器的真实兼容性验收仍待完成。本项目目前不是一键安装包，也不保证任意管理员脚本可兼容。模型卡的代码许可证不自动授予录音、声音、歌曲或训练数据权利。
 
-验证范围：离线代码单元和模拟进程测试，已经生成现有成品的人类可读目录；**未部署**本候选代码，插件仍设为 `enabled=false`，QQ 未自动重登，真实用户端到端语音发送仍待授权测试。
+## 两个 Python 环境
+
+1. SDK Runner：Host/SDK 版本遵守 Manifest；插件轻依赖为 aiohttp、httpx、cryptography、segno。不得修改 MaiBot 核心依赖来安装媒体库。
+2. 管理员指定的 `worker_python`：隔离 Demucs/RVC 环境，需要 torch、torchaudio、numpy、demucs、soundfile、librosa、pyworld、FAISS、fairseq、scipy、praat-parselmouth、torchcrepe、OmegaConf、numba及实际传递依赖。历史 Python 3.9/旧 torch 组合记录不等于新版锁定、ABI 或安全验收。
+
+`musicdl_python` 是退休兼容字段，不是当前生产链的第三个必备环境。RuntimeVersionProbe 读取包/编码器元数据，不导入模型；版本存在不等于推理可用。受限反序列化策略也不能代替依赖漏洞审查。
+
+系统必须提供 Linux cgroup v2、systemd user manager、memory/cpu/pids 控制器、ffmpeg/ffprobe及 libmp3lame 编码器。共享锁父目录和持久化目录须有正确权限与足够磁盘空间。
+
+## 预算与恢复
+
+每个可达媒体阶段，包括来源探测、解码、分离、转换、混音、编码和校验，都运行在独立有限服务中。默认 MemoryMax=2048 MiB、MemoryHigh=1536 MiB、swap=0、CPUQuota=150%、TasksMax=64、有限 RuntimeMaxSec、KillMode=control-group、OOMPolicy=kill及实际 memory.oom.group=1。参数由一个验证后的冻结预算传递，不回退 4 GiB，不通过涨额度掩盖失败。
+
+启动前检查目标服务的有限共享祖先，必须有完整预算加默认 512 MiB 余量；服务内拿到管理员配置的共享 inference lock 后、加载模型前再检查。所有重工作串行，旧 unit/子进程未证明停止前不释放槽。未知或不足就拒绝，不启动媒体；仅真实 systemd/cgroup 证据可以确认 OOM。
+
+存储绑定与实时资产代际分离。启动、旧 unit 对账、失败通知和已完成任务的不可变发布不要求今天的模型/解释器/执行器仍存在；新接纳、新阶段必须验证实时资产及版本。新 launch 前验证实际执行文件。旧 claimed unit 必须先对账，再验证 probe 实际证据，避免丢失文件挡住取消或终止结算。发布仍验证冻结来源、收据、配方及实际成品字节，不发送半成品、不自动重试。
+
+## 持久化和服务生命周期
+
+数据库、工作区根及永久 covers 根采用 SDK 数据目录或管理员显式配置的合法绝对目录。首次绑定后不能用热更偷偷搬迁。浏览目录、索引与成品不依赖私有实验目录，也不随源码升级删除。
+
+QQ/NapCat 独立于插件生命周期。部署应先核对 SDK Supervisor 的反向依赖，使用受信管理入口重载；不假设存在 HTTP reload 端点，不杀整组 Runner 或 QQ 来模拟单插件更新。旧任务不会被追加新发送许可，音频和失败通知保持各自的持久化单次尝试语义。
+
+## 当前证据范围
+
+预算模块定向 80 项通过是已有执行证据；随后新增入口、probe、发布、恢复、适配器回归未执行，不能引用历史总数当作当前全量通过。本轮尚未把 0.6.0 应用到现网；现网观察为 0.5.0 且已启用。用户已授权后续应用更新，但授权不等于完成安全验收和重载。
+
+纯测试须在 512 MiB/high384 MiB 隔离服务中逐目标/小组运行，有限共享祖先至少有 1 GiB 余量。真实模型需要单独许可、至少 2.5 GiB 余量及 2048/1536 MiB 媒体预算。实际 QQ 验收另需许可，不自动发送、重登或重启 QQ。

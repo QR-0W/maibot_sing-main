@@ -18,6 +18,29 @@ inventory = importlib.import_module('inventory_test_pkg.services.asset_inventory
 recipe = importlib.import_module('inventory_test_pkg.runtime.recipe_identity')
 
 
+@pytest.mark.parametrize('delete_after_construction', [False, True])
+def test_version_probe_missing_interpreter_is_lazy_and_never_spawns(tmp_path, monkeypatch,
+                                                                   delete_after_construction):
+    python = tmp_path / 'worker-python'
+    if delete_after_construction:
+        python.write_bytes(b'synthetic interpreter')
+    probe = inventory.RuntimeVersionProbe(python)
+    if delete_after_construction:
+        python.unlink()
+    calls = []
+
+    def unexpected_spawn(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError('Missing interpreter must be refused before spawning')
+
+    monkeypatch.setattr(inventory.subprocess, 'run', unexpected_spawn)
+    with pytest.raises(inventory.InventoryError) as error:
+        probe()
+    assert error.value.code == 'runtime_probe_failed'
+    assert str(error.value) == 'Isolated runtime version probe failed'
+    assert calls == []
+
+
 def versions():
     return {name: '1.2.3' for name in recipe.VERSION_NAMES}
 
@@ -257,3 +280,23 @@ def test_symlinked_or_incomplete_inventory_is_refused(tmp_path):
     with pytest.raises(inventory.InventoryError) as error:
         inventory.AssetInventory(paths, lambda: incomplete).build(source)
     assert error.value.code == 'runtime_version_missing'
+
+
+@pytest.mark.parametrize('helper', ['excerpt_selection', 'context_window'])
+def test_helper_bytes_and_execution_path_are_runtime_identity(tmp_path, helper):
+    paths=assets(tmp_path)
+    service=inventory.AssetInventory(paths,versions)
+    context=generation_context(tmp_path,paths)
+    first=service.build_runtime()
+    generation=inventory.runtime_generation(first,context)
+    helper_path = context['execution_paths'][helper]
+    assert first.hashes[helper]==hashlib.sha256(helper_path.read_bytes()).hexdigest()
+    helper_path.write_bytes(b'changed deterministic helper implementation')
+    changed=service.build_runtime()
+    assert changed.hashes[helper]!=first.hashes[helper]
+    assert inventory.runtime_generation(changed,context)!=generation
+    relocated=copy.deepcopy(context)
+    relocated['execution_paths'][helper]=tmp_path/'other-helper.py'
+    assert inventory.runtime_generation(first,relocated)!=generation
+    incomplete=copy.deepcopy(context);incomplete['execution_paths'].pop(helper)
+    with pytest.raises(inventory.InventoryError):inventory.runtime_generation(first,incomplete)

@@ -26,6 +26,7 @@ download_module = importlib.import_module('job_service_test_pkg.services.source_
 ownership = importlib.import_module('job_service_test_pkg.services.ownership')
 runner_module = importlib.import_module('job_service_test_pkg.services.unit_runner')
 recipes = importlib.import_module('job_service_test_pkg.runtime.recipe_identity')
+contexts = importlib.import_module('job_service_test_pkg.runtime.context_window')
 
 
 class FakeCatalogue:
@@ -115,7 +116,7 @@ async def wait_until(predicate, timeout=2.0):
 
 
 def make_service(tmp_path, *, store=None, catalogue=None, coordinator=None,
-                 downloader=None, publisher=None, pause_first=False,
+                 downloader=None, publisher=None, probe=None, pause_first=False,
                  ownership_fd=None, close_drain_s=1.0):
     store = store or ledger.JobStore(tmp_path / 'jobs.sqlite3')
     catalogue = catalogue or FakeCatalogue()
@@ -155,6 +156,8 @@ def make_service(tmp_path, *, store=None, catalogue=None, coordinator=None,
             'rvc_upstream':paths.rvc_upstream,'media_stage':paths.media_stage,
             'worker':paths.worker,'render_plan':paths.render_plan,
             'stage_executor':paths.stage_executor,'worker_python':python,
+            'excerpt_selection':paths.excerpt_selection,
+            'context_window':paths.context_window,
             'worker_script':paths.media_stage,'inference_lock':inference_lock},
         'artifact_root':artifact_root,
         'limits':{'max_duration_s':runtime.max_duration_s,
@@ -172,8 +175,13 @@ def make_service(tmp_path, *, store=None, catalogue=None, coordinator=None,
 
     async def fake_probe(path, chosen, **kwargs):
         assert path.read_bytes() == b'S' * 4096
-        return {'duration_s': 31.0, 'container_duration_s': 31.04,
-                'frames': 31*44100, 'sample_rate': 44100, 'audio_streams': 1,
+        frames = 31*44100
+        context = (contexts.freeze_context(frames) if kwargs['max_seconds'] == 900
+                   else contexts.full_context(frames))
+        return {'duration_s': frames/44100, 'container_duration_s': 31.04,
+                'frames': frames, 'source_frames': frames, 'context_window': context,
+                'render_mode': 'excerpt' if kwargs['max_seconds'] == 900 else 'full',
+                'sample_rate': 44100, 'audio_streams': 1,
                 'provider': chosen.provider, 'source_id': chosen.track_id}
 
     def fake_publish(job_store, artifacts, *, job_id, stream_id, run_token,
@@ -188,7 +196,8 @@ def make_service(tmp_path, *, store=None, catalogue=None, coordinator=None,
     instance = service_module.JobService(
         store, catalogue, coordinator, artifact_root, inventory, runtime,
         runtime_context=runtime_context,
-        downloader=downloader or exact_download, probe=fake_probe,
+        downloader=downloader or exact_download,
+        probe=fake_probe if probe is None else probe,
         publisher=publisher or fake_publish, ownership_fd=ownership_fd,
         close_drain_s=close_drain_s)
     return instance, store, catalogue, coordinator, calls
@@ -230,8 +239,10 @@ async def test_selected_job_returns_queued_then_runs_without_search_or_persisted
 async def test_exact_probe_frames_override_container_padding_at_chunk_boundary(tmp_path):
     instance,store,catalogue,coordinator,downloads=make_service(tmp_path)
     async def boundary_probe(path,chosen,**kwargs):
-        return {'duration_s':45.035102,'container_duration_s':45.035102,
-                'frames':1984059,'sample_rate':44100,'audio_streams':1,
+        return {'duration_s':1984059/44100,'container_duration_s':45.035102,
+                'frames':1984059,'source_frames':1984059,
+                'context_window':contexts.full_context(1984059),'render_mode':'full',
+                'sample_rate':44100,'audio_streams':1,
                 'provider':chosen.provider,'source_id':chosen.track_id}
     instance.probe=boundary_probe
     queued,_=await instance.submit_selected(
@@ -262,6 +273,135 @@ async def test_prepare_requires_exact_44100_frame_evidence(tmp_path,probe_report
     assert failed.id==queued.id and failed.state=='failed'
     assert failed.error['code']=='source_probe_invalid'
     assert coordinator.calls==[]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('frames,valid', [(14032003,True),(900*44100,True),
+                                         (900*44100+1,False)])
+async def test_excerpt_freezes_only_one_centered_context_from_complete_source(tmp_path, frames, valid):
+    instance, store, _, coordinator, downloads = make_service(tmp_path)
+    async def exact_probe(path, chosen, **kwargs):
+        assert kwargs['max_seconds'] == 900
+        window_frames = min(frames,90*44100)
+        start = (frames-window_frames)//2
+        return {'duration_s':frames/44100,'container_duration_s':frames/44100,
+                'frames':frames,'source_frames':frames,'sample_rate':44100,
+                'audio_streams':1,'provider':chosen.provider,'source_id':chosen.track_id,
+                'render_mode':'excerpt',
+                'context_window':{'start_frame':start,'end_frame':start+window_frames}}
+    instance.probe = exact_probe
+    try:
+        queued, _ = await instance.submit_selected('long-stream','long-excerpt',
+            {'render_mode':'excerpt'}, selected())
+        result = await instance.run_once()
+        workspace = instance.runtime.work_root/queued.id
+        if valid:
+            assert result.state == 'ready', result.error
+            recipe = json.loads((workspace/'recipe.json').read_text())
+            assert recipe['source_frames'] == frames
+            assert recipe['context_window'] == contexts.freeze_context(frames)
+            assert recipe['context_window']['end_frame']-recipe['context_window']['start_frame'] == 90*44100
+            assert coordinator.calls.count('separate') == 1
+            assert coordinator.calls.count('convert_000') == 1
+            assert not any(name == 'convert_001' for name in coordinator.calls)
+        else:
+            assert result.state == 'failed' and result.error['code'] == 'source_probe_invalid'
+            assert coordinator.calls == [] and result.artifact_key is None
+            assert not (workspace/'recipe.json').exists()
+        assert len(downloads) == 1
+    finally:
+        await instance.close()
+
+
+@pytest.mark.asyncio
+async def test_prepare_storage_is_idempotent_without_generation_or_versions(tmp_path, monkeypatch):
+    instance, store, _, coordinator, downloads = make_service(tmp_path)
+    instance.runtime.model.unlink()
+    instance.runtime.index.unlink()
+    instance.inventory.paths.worker.unlink()
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Storage binding must not inspect generation assets or versions')
+    monkeypatch.setattr(instance.inventory, 'build_runtime', forbidden)
+    monkeypatch.setattr(instance.inventory, 'version_provider', forbidden)
+    try:
+        await instance.prepare_storage()
+        await instance.prepare_storage()
+        assert isinstance(instance.artifacts, artifact_module.ArtifactStore)
+        assert store.bind_artifact_root(str(tmp_path/'artifacts')) == str(tmp_path/'artifacts')
+        assert instance._generation is None and instance._runtime_inventory is None
+        assert instance._context_task is None and instance._task is None
+        assert downloads == coordinator.calls == []
+    finally:
+        await instance.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('operation', ['prepare_storage', 'prepare'])
+async def test_cancelled_preparation_keeps_owned_offload_lease_until_bounded_drain(
+        tmp_path, monkeypatch, operation):
+    lock = tmp_path/'prepare-owner.lock'
+    owner = ownership.exclusive(lock)
+    fd = owner.__enter__()
+    instance, _, _, _, _ = make_service(tmp_path, ownership_fd=fd, close_drain_s=.02)
+    entered, release = threading.Event(), threading.Event()
+    method = '_prepare_storage_sync' if operation == 'prepare_storage' else '_prepare_context_sync'
+    real = getattr(instance, method)
+    def delayed():
+        entered.set()
+        assert release.wait(5)
+        return real()
+    monkeypatch.setattr(instance, method, delayed)
+    preparing = asyncio.create_task(getattr(instance, operation)())
+    try:
+        await wait_until(entered.is_set)
+        preparing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await preparing
+        started = time.monotonic()
+        await instance.close()
+        assert time.monotonic()-started < .5
+    finally:
+        owner.__exit__(None, None, None)
+    try:
+        with pytest.raises(ownership.OwnershipBusy):
+            with ownership.exclusive(lock):
+                pass
+    finally:
+        release.set()
+    await wait_until(lambda: not instance._offloads)
+    if instance._context_task is not None:
+        await asyncio.gather(instance._context_task, return_exceptions=True)
+    with ownership.exclusive(lock):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_shared_generation_preparation_survives_one_cancelled_waiter(tmp_path, monkeypatch):
+    instance, _, _, _, _ = make_service(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    real = instance.inventory.build_runtime
+    calls = []
+    def delayed_inventory():
+        calls.append(True)
+        entered.set()
+        assert release.wait(5)
+        return real()
+    monkeypatch.setattr(instance.inventory, 'build_runtime', delayed_inventory)
+    first = asyncio.create_task(instance.prepare())
+    second = asyncio.create_task(instance.prepare())
+    try:
+        await wait_until(entered.is_set)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert not second.done()
+        release.set()
+        generation = await second
+        assert generation == instance.generation and calls == [True]
+    finally:
+        release.set()
+        await asyncio.gather(first, second, return_exceptions=True)
+        await instance.close()
 
 
 @pytest.mark.asyncio
@@ -343,6 +483,9 @@ async def test_changed_assets_reconcile_active_unit_before_any_rehash(tmp_path):
     active = ActiveReconcileCoordinator(reopened)
     second, _, _, _, resumed_downloads = make_service(
         tmp_path, store=reopened, catalogue=catalogue, coordinator=active)
+    second.runtime.model.unlink()
+    second.inventory.build_runtime = lambda: (_ for _ in ()).throw(
+        AssertionError('Active existing unit must reconcile before generation inventory'))
     second.inventory.build = lambda source: (_ for _ in ()).throw(
         AssertionError('Active existing unit must be reconciled before inventory'))
     observed = await second.run_once()
@@ -383,7 +526,9 @@ async def test_unknown_claim_is_publicly_recorded_and_loop_backs_off(tmp_path):
     unknown = UnknownReconcileCoordinator(reopened)
     second, _, _, _, resumed_downloads = make_service(
         tmp_path, store=reopened, catalogue=catalogue, coordinator=unknown)
-    second.runtime.model.write_bytes(b'changed-but-must-not-hash-while-unit-unknown')
+    second.runtime.model.unlink()
+    second.inventory.build_runtime = lambda: (_ for _ in ()).throw(
+        AssertionError('Unknown existing unit must retain slot before generation inventory'))
     second.inventory.build = lambda source: (_ for _ in ()).throw(
         AssertionError('Unknown existing unit must retain slot before inventory'))
     await second.start()
@@ -632,3 +777,153 @@ async def test_request_metadata_rejects_signed_url_before_ledger_write(tmp_path)
         await instance.submit_selected('stream-e', 'rpc-message-5',
             {'instrumental': False, 'playback_url': 'https://signed.invalid/private'}, selected())
     assert service_module.SqliteJobScanner()(store, ('running', 'cancel_requested')) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field', ['render_mode','delivery_mode'])
+@pytest.mark.parametrize('bad', [None,True,False,0,[],{},'','FULL','excerpt '])
+async def test_invalid_modes_never_admit_or_download(tmp_path,field,bad):
+    instance,store,catalogue,coordinator,downloads=make_service(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            await instance.submit_selected('stream-invalid-mode','request-invalid-mode',
+                {field:bad},selected())
+        assert store.find_request('stream-invalid-mode','request-invalid-mode') is None
+        assert downloads==[] and coordinator.calls==[]
+    finally:
+        await instance.close()
+
+
+@pytest.mark.asyncio
+async def test_full_excerpt_cache_split_but_delivery_transport_does_not_change_audio(tmp_path):
+    instance,store,catalogue,coordinator,downloads=make_service(tmp_path)
+    observed=[]
+    assert instance._PROGRESS is ledger.JOB_PROGRESS_STAGES
+    progress=store.progress
+    def record(*args,**kwargs):
+        observed.append(kwargs['stage'])
+        return progress(*args,**kwargs)
+    store.progress=record
+    keys={}
+    try:
+        for render,delivery in [('full','file'),('excerpt','file'),('excerpt','voice')]:
+            request={'render_mode':render,'delivery_mode':delivery,'instrumental':True}
+            queued,_=await instance.submit_selected('stream-modes',render+'-'+delivery,
+                                                   request,selected('same-source'))
+            finished=await instance.run_once()
+            assert finished.state=='ready', finished.error
+            recipe=json.loads((instance.runtime.work_root/queued.id/'recipe.json').read_text())
+            assert recipe['render_mode']==render and recipe['schema']=='sing-render-v4'
+            assert ('excerpt' in [step['name'] for step in recipe['steps']])==(render=='excerpt')
+            keys[render,delivery]=finished.artifact_key
+        assert keys['full','file']!=keys['excerpt','file']
+        assert keys['excerpt','file']==keys['excerpt','voice']
+        assert 'excerpt' in observed
+        assert observed[observed.index('excerpt') + 2]=='converting'
+    finally:
+        await instance.close()
+
+
+@pytest.mark.asyncio
+async def test_excerpt_recovery_keeps_frozen_plan_and_does_not_download_again(tmp_path):
+    first,store,catalogue,coordinator,downloads=make_service(tmp_path,pause_first=True)
+    queued,_=await first.submit_selected('stream-excerpt-recovery','excerpt-recovery',
+        {'render_mode':'excerpt','delivery_mode':'file'},selected())
+    assert (await first.run_once()).state=='running'
+    path=first.runtime.work_root/queued.id/'recipe.json'
+    frozen=path.read_bytes()
+    await first.close()
+    second,_,_,resumed,resumed_downloads=make_service(tmp_path,store=ledger.JobStore(store.path))
+    try:
+        finished=await second.run_once()
+        assert finished.state=='ready' and resumed_downloads==[], finished.error
+        assert resumed.reconciles==['decode'] and resumed.calls[0:2]==['separate','excerpt']
+        assert path.read_bytes()==frozen
+    finally:
+        await second.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('schema', ['sing-render-v2', 'sing-render-v3'])
+async def test_historical_frozen_recipe_cannot_launch_a_new_stage(tmp_path, schema):
+    first, store, catalogue, _, _ = make_service(tmp_path)
+    first.coordinator = StopAfterFirstCoordinator(store)
+    queued, _ = await first.submit_selected('legacy-stream','legacy-request',
+        {'render_mode':'full'}, selected())
+    with pytest.raises(asyncio.CancelledError):
+        await first.run_once()
+    workspace = first.runtime.work_root/queued.id
+    recipe_path, plan_path = workspace/'recipe.json', workspace/'plan.json'
+    recipe = json.loads(recipe_path.read_text())
+    plan = json.loads(plan_path.read_text())
+    recipe['schema'] = schema
+    recipe.pop('source_frames'); recipe.pop('context_window')
+    recipe['hashes'].pop('context_window')
+    if schema == 'sing-render-v2':
+        recipe.pop('render_mode'); recipe['hashes'].pop('excerpt_selection')
+    for step in recipe['steps'] + plan['steps']:
+        argv = step['argv']
+        for option in ('--source-frames','--context-start-frame','--context-end-frame',
+                       *(('--render-mode',) if schema == 'sing-render-v2' else ())):
+            if option in argv:
+                index = argv.index(option); del argv[index:index+2]
+    plan['recipe'] = recipes.fingerprint(recipe)
+    recipe_path.write_text(json.dumps(recipe)); plan_path.write_text(json.dumps(plan))
+    await first.close()
+    second, reopened, _, coordinator, downloads = make_service(tmp_path,
+        store=ledger.JobStore(store.path), catalogue=catalogue)
+    try:
+        failed = await second.run_once()
+        assert failed.state == 'failed' and failed.error['code'] == 'legacy_plan_read_only'
+        assert downloads == coordinator.calls == coordinator.reconciles == []
+        assert len(reopened.stage_attempts(queued.id, queued.stream_id)) == 1
+        assert failed.artifact_key is None
+    finally:
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_frozen_excerpt_selector_change_blocks_next_launch(tmp_path):
+    first,store,catalogue,coordinator,downloads=make_service(tmp_path)
+    first.coordinator=StopAfterFirstCoordinator(store)
+    queued,_=await first.submit_selected('stream-selector-change','selector-change',
+        {'render_mode':'excerpt','delivery_mode':'file'},selected())
+    with pytest.raises(asyncio.CancelledError):await first.run_once()
+    await first.close()
+    first.inventory.paths.excerpt_selection.write_bytes(b'changed selector')
+    second,_,_,resumed,resumed_downloads=make_service(tmp_path,store=ledger.JobStore(store.path))
+    try:
+        failed=await second.run_once()
+        assert failed.id==queued.id and failed.state=='failed'
+        assert failed.error['code']=='asset_inventory_changed'
+        assert resumed.calls==[] and resumed_downloads==[]
+    finally:
+        await second.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field',[
+    'worker_python','worker_script','rvc_script','model','index','hubert','demucs_repo'])
+async def test_new_launch_rejects_consistently_remapped_private_asset_paths(tmp_path,field):
+    instance,store,_,coordinator,_=make_service(tmp_path)
+    workspace=tmp_path/'workspaces'/'private-plan'
+    args=instance._runtime_args(workspace)
+    frames=30*44100
+    steps=service_module.build_plan(**args,frames=frames,render_mode='excerpt')
+    recipe=recipes.recipe_document(**args,provider='163',track_id='private-plan',
+        hashes={name:'a'*64 for name in recipes.HASH_NAMES},
+        versions={name:'test' for name in recipes.VERSION_NAMES},
+        steps=steps,source_frames=frames,render_mode='excerpt')
+    instance._verify_launch_plan(workspace,recipe,steps)
+    old=str(args[field]); new='/un-inventoried/'+field
+    forged=tuple(service_module.Step(step.name,
+        tuple(new if token==old else token for token in step.argv),
+        step.timeout_s,step.inputs,step.outputs) for step in steps)
+    assert forged!=steps
+    # Read-only reconciliation accepts original consistent asset bindings.
+    recipes.validate_private_steps(recipe,forged,workspace)
+    # A future launch must instead bind the actual inventoried runtime paths.
+    with pytest.raises(service_module.JobServiceError) as caught:
+        instance._verify_launch_plan(workspace,recipe,forged)
+    assert caught.value.code=='frozen_plan_invalid' and coordinator.calls==[]
+    await instance.close()

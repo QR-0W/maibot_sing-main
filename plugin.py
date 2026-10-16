@@ -9,10 +9,8 @@ from dataclasses import dataclass
 import json
 import os
 import re
-import time
-import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from maibot_sdk import (
     CONFIG_RELOAD_SCOPE_SELF,
@@ -24,27 +22,23 @@ from maibot_sdk import (
 )
 from maibot_sdk.types import ActivationType, ToolParameterInfo, ToolParamType
 
-from .music.search import MusicSearchClient, MusicSearchError, SongInfo
-from .rvc_client import RVCClient, RVCSidecarError
-from .services.mimo_tts import MiMoTTSService
-from .services.pipeline import Pipeline
-from .services.local_backend import LocalBackend
+from .music.search import MusicSearchClient, SongInfo
 from .services.artifact_store import ArtifactStore
 from .services.asset_inventory import AssetInventory, AssetPaths, RuntimeVersionProbe
 from .services.catalogue_service import CatalogueService, CatalogueError
-from .services.delivery_outbox import CustomVoiceSender, DeliveryOutbox
+from .services.delivery_outbox import CustomVoiceSender, DeliveryOutbox, classify_ack
 from .services.job_service import JobService, RenderRuntime, RENDER_PARAMETER_POLICY
-from .services.job_store import TRUSTED_QQ_INGRESS, JobConflict, JobNotFound, JobStore
+from .services.job_store import (TRUSTED_QQ_INGRESS, TRUSTED_TOOL_INGRESS, JobConflict,
+                                 JobNotFound, JobStore)
 from .services.ownership import OwnershipBusy, exclusive
-from .services.source_offer import normalized
+from .services.request_options import COVER_COMMAND_PATTERN, parse_request_text, validate_direct_host_text
+from .services.resource_budget import ResourceBudget
+from .services.stage_errors import MESSAGES as STAGE_MESSAGES
 from .services.stage_coordinator import StageCoordinator
 from .services.unit_runner import UnitRunner
-from .services.voice_sender import SingleVoiceSender
 
 
-# 期望的 sidecar 代码版本；sidecar/server.py 的 SIDECAR_VERSION 递增时同步修改。
-# 端口上已有服务版本不匹配（残留旧代码进程）时，插件会终止它并重新拉起
-EXPECTED_SIDECAR_VERSION = "4"
+from .runtime.catalogue_text import validate_catalogue_text as safe_text
 
 
 # ===== 配置模型 =====
@@ -57,16 +51,16 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="默认禁用；管理员审查后明确启用")
-    config_version: str = Field(default="0.5.0", description="配置版本")
+    config_version: str = Field(default="0.6.0", description="配置版本")
 
 
 class RVCConfig(PluginConfigBase):
-    """RVC sidecar 配置（可迁移核心：改 rvc_root 即可迁移）。"""
+    """旧 RVC/sidecar 兼容字段已退休；仅 default_model 用于固定音色显示。"""
 
-    __ui_label__ = "RVC 声音转换"
+    __ui_label__ = "历史 RVC 配置（仅 default_model 生效）"
     __ui_order__ = 1
 
-    rvc_root: str = Field(default="D:/RVC20240604Nvidia", description="RVC 安装根目录")
+    rvc_root: str = Field(default="", description="退休兼容字段；当前翻唱不读取或启动旧 sidecar")
     python_path: str = Field(default="", description="RVC Python 解释器路径，留空自动用 {rvc_root}/runtime/python.exe")
     port: int = Field(default=7898, description="sidecar 监听端口（避开 7897 WebUI）")
     auto_start: bool = Field(default=False, description="旧 sidecar 不自动启动；Linux 本地模式始终忽略此项")
@@ -117,9 +111,9 @@ class RVCConfig(PluginConfigBase):
 
 
 class MiMoConfig(PluginConfigBase):
-    """MiMo TTS 配置（说话功能的基础 TTS）。"""
+    """退休 TTS 兼容配置；未接入受限媒体单元，不读取参考音频或合成。"""
 
-    __ui_label__ = "MiMo TTS"
+    __ui_label__ = "历史 MiMo TTS 配置（暂不支持）"
     __ui_order__ = 2
 
     api_key: str = Field(default="", description="MiMo API Key")
@@ -169,14 +163,20 @@ class LocalConfig(PluginConfigBase):
     demucs_repo_path: str = Field(default="", description="固定本地 Demucs 模型 repo 绝对目录：htdemucs.yaml 与对应 .th")
     rvc_upstream_path: str = Field(default="", description="固定 RVC 上游代码文件/目录绝对路径")
     worker_python: str = Field(default="", description="安装 Demucs/RVC 的隔离 Python 绝对路径（建议 3.9）")
-    musicdl_python: str = Field(default="", description="安装 musicdl 的隔离 Python 绝对路径")
+    musicdl_python: str = Field(default="", description="退休兼容字段；下载只走受限 JobService 媒体阶段")
     rvc_script: str = Field(default="", description="受限 RVC 脚本绝对路径；不执行未隔离 WebUI")
     inference_lock: str = Field(default="", description="与本机其他推理共享的绝对锁文件路径，父目录须存在")
     max_queue: int = Field(default=2, ge=0, le=8)
-    timeout_s: int = Field(default=900, ge=60, le=900)
+    timeout_s: int = Field(default=900, ge=60, le=900, description="退休 LocalBackend 兼容字段；受限阶段使用各自预算")
     max_duration_s: int = Field(default=300, ge=30, le=300)
     max_download_bytes: int = Field(default=67108864, ge=1048576, le=67108864)
-    local_source_allowlist: list[str] = Field(default_factory=list, description="仅用于管理员可控回归")
+    local_source_allowlist: list[str] = Field(default_factory=list, description="退休 LocalBackend 兼容字段；不允许旧本地输入旁路")
+    memory_max_mb: int = Field(default=2048, ge=512, le=6144,
+        description="媒体服务及子进程硬内存上限（MiB）；软限为75%，超限终止并记录错误。此额度不包含 SDK Runner 入口内存，也不保证其它服务不会耗尽容器。")
+    memory_headroom_mb: int = Field(default=512, ge=256, le=4096,
+        description="每个有限共享祖先除完整媒体预算外须额外保留的 MiB；容量未知或不足就拒绝，不启动媒体")
+    cpu_quota_percent: int = Field(default=150, ge=25, le=400, description="单个阶段服务的 CPU 配额百分比")
+    media_tasks_max: int = Field(default=64, ge=8, le=512, description="单个阶段服务的最大进程/线程数")
 
 
 class SingPluginConfig(PluginConfigBase):
@@ -212,6 +212,7 @@ class DurableCoverSettings:
     provider: str
     search_limit: int
     default_model: str
+    budget: ResourceBudget
 
     def path(self,name: str) -> Path:
         return dict(self.paths)[name]
@@ -225,15 +226,6 @@ class SingPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._music: MusicSearchClient | None = None
-        self._rvc: RVCClient | None = None
-        self._mimo: MiMoTTSService | None = None
-        self._pipeline: Pipeline | None = None
-        self._local: LocalBackend | None = None
-        self._sidecar_proc: asyncio.subprocess.Process | None = None
-        # 待选歌曲状态: stream_id -> (结果列表, 平台, 时间戳)
-        self._pending: dict[str, tuple[list[SongInfo], str, float]] = {}
-        self._pending_lock = asyncio.Lock()
-        self._voice_sender: SingleVoiceSender | None = None
         self._active_cover: ActiveCoverService | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._startup_tasks: set[asyncio.Task[Any]] = set()
@@ -245,8 +237,6 @@ class SingPlugin(MaiBotPlugin):
         self._outbox: DeliveryOutbox | None = None
         self._delivery_task: asyncio.Task[None] | None = None
         self._scheduler_owner: Any = None
-        # 翻唱语音缓存定期清理任务
-        self._cache_cleanup_task: asyncio.Task[None] | None = None
 
     # ===== 生命周期 =====
 
@@ -353,24 +343,11 @@ class SingPlugin(MaiBotPlugin):
         self.ctx.logger.info("翻唱插件加载中...")
         # Copy every scalar needed below before the first await. A Host config
         # callback can replace self.config later, but this lifecycle owns one snapshot.
-        port=self.config.rvc.port
-        legacy=(self.config.local.backend,self.config.rvc.auto_start)
-        mimo_key=self.config.mimo.api_key
-        mimo_base=self.config.mimo.api_base_url
         durable=self._capture_durable_settings()
-        self._cache_cleanup_task=asyncio.create_task(
-            self._voice_cache_cleanup_loop(),name='sing-voice-cache-cleanup')
-        self._voice_sender=SingleVoiceSender(self.ctx.send.custom)
-        self._rvc=RVCClient(f"http://127.0.0.1:{port}",logger=self.ctx.logger)
-        if legacy==('legacy',True):
-            self.ctx.logger.warning("旧 sidecar 不具备 Linux 资源隔离，拒绝自动拉起")
         self._music=self._build_music_client()
         await self._restore_music_logins()
-        self._mimo=MiMoTTSService(api_key=mimo_key,api_base_url=mimo_base,
-                                  logger=self.ctx.logger)
-        self._pipeline=Pipeline(self._music,self._rvc,self._mimo,self.ctx.logger)
         await self._start_durable_services(durable)
-        self.ctx.logger.info("翻唱插件加载完成")
+        self.ctx.logger.info("翻唱插件加载完成（0.6.1 source-window-v4；excerpt源≤900秒/上下文≤90秒；Tool 来源策略：first-candidate-v1）")
 
     async def _stop_durable_services(self) -> None:
         self._active_cover=None
@@ -411,60 +388,28 @@ class SingPlugin(MaiBotPlugin):
         self._raise_cleanup_errors(errors)
 
     async def _close_resources(self) -> None:
-        local,self._local=self._local,None
-        login_tasks=[task for task in (self._qq_login_task,self._netease_login_task,
-                                       self._cache_cleanup_task) if task is not None]
-        self._qq_login_task=self._netease_login_task=self._cache_cleanup_task=None
-        sender,self._voice_sender=self._voice_sender,None
+        login_tasks=[task for task in (self._qq_login_task,self._netease_login_task)
+                     if task is not None]
+        self._qq_login_task=self._netease_login_task=None
         music,self._music=self._music,None
-        mimo,self._mimo=self._mimo,None
-        rvc,self._rvc=self._rvc,None
-        sidecar,self._sidecar_proc=self._sidecar_proc,None
-        self._pipeline=None
-        self._pending.clear()
         errors: list[tuple[str,BaseException]]=[]
         try:
             await self._stop_durable_services()
         except BaseException as exc:
             errors.append(('durable_services',exc))
-        if local is not None:
-            try:
-                await local.close()
-            except BaseException as exc:
-                errors.append(('local_backend',exc))
         for task in login_tasks:
             task.cancel()
         if login_tasks:
             try:
                 await asyncio.gather(*login_tasks,return_exceptions=True)
             except BaseException as exc:
-                errors.append(('login_or_cache_tasks',exc))
-        if sender is not None:
-            try:
-                await sender.shutdown(timeout_s=1.0)
-            except BaseException as exc:
-                errors.append(('voice_sender',exc))
+                errors.append(('login_tasks',exc))
         if music is not None:
             try:
                 await music.close()
             except BaseException as exc:
                 errors.append(('music_client',exc))
-        if mimo is not None:
-            try:
-                await mimo.close()
-            except BaseException as exc:
-                errors.append(('mimo_client',exc))
-        if rvc is not None:
-            try:
-                await rvc.close()
-            except BaseException as exc:
-                errors.append(('rvc_client',exc))
-        try:
-            await self._close_sidecar_process(sidecar)
-        except BaseException as exc:
-            errors.append(('sidecar',exc))
-        if errors:
-            self._raise_cleanup_errors(errors)
+        self._raise_cleanup_errors(errors)
         self.ctx.logger.info("翻唱插件已卸载")
 
     async def on_unload(self) -> None:
@@ -485,6 +430,17 @@ class SingPlugin(MaiBotPlugin):
                 raise
 
     # ===== 持久化渲染与投递 =====
+
+    def _resource_budget(self) -> ResourceBudget:
+        """Build the validated per-stage budget from administrator config.
+
+        Invalid values raise a Chinese ValueError here, so the mistake surfaces
+        while loading/updating config instead of when a job is already queued.
+        """
+        cfg = self.config.local
+        return ResourceBudget.from_config(
+            memory_max_mb=cfg.memory_max_mb, cpu_quota_percent=cfg.cpu_quota_percent,
+            tasks_max=cfg.media_tasks_max, headroom_mb=cfg.memory_headroom_mb)
 
     def _render_paths(self) -> dict[str, Path]:
         cfg = self.config.local
@@ -522,25 +478,30 @@ class SingPlugin(MaiBotPlugin):
             max_download_bytes=int(self.config.local.max_download_bytes),
             provider=self._resolve_platform(self.config.music.default_platform),
             search_limit=min(10,max(1,int(self.config.music.search_limit))),
-            default_model=self.config.rvc.default_model.strip())
+            default_model=self.config.rvc.default_model.strip(),
+            budget=self._resource_budget())
 
     async def _start_durable_services(self, settings: DurableCoverSettings) -> None:
         path=settings.path
         root,output,runtime_dir=settings.root,settings.output,settings.runtime_dir
         # The scheduler lock parent is the only pre-service directory creation.
-        # All durable binding, artifact validation, and hashing belong to jobs.prepare.
+        # Bind durable storage before recovery; generation assets are only needed
+        # for admission and new media launches, never old-unit reconciliation.
         await asyncio.to_thread(root.mkdir,parents=True,exist_ok=True,mode=0o700)
         ownership_fd=await self._acquire_scheduler_owner(
             root/'.durable-scheduler.lock')
         store=await self._startup_owned_call(
             ownership_fd,JobStore,root/'jobs.sqlite3',max(1,settings.max_queue+1))
-        runner=UnitRunner(runtime_dir/'stage_executor.py',path('worker_python'))
+        runner=UnitRunner(runtime_dir/'stage_executor.py',path('worker_python'),
+                          settings.budget)
         asset_paths=AssetPaths(
             model=path('model_path'),index=path('index_path'),hubert=path('hubert_path'),
             demucs_repo=path('demucs_repo_path'),rvc_script=path('rvc_script'),
             rvc_upstream=path('rvc_upstream_path'),media_stage=runtime_dir/'media_stage.py',
             worker=runtime_dir/'worker.py',render_plan=runtime_dir/'render_plan.py',
-            stage_executor=runtime_dir/'stage_executor.py')
+            stage_executor=runtime_dir/'stage_executor.py',
+            excerpt_selection=runtime_dir/'excerpt_selection.py',
+            context_window=runtime_dir/'context_window.py')
         inventory=AssetInventory(asset_paths,RuntimeVersionProbe(path('worker_python')))
         runtime=RenderRuntime(
             work_root=root/'jobs',worker_python=path('worker_python'),
@@ -556,6 +517,8 @@ class SingPlugin(MaiBotPlugin):
             'media_stage':runtime_dir/'media_stage.py','worker':runtime_dir/'worker.py',
             'render_plan':runtime_dir/'render_plan.py',
             'stage_executor':runtime_dir/'stage_executor.py',
+            'excerpt_selection':runtime_dir/'excerpt_selection.py',
+            'context_window':runtime_dir/'context_window.py',
             'worker_python':path('worker_python'),'worker_script':runtime_dir/'media_stage.py',
             'inference_lock':path('inference_lock')}
         runtime_context={
@@ -570,7 +533,7 @@ class SingPlugin(MaiBotPlugin):
             StageCoordinator(store,runner),output,inventory,runtime,
             runtime_context=runtime_context,ownership_fd=ownership_fd)
         self._jobs=jobs
-        await jobs.prepare()
+        await jobs.prepare_storage()
         if not isinstance(jobs.artifacts,ArtifactStore):
             raise RuntimeError('持久化产物存储未完成绑定')
         outbox=DeliveryOutbox(
@@ -579,6 +542,7 @@ class SingPlugin(MaiBotPlugin):
         # Root is already validated and bound. Recovery must precede any worker
         # claim or delivery discovery.
         await outbox.recover()
+        await jobs.recover_failure_notices()
         await jobs.start()
         aliases=tuple(dict.fromkeys(value for value in (
             settings.default_model,str(path('model_path')),path('model_path').name) if value))
@@ -596,161 +560,41 @@ class SingPlugin(MaiBotPlugin):
                 if jobs is not None and outbox is not None:
                     for job_id,stream_id in await jobs.delivery_candidates(limit=8):
                         await outbox.dispatch(job_id,stream_id)
+                    for job_id,stream_id in await jobs.failure_notice_candidates(limit=8):
+                        await self._dispatch_failure_notice(jobs, job_id, stream_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.ctx.logger.exception('持久化投递巡检失败；不得无凭据重发')
             await asyncio.sleep(2)
 
-    # ===== 本地受限后端（仅保留兼容查询；不再用于翻唱入口） =====
-
-    def _make_local_backend(self) -> LocalBackend:
-        cfg = self.config.local
-        if cfg.backend != 'local':
-            raise RuntimeError('旧 sidecar 未隔离，禁止在本机启用')
-        if cfg.output_dir.strip():
-            output = Path(cfg.output_dir)
-            if not output.is_absolute():
-                raise ValueError('local.output_dir 必须是绝对路径')
-        else:
-            output = Path(self.ctx.paths.data_dir).resolve() / 'covers'
-        path_fields = ('model_path', 'index_path', 'worker_python', 'musicdl_python',
-                       'rvc_script', 'inference_lock')
-        paths = {field: Path(getattr(cfg, field)) for field in path_fields if getattr(cfg, field).strip()}
-        if len(paths) != len(path_fields) or any(not path.is_absolute() for path in paths.values()):
-            raise ValueError('local 的模型、索引、隔离 Python、RVC 脚本、推理锁须全部配置为绝对路径')
-        return LocalBackend(output, model=paths['model_path'], index=paths['index_path'],
-                            worker_python=paths['worker_python'], musicdl_python=paths['musicdl_python'],
-                            rvc_script=paths['rvc_script'], inference_lock=paths['inference_lock'],
-                            max_queue=cfg.max_queue, timeout_s=cfg.timeout_s,
-                            max_duration_s=cfg.max_duration_s,
-                            max_download_bytes=cfg.max_download_bytes,
-                            allowlist=tuple(Path(path) for path in cfg.local_source_allowlist))
-
-    # ===== sidecar 管理 =====
-
-    def _resolve_python_path(self) -> str:
-        """解析 RVC Python 解释器路径。"""
-        rvc_root = self.config.rvc.rvc_root
-        configured = self.config.rvc.python_path.strip()
-        if configured:
-            return configured
-        return str(Path(rvc_root) / "runtime" / "python.exe")
-
-    def _sidecar_script_path(self) -> str:
-        return str(Path(__file__).parent / "sidecar" / "server.py")
-
-    async def _start_sidecar(self) -> None:
-        """历史 Windows sidecar；Linux 本地部署禁止启动无界推理。"""
-        if os.name == "posix":
-            raise RuntimeError("Linux 禁止无资源隔离的旧 sidecar")
-        rvc = self._rvc
-        if rvc is None:
-            return
-        port = self.config.rvc.port
-
-        # 先探测端口是否已有服务
+    async def _dispatch_failure_notice(self, jobs: JobService, job_id: str, stream_id: str) -> None:
+        """Claim before RPC; any uncertain send is fenced, never retried."""
+        claim_task = asyncio.create_task(jobs.claim_failure_notice(job_id, stream_id))
         try:
-            health = await rvc.health()
-        except Exception:
-            health = None
-
-        if health and health.get("status") == "ready":
-            version = str(health.get("version", "") or "")
-            if version == EXPECTED_SIDECAR_VERSION:
-                self.ctx.logger.info("复用已运行的 sidecar: %s", port)
-                return
-            # 版本不匹配：端口上是旧代码的残留进程，终止后重新拉起
-            self.ctx.logger.warning(
-                "端口 %s 上的 sidecar 代码版本过旧（%s != %s），终止后重新拉起",
-                port, version or "未知", EXPECTED_SIDECAR_VERSION,
-            )
-            self.ctx.logger.error('端口已有不同版本服务；拒绝关闭非本插件拥有的进程')
+            notice = await asyncio.shield(claim_task)
+        except asyncio.CancelledError:
+            # SQLite cannot be interrupted. Fence its eventual claim even if
+            # unload cancelled the caller before the transaction returned.
+            async def abandon_claim() -> None:
+                claimed = await claim_task
+                if claimed is not None:
+                    await jobs.settle_failure_notice(job_id, claimed['token'], 'unknown')
+            self._track_startup_task(asyncio.create_task(abandon_claim(), name='sing-notice-claim-close'))
+            raise
+        if notice is None:
             return
-
-        rvc_root = self.config.rvc.rvc_root
-        python_exe = self._resolve_python_path()
-        script = self._sidecar_script_path()
-
-        if not Path(rvc_root).exists():
-            self.ctx.logger.error("RVC 根目录不存在: %s", rvc_root)
-            return
-        if not Path(python_exe).exists():
-            self.ctx.logger.error("RVC Python 解释器不存在: %s（请检查 rvc_root 或 python_path）", python_exe)
-            return
-
-        self.ctx.logger.info("拉起 sidecar: %s %s --rvc-root %s --port %s", python_exe, script, rvc_root, port)
+        message = STAGE_MESSAGES.get(notice['code'], '任务处理失败；私有日志保留了诊断。')
+        text = f"翻唱任务 {job_id} 已停止（{notice['code']}）：{message} 不会自动重试或发送未完成音频。"
         try:
-            self._sidecar_proc = await asyncio.create_subprocess_exec(
-                python_exe,
-                script,
-                "--rvc-root",
-                rvc_root,
-                "--port",
-                str(port),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-        except OSError as exc:
-            self.ctx.logger.error("拉起 sidecar 失败: %s", exc)
-            return
-
-        # 等待 sidecar 就绪（模型加载可能较慢，但服务本身几秒内可响应 /health）
-        for _ in range(60):
-            if self._sidecar_proc is not None and self._sidecar_proc.returncode is not None:
-                self.ctx.logger.error("sidecar 进程提前退出，退出码: %s", self._sidecar_proc.returncode)
-                return
-            try:
-                health = await rvc.health()
-                if health.get("status") == "ready":
-                    self.ctx.logger.info("sidecar 已就绪: %s", port)
-                    return
-            except Exception:
-                pass
-            await asyncio.sleep(1)
-        self.ctx.logger.warning("等待 sidecar 就绪超时（60s），可能仍在加载模型")
-
-    async def _terminate_stale_sidecar(self, health: dict[str, Any]) -> None:
-        """终止版本过旧的 sidecar 进程并等待端口释放。"""
-        proc = self._sidecar_proc
-        if proc is not None and proc.returncode is None:
-            proc.terminate()
-        else:
-            self.ctx.logger.warning('拒绝终止其他服务健康检查返回的 PID')
-            return
-        self._sidecar_proc = None
-        # 等旧进程释放端口
-        for _ in range(10):
-            try:
-                await self._rvc.health()
-                await asyncio.sleep(0.5)
-            except Exception:
-                return
-
-    async def _ensure_sidecar_ready(self) -> None:
-        """发起转换前确保 sidecar 存活；崩溃或被结束后自动重新拉起。"""
-        if self._rvc is None:
-            return
-        try:
-            health = await self._rvc.health()
-            if health.get("status") == "ready":
-                return
-        except Exception:
-            pass
-        self.ctx.logger.warning("sidecar 未就绪，自动重新拉起")
-        await self._start_sidecar()
-
-    async def _close_sidecar_process(self, proc) -> None:
-        if proc is not None and proc.returncode is None:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                proc.kill()
-
-    async def _stop_sidecar(self) -> None:
-        proc,self._sidecar_proc=self._sidecar_proc,None
-        await self._close_sidecar_process(proc)
+            ack = await asyncio.wait_for(self.ctx.send.text(
+                text, stream_id, return_details=True, _rpc_timeout_ms=15_000), timeout=20)
+        except BaseException:
+            await asyncio.shield(jobs.settle_failure_notice(job_id, notice['token'], 'unknown'))
+            raise
+        receipt = classify_ack(ack)
+        await asyncio.shield(jobs.settle_failure_notice(
+            job_id, notice['token'], receipt.outcome, message_id=receipt.message_id))
 
     def _build_music_client(self) -> MusicSearchClient:
         netease_cookie: dict[str, str] = {}
@@ -860,42 +704,6 @@ class SingPlugin(MaiBotPlugin):
 
     # ===== 工具方法 =====
 
-    def _convert_kwargs(self, sid: str = "") -> dict[str, Any]:
-        cfg = self.config.rvc
-        f0_up_key, _ = self._resolve_f0_up_key(sid)
-        return {
-            "f0_up_key": f0_up_key,
-            "f0_method": cfg.f0_method,
-            "index_rate": cfg.index_rate,
-            "filter_radius": cfg.filter_radius,
-            "resample_sr": cfg.resample_sr,
-            "rms_mix_rate": cfg.rms_mix_rate,
-            "protect": cfg.protect,
-        }
-
-    def _resolve_f0_up_key(self, sid: str) -> tuple[int, bool]:
-        """解析变调半音数，返回 (半音数, 是否命中 model_keys 手动映射)。
-
-        每个 RVC 模型都有其训练时最合适的音域，翻唱时按模型自动适配变调。
-        ``rvc.model_keys`` 键为模型文件名（含 .pth），值为该模型的变调半音数；
-        手动映射优先于自动变调。
-        """
-        model = (sid or "").strip()
-        if model:
-            key = self.config.rvc.model_keys.get(model)
-            if key is not None:
-                return int(key), True
-        return int(self.config.rvc.f0_up_key), False
-
-    def _resolve_model(self, sid: str) -> str:
-        """解析音色模型名，未指定时用配置默认值。"""
-        model = sid.strip() if sid else self.config.rvc.default_model.strip()
-        if not model and self._local is not None:
-            model = self._local.model.name
-        if not model:
-            raise RuntimeError("未指定音色模型，请配置 rvc.default_model")
-        return model
-
     def _resolve_platform(self, platform: str) -> str:
         p = platform.strip().lower()
         if p in ("163", "qq"):
@@ -906,70 +714,6 @@ class SingPlugin(MaiBotPlugin):
             return "qq"
         default = self.config.music.default_platform.strip().lower()
         return default if default in ("163", "qq") else "163"
-
-    def _voice_cache_dir(self) -> Path:
-        """翻唱语音缓存目录：配置了 voice_cache_dir 用之，否则用运行时目录。"""
-        raw = self.config.rvc.voice_cache_dir.strip()
-        return Path(raw).expanduser() if raw else Path(self.ctx.paths.runtime_dir)
-
-    def _cleanup_voice_cache(self) -> int:
-        """清理超过保留期的翻唱语音缓存文件，返回删除数量。"""
-        retention_days = self.config.rvc.voice_cache_retention_days
-        if retention_days <= 0:
-            return 0
-        cache_dir = self._voice_cache_dir()
-        if not cache_dir.is_dir():
-            return 0
-        cutoff = time.time() - retention_days * 86400
-        removed = 0
-        for path in cache_dir.glob("sing_*.wav"):
-            try:
-                if path.stat().st_mtime < cutoff:
-                    path.unlink()
-                    removed += 1
-            except OSError:
-                continue  # 文件可能正被发送流程占用，跳过下次再清
-        if removed:
-            self.ctx.logger.info("已清理 %d 个超过 %d 天的翻唱语音缓存", removed, retention_days)
-        return removed
-
-    async def _voice_cache_cleanup_loop(self) -> None:
-        """启动时清理一次，之后每 24 小时巡检一次。"""
-        while True:
-            try:
-                await asyncio.to_thread(self._cleanup_voice_cache)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.ctx.logger.exception("清理翻唱语音缓存失败")
-            await asyncio.sleep(24 * 3600)
-
-    async def _send_voice(self, audio: bytes | Path, stream_id: str,
-                          sender: SingleVoiceSender | None = None):
-        """Make exactly one detailed ``voiceurl`` attempt and preserve ambiguity."""
-        sender=sender or self._voice_sender
-        if sender is None:
-            raise RuntimeError('语音发送服务尚未启动或正在重载')
-        if isinstance(audio,Path):
-            cache_path=audio
-        else:
-            cache_dir=self._voice_cache_dir()
-            await asyncio.to_thread(cache_dir.mkdir,parents=True,exist_ok=True)
-            cache_path=cache_dir/f"sing_{uuid.uuid4().hex}.wav"
-            await asyncio.to_thread(cache_path.write_bytes,audio)
-        absolute=await asyncio.to_thread(cache_path.resolve)
-        return await sender.send_file(absolute,stream_id)
-
-    def _find_stream_id(self, stream_id: str, kwargs: dict[str, Any]) -> str:
-        sid = str(stream_id or "").strip() or str(kwargs.get("stream_id", "") or "")
-        if sid:
-            return sid
-        msg = kwargs.get("message", {})
-        if isinstance(msg, dict):
-            sid = str(msg.get("stream_id", "") or "")
-            if sid:
-                return sid
-        return ""
 
     # ===== 命令 =====
 
@@ -985,11 +729,13 @@ class SingPlugin(MaiBotPlugin):
         if any(not isinstance(value, str) or not value.strip() or len(value) > 256
                for value in values.values()):
             raise ValueError('宿主消息身份不完整，拒绝自动投递')
-        if (stream_id != values['stream_id'] or kwargs.get('platform') != values['platform']
+        if (not isinstance(kwargs.get('text'), str) or not kwargs['text'].strip()
+                or stream_id != values['stream_id'] or kwargs.get('platform') != values['platform']
                 or kwargs.get('user_id') != values['user_id']
                 or kwargs.get('text') != message.get('processed_plain_text')
                 or message.get('is_command') is not True):
             raise ValueError('宿主消息与会话/平台/用户不匹配，拒绝自动投递')
+        validate_direct_host_text(message, kwargs['text'])
         # Current trusted NapCat codec supplies self_id/message_type/target;
         # Host's registered gateway adds its independently resolved account_id.
         # WebUI virtual QQ supplies only at_bot, even with a real QQ group ID.
@@ -1034,14 +780,48 @@ class SingPlugin(MaiBotPlugin):
                          ensure_ascii=False, separators=(',', ':')).encode('utf-8')
         return hashlib.sha256(b'sing-command-v1\0' + raw).hexdigest()
 
+    @staticmethod
+    def _tool_session_identity(payload: dict[str, Any]) -> dict[str, str]:
+        """Validate the QQ Tool context using the accepted Host/LLM boundary.
+
+        The Host merges `stream_id`/`chat_id`/`platform`/`user_id` from the real
+        execution context, but a model argument of the same name wins over it.
+        The Host always emits both `stream_id` and `chat_id` from one value, so a
+        mismatch proves one of them was overwritten; only the exact same value is
+        accepted. This is a consistency check, not a signature: it does not stop
+        a prompt-injected model that forges *both* consistently, which is why the
+        Tool path is recorded under its own weaker ingress proof.
+        """
+        stream = payload.get('stream_id')
+        chat = payload.get('chat_id')
+        platform = payload.get('platform')
+        user = payload.get('user_id')
+        group = payload.get('group_id')
+        if (not isinstance(stream, str) or not stream.strip() or len(stream) > 256
+                or stream != chat):
+            raise ValueError('工具调用缺少一致的宿主会话上下文，未入队')
+        if platform != 'qq' or not isinstance(user, str) or not user.strip() or len(user) > 256:
+            raise ValueError('仅支持来自真实 QQ 会话的工具调用，未入队')
+        if group is not None and (not isinstance(group, str) or not group.strip() or len(group) > 256):
+            raise ValueError('工具调用的群会话上下文无效，未入队')
+        # WebUI virtual-QQ chats reuse platform 'qq'; their group ids are marked.
+        if any(isinstance(value, str) and value.startswith('webui_virtual_group_')
+               for value in (stream, group)):
+            raise ValueError('WebUI 虚拟 QQ 会话不能创建生产翻唱任务，未入队')
+        return {'stream_id': stream, 'platform': 'qq', 'user_id': user, 'group_id': group or ''}
+
+    @staticmethod
+    def _tool_request_token(identity: dict[str, str], request: dict[str, Any]) -> str:
+        """Intent key, not a permanent request token or an original-message ID."""
+        raw = json.dumps({'identity': identity, 'request': request}, sort_keys=True,
+                         ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        return hashlib.sha256(b'sing-tool-v2\0' + raw).hexdigest()
+
     def _require_active_cover(self) -> ActiveCoverService:
         active=self._active_cover
         if active is None:
             raise RuntimeError('持久化调度服务尚未启动或正在重载')
         return active
-
-    def _require_jobs(self) -> JobService:
-        return self._require_active_cover().jobs
 
     @staticmethod
     def _job_status(job: Any) -> str:
@@ -1057,6 +837,23 @@ class SingPlugin(MaiBotPlugin):
             delivery = '自动投递待处理' if job.delivery_state == 'pending' else '未授权/已取消投递'
         failure = f"，阶段原因 {job.error.get('code')}" if job.error else ''
         return f'{job.state}/{job.stage}，进度 {job.chunk_done}/{job.chunk_total}{failure}，{delivery}'
+
+    @staticmethod
+    def _source_choice_lines(job_id: str, items: list[dict[str, Any]]) -> list[str]:
+        """Display the frozen ordinal/availability without substituting recordings."""
+        selectable = any(item['availability'] in ('unknown', 'available') for item in items)
+        header = (f'任务 {job_id}：请选择标为可选的版本，发送 /翻唱选择 {job_id} 序号：'
+                  if selectable else
+                  f'任务 {job_id}：候选均不可选，尚未入队；无需发送选择命令。'
+                  '请处理下列原因后重新请求，不会自动换用其他版本。')
+        labels = {'unknown': '可选，平台访问待取链确认', 'available': '可选，取链后确认',
+                  'requires_login': '需管理员登录音乐平台（不可选）',
+                  'unavailable': '平台当前不可访问（不可选）',
+                  'over_limit': '超过当前来源时长上限（不可选）'}
+        return [header] + [
+            f"{index}. {item['title']} - {item['artist']} · {item['album']} · "
+            f"ID {item['track_id']} · {labels[item['availability']]}"
+            for index, item in enumerate(items, 1)]
 
     async def _owned_job(self, active: ActiveCoverService, stream_id: str,
                          kwargs: dict[str,Any], job_id: str):
@@ -1122,8 +919,8 @@ class SingPlugin(MaiBotPlugin):
 
     @Command(
         "翻唱",
-        description="用克隆音色翻唱歌曲（搜歌 → 人声分离 → 换音色）",
-        pattern=r"^(?P<pfx>\S)翻唱\s+(?P<query>.+?)(?:\s+--album\s+(?P<album>.+?))?(?:\s+--source-id\s+(?P<source_id>[A-Za-z0-9_-]+))?(?:\s+-v\s+(?P<model>\S+))?(?:\s+(?P<instrumental>--with-instrumental))?(?:\s+(?P<auto_reply>--auto-reply))?$",
+        description="/翻唱 原始命令即授权完成后单次送达；默认完整伴奏文件，各选项独立覆盖",
+        pattern=COVER_COMMAND_PATTERN,
         timeout_ms=45_000,  # only bounded catalogue search and ledger writes
 
     )
@@ -1132,71 +929,43 @@ class SingPlugin(MaiBotPlugin):
         if identity is None:
             return False, '未验证的 QQ 命令来源', True
         try:
+            # No Hook/cache binding: slash requests reach this Host Command
+            # after chat-disable/operator checks. Every request selector,
+            # including consent, comes only from the validated original text.
+            options = parse_request_text(kwargs['message']['processed_plain_text'])
             active=self._require_active_cover()
-            # Tool/kwargs groups cannot grant consent: parse the Host's original
-            # Command text rather than trusting a separately supplied group.
-            command_match = re.fullmatch(
-                r'\S翻唱\s+(?P<query>.+?)(?:\s+--album\s+(?P<album>.+?))?'
-                r'(?:\s+--source-id\s+(?P<source_id>[A-Za-z0-9_-]+))?'
-                r'(?:\s+-v\s+(?P<model>\S+))?'
-                r'(?:\s+(?P<instrumental>--with-instrumental))?'
-                r'(?:\s+(?P<auto_reply>--auto-reply))?', kwargs['text'])
-            if command_match is None:
-                raise ValueError('翻唱命令格式无效；--auto-reply 只能放在最后')
-            matched = command_match.groupdict()
-            query = str(matched.get('query') or '').strip()
-            model = str(matched.get('model') or '').strip()
-            album = str(matched.get('album') or '').strip()
-            source_id = str(matched.get('source_id') or '').strip()
-            auto_reply = matched.get('auto_reply') == '--auto-reply'
+            query, model = options.query, options.model_selector
+            album, source_id = options.album, options.source_id
+            auto_reply = options.auto_reply
             consent_event = identity['message_id'] if auto_reply else None
-            if re.search(r'\s(?:--[A-Za-z-]+|-v)(?=\s|$)', query):
-                raise ValueError('命令参数顺序无效；--auto-reply 只能放在最后')
-            if not query or ' - ' not in query or not query.rsplit(' - ', 1)[-1].strip():
-                raise ValueError('请用 /翻唱 准确歌名 - 艺人名；来源需在候选列表明确选定')
             if model and model not in active.model_aliases:
                 raise ValueError('只能使用管理员固定配置的音色')
             if identity['platform']!='qq':
                 raise ValueError('目前仅支持 QQ 原始命令授权语音自动投递')
             jobs=active.jobs
             provider=active.provider
-            request={'query':query,'provider':provider,'platform':identity['platform'],
+            request={'title':options.title,'artist':options.artist,
+                     'query':query,'provider':provider,'platform':identity['platform'],
                      'user_id':identity['user_id'],
-                     'instrumental':matched.get('instrumental')=='--with-instrumental',
+                     'entry_kind':options.entry_kind,'render_mode':options.render_mode,
+                     'delivery_mode':options.delivery_mode,'instrumental':options.instrumental,
                      'album':album,'source_id':source_id,'model_selector':model,
                      'model':active.default_model,'model_path':active.model_path,
-                     'auto_reply':auto_reply,'ingress_proof':TRUSTED_QQ_INGRESS}
+                     'auto_reply':auto_reply,'legacy_auto_reply_flag':options.legacy_auto_reply_flag,
+                     'ingress_proof':TRUSTED_QQ_INGRESS}
             token = self._request_token(identity)
             # Replayed Command RPCs reuse the exact persisted token; never repeat a
             # search or start a second worker when an offer/selection already exists.
-            existing=await jobs.find_request(
-                stream_id,token,request,auto_reply=auto_reply,consent_event=consent_event)
-            if existing is not None:
-                job=existing
-            else:
-                choices=await jobs.catalogue.search(
-                    query,provider,limit=active.search_limit)
-                title, artist = [part.strip() for part in query.rsplit(' - ', 1)]
-                if not title:
-                    raise ValueError('缺少准确歌名')
-                choices = [item for item in choices if normalized(item.artist) == normalized(artist)
-                           and (normalized(item.title) == normalized(title)
-                                or normalized(item.title).startswith(normalized(title) + ' '))]
-                if album:
-                    choices = [item for item in choices if item.album == album]
-                if source_id:
-                    choices = [item for item in choices if item.track_id == source_id]
-                if not choices:
-                    raise ValueError('未找到符合准确曲目/艺人/专辑/来源 ID 的候选；没有启动翻唱')
-                job,_=await jobs.admit_offer(
-                    stream_id,token,request,choices,auto_reply=auto_reply,
-                    consent_event=consent_event,select_single=True)
+            job = await jobs.search_and_admit(
+                title=options.title, artist=options.artist,
+                provider=active.provider, search_limit=active.search_limit,
+                stream_id=stream_id, token=token, request=request,
+                album=album, source_id=source_id,
+                auto_reply=auto_reply, consent_event=consent_event)
             if job.state=='needs_selection':
                 offer=await jobs.choices(job.id,stream_id)
                 choices=offer['items']
-                lines=[f'任务 {job.id}：请选择明确版本，发送 /翻唱选择 {job.id} 序号：']
-                lines += [f"{i}. {item['title']} - {item['artist']} · {item['album']} · ID {item['track_id']} · {item['availability']}"
-                          for i,item in enumerate(choices,1)]
+                lines = self._source_choice_lines(job.id, choices)
                 await self.ctx.send.text('\n'.join(lines),stream_id)
                 return True,f'待选择任务 {job.id}',True
             await self.ctx.send.text(f'翻唱任务 {job.id}：{self._job_status(job)}；发送 /翻唱状态 {job.id} 查询。', stream_id)
@@ -1207,45 +976,16 @@ class SingPlugin(MaiBotPlugin):
 
     @Command(
         "说",
-        description="用克隆音色说话（MiMo TTS → 换音色）",
+        description="说话功能未接入受限媒体单元，当前明确不支持",
         pattern=r"^(?P<pfx>\S)说\s+(?P<text>.+)$",
-        timeout_ms=600_000,
+        timeout_ms=10_000,
     )
     async def handle_speak_command(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
         if self._trusted_command_identity(stream_id, kwargs) is None:
             return False, '未验证的 QQ 命令来源', True
-        matched = kwargs.get("matched_groups")
-        if not isinstance(matched, dict):
-            matched = {}
-        text = str(matched.get("text", "") or "").strip()
-        if not text:
-            await self.ctx.send.text("用法：/说 <文本>", stream_id)
-            return False, "缺少文本", True
-
-        try:
-            sender=self._voice_sender
-            if sender is None:
-                raise RuntimeError('语音发送服务尚未启动或正在重载')
-            model = self._resolve_model("")
-            audio = await self._run_speak(text, model, stream_id)
-        except Exception as exc:
-            self.ctx.logger.exception("说话失败")
-            await self.ctx.send.text(f"说话失败：{exc}", stream_id)
-            return False, str(exc), True
-
-        try:
-            receipt=await self._send_voice(audio,stream_id,sender)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self.ctx.logger.exception("语音发送失败")
-            await self.ctx.send.text(f"语音发送失败：{exc}",stream_id)
-            return False,str(exc),True
-        if receipt.outcome=='sent' and receipt.message_id:
-            return True,f"说: {text}（消息 {receipt.message_id}）",True
-        message='语音发送结果未知，可能已送达；不会自动重发。'
+        message='说话功能暂不支持：TTS 与旧后处理尚未接入受限媒体单元；不会合成、读取参考音频或发送语音。'
         await self.ctx.send.text(message,stream_id)
-        return True,message,True
+        return False,message,True
 
     @Command(
         "音色列表",
@@ -1496,74 +1236,163 @@ class SingPlugin(MaiBotPlugin):
     @Tool(
         "cover_song",
         description=(
-            "用克隆音色翻唱一首歌（bot 亲自开口唱）。仅当用户想让 bot 自己唱时调用，"
-            "典型说法：「我想听你唱XX」「你唱一首XX」「翻唱XX」「用你的声音唱XX」。"
-            "传参 query 必须为『准确歌名 - 艺人名』，例如 In the Aeroplane Over the Sea - Neutral Milk Hotel；"
-            "不能只填歌名。本 Tool 不拥有可信原始用户 message_id，仅提供 /翻唱 命令授权指引；不会入队、渲染或自动发送。"
-            "注意：用户只是想听这首歌的原唱/原曲时（如「放一首XX」「发一首XX」「来一首XX的歌」"
-            "「放XX听听」），不要调用本工具，应改用 search_and_play_music。"
-            "请提示用户亲自发送 /翻唱 准确歌名 - 艺人名：缺省只保存并允许查询状态，不自动发送；仅用户明确要求完成后自动回复时在命令最后加 --auto-reply。涉及歌曲选择须用 /翻唱选择。"
-            "任何 stream_id、source_id 或其它工具参数均不可作为自动投递授权。"
+            "用克隆音色翻唱一首歌（bot 亲自开口唱），用户用自然语言提出翻唱时调用本工具。"
+            "典型说法：「你能唱一下朴树的生如夏花吗？」「我想听你唱XX」「请翻唱XX的YY」「用你的声音唱XX」。"
+            "请把用户说到的曲目拆成 title（歌名）与 artist（歌手）两个参数，不要只填关键词、不要编造。"
+            "工具会在准确歌名、艺人及明确来源条件过滤后自动绑定第一个候选，不让用户手动选择。"
+            "首项不可用时返回未入队原因，不静默改唱后面的版本。请按真实结果回复："
+            "只有 queued/running 等状态才表示接纳，完成后向当前会话最多发送一次；不要提前声称已经发送。"
+            "注意：用户只是想听原唱/原曲时（如「放一首XX」「发一首XX」「来一首XX的歌」），"
+            "不要调用本工具，应改用 search_and_play_music。"
         ),
-        activation_type=ActivationType.ALWAYS,
-        timeout_ms=10_000,  # no rendering, sending or queue writes via untrusted Tool
-
+        timeout_ms=45_000,  # normal MaiCore deferred discovery; admission only
         parameters=[
-            ToolParameterInfo(name="query", param_type=ToolParamType.STRING, description="准确歌名 - 艺人名；必须包含艺人，不能仅用关键词", required=True),
-            ToolParameterInfo(name="with_instrumental", param_type=ToolParamType.BOOLEAN, description="是否混入伴奏（默认 false）", required=False),
-            ToolParameterInfo(name="album", param_type=ToolParamType.STRING, description="用户明确选择的专辑，可选；不得根据时长猜测", required=False),
-            ToolParameterInfo(name="source_id", param_type=ToolParamType.STRING, description="用户明确选择的返回候选曲目ID，可选；不得编造", required=False),
+            ToolParameterInfo(name="title", param_type=ToolParamType.STRING,
+                              description="准确歌名，例如 生如夏花；不要包含歌手名", required=True),
+            ToolParameterInfo(name="artist", param_type=ToolParamType.STRING,
+                              description="准确歌手/艺人名，例如 朴树；不知道时必须先问用户，不能编造", required=True),
+            ToolParameterInfo(name="instrumental", param_type=ToolParamType.BOOLEAN,
+                              description="是否带伴奏；不填按纯人声片段处理", required=False),
+            ToolParameterInfo(name="render_mode", param_type=ToolParamType.STRING,
+                              description="full=整曲，excerpt=12–18 秒片段（默认）", required=False),
+            ToolParameterInfo(name="delivery_mode", param_type=ToolParamType.STRING,
+                              description="voice=语音条（默认），file=音频文件", required=False),
+            ToolParameterInfo(name="album", param_type=ToolParamType.STRING,
+                              description="用户明确指定的专辑名，可选；不得根据时长猜测", required=False),
+            ToolParameterInfo(name="source_id", param_type=ToolParamType.STRING,
+                              description="用户明确指定的候选曲目ID，可选；不得编造", required=False),
         ],
     )
-    async def handle_cover_tool(self, query: str = "", with_instrumental: bool = False, stream_id: str = "", album: str | None = None, source_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
-        # Tool arguments may contain a fabricated stream_id and do not include an
-        # authenticated original message_id. Never convert them into consent.
-        del stream_id, album, source_id, with_instrumental, kwargs
-        title = query.strip() if isinstance(query, str) else ''
-        if not title:
-            return {'content': '请向用户询问准确歌名 - 艺人名。Tool 无权发起自动投递。'}
-        return {'content': f'请用户本人发送 /翻唱 {title} 发起任务（缺省只保存、可查状态，不自动发语音）；若本人明确希望完成后自动回复，请在命令最后加 --auto-reply。本次仅提供说明，未搜索、未入队、未发送语音。'}
+    async def handle_cover_tool(self, title: str = "", artist: str = "", instrumental: Any = None,
+                                render_mode: Any = None, delivery_mode: Any = None,
+                                album: Any = None, source_id: Any = None,
+                                **kwargs: Any) -> dict[str, Any]:
+        """Admit one cover request from a real QQ session context.
+
+        Session fields come from the Host execution context; see
+        `_tool_session_identity` for the consistency check and its limits.
+        """
+        try:
+            identity = self._tool_session_identity(kwargs)
+            clean_title, clean_artist = safe_text(title), safe_text(artist)
+            mode = 'excerpt' if render_mode in (None, '') else render_mode
+            transport = 'voice' if delivery_mode in (None, '') else delivery_mode
+            backing = False if instrumental is None else instrumental
+            if not isinstance(mode, str) or mode not in ('full', 'excerpt'):
+                raise ValueError('render_mode 只能是 full 或 excerpt')
+            if not isinstance(transport, str) or transport not in ('file', 'voice'):
+                raise ValueError('delivery_mode 只能是 file 或 voice')
+            if type(backing) is not bool:
+                raise ValueError('instrumental 必须是布尔值')
+            chosen_album = safe_text(album) if album not in (None, '') else ''
+            if source_id is None or source_id == '':
+                chosen_source = ''
+            elif isinstance(source_id, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,64}', source_id):
+                chosen_source = source_id
+            else:
+                raise ValueError('source_id 格式无效')
+            query = f'{clean_title} - {clean_artist}'
+            active = self._require_active_cover()
+            request = {'title': clean_title, 'artist': clean_artist,
+                       'query': query, 'provider': active.provider, 'platform': identity['platform'],
+                       'user_id': identity['user_id'], 'entry_kind': 'tool',
+                       'source_selection_policy': 'first-candidate-v1',
+                       'render_mode': mode, 'delivery_mode': transport, 'instrumental': backing,
+                       'album': chosen_album, 'source_id': chosen_source, 'model_selector': '',
+                       'model': active.default_model, 'model_path': active.model_path,
+                       'auto_reply': True, 'legacy_auto_reply_flag': False,
+                       'ingress_proof': TRUSTED_TOOL_INGRESS}
+            intent_key = self._tool_request_token(identity, request)
+            token, job = await active.jobs.bind_tool_request(
+                identity['stream_id'], intent_key, request, auto_reply=True)
+            if job is None:
+                job = await active.jobs.search_and_admit(
+                    title=clean_title, artist=clean_artist,
+                    provider=active.provider, search_limit=active.search_limit,
+                    stream_id=identity['stream_id'], token=token, request=request,
+                    album=chosen_album, source_id=chosen_source,
+                    auto_reply=True, consent_event=token)
+            return await self._cover_tool_result(active.jobs, job, identity['stream_id'])
+        except (ValueError, JobConflict, CatalogueError, RuntimeError) as exc:
+            if isinstance(exc, (ValueError, CatalogueError)):
+                explanation = str(exc)
+            elif isinstance(exc, JobConflict):
+                explanation = '任务接纳冲突或队列已满；没有创建第二个任务'
+            else:
+                self.ctx.logger.exception('翻唱工具接纳失败，诊断不输出到聊天')
+                explanation = '持久化调度服务未就绪或接纳失败，请管理员查看私有日志'
+            code = 'invalid_request' if isinstance(exc, ValueError) else 'admission_failed'
+            if isinstance(exc, CatalogueError) and exc.code in ('source_duration_limit', 'source_unavailable'):
+                code = exc.code
+            return {'success': False, 'job_id': None, 'state': 'not_admitted',
+                    'code': code, 'content': f'翻唱未入队：{explanation}。'}
+
+    async def _cover_tool_result(self, jobs: JobService, job: Any,
+                                 stream_id: str) -> dict[str, Any]:
+        """One public result format for admission and same-session status."""
+        failed = job.state in ('failed', 'interrupted', 'cancelled')
+        raw_code = job.error.get('code') if job.error else None
+        code = raw_code if raw_code in STAGE_MESSAGES else ('job_failed' if failed else job.state)
+        result = {'success': not failed, 'job_id': job.id, 'state': job.state,
+                  'code': code, 'delivery_state': job.delivery_state}
+        if job.state == 'needs_selection':
+            offer = await jobs.choices(job.id, stream_id)
+            lines = self._source_choice_lines(job.id, offer['items'])
+            if not any(item['availability'] in ('unknown', 'available') for item in offer['items']):
+                result.update(success=False, code='source_unavailable')
+            result.update(content='\n'.join(lines), choices=offer['items'])
+        else:
+            detail = STAGE_MESSAGES.get(code, '任务已停止；不会自动重试。') if failed else ''
+            delivery_hint = ('不会自动重试或发送未完成音频。' if failed else
+                             '已授权的完成产物最多尝试一次投递，未知结果不重发。')
+            selected_hint = ''
+            if (job.request.get('source_selection_policy') == 'first-candidate-v1'
+                    and job.selected_source):
+                selected = job.selected_source
+                result['selected_source'] = {key: selected[key] for key in
+                    ('provider', 'track_id', 'title', 'artist', 'album')}
+                selected_hint = (f"已自动绑定第一个匹配候选：{selected['title']} - {selected['artist']}"
+                                 f"（{selected['album']}，ID {selected['track_id']}）；无需选择序号。")
+            result['content'] = (selected_hint + f'翻唱任务 {job.id}：{self._job_status(job)}。{detail}'
+                                 f'{delivery_hint}可用 /翻唱状态 {job.id} 查询、'
+                                 f'/翻唱取消 {job.id} 取消。')
+        return result
+
+    @Tool(
+        'cover_song_status',
+        description='查询本 QQ 会话当前用户的翻唱任务状态；使用 cover_song 返回的 job_id，不得编造 ID。',
+        timeout_ms=10_000,
+        parameters=[ToolParameterInfo(name='job_id', param_type=ToolParamType.STRING,
+                                      description='cover_song 返回的任务 ID', required=True)],
+    )
+    async def handle_cover_status_tool(self, job_id: str = '', **kwargs: Any) -> dict[str, Any]:
+        try:
+            identity = self._tool_session_identity(kwargs)
+            if not isinstance(job_id, str) or not re.fullmatch('[0-9a-f]{32}', job_id):
+                raise ValueError('无效的翻唱任务 ID')
+            active = self._require_active_cover()
+            job = await active.jobs.get_job(job_id, identity['stream_id'])
+            if (job.request.get('platform') != identity['platform']
+                    or job.request.get('user_id') != identity['user_id']):
+                raise JobNotFound('无权访问其他用户的任务')
+            return await self._cover_tool_result(active.jobs, job, identity['stream_id'])
+        except (ValueError, JobNotFound, RuntimeError):
+            return {'success': False, 'job_id': None, 'state': 'unavailable',
+                    'code': 'job_unavailable', 'content': '任务不存在、不可访问或调度服务尚未就绪。'}
 
     @Tool(
         "speak_voice",
-        description=(
-            "用克隆音色说话。当用户要求语音回复、发送了语音消息、或适合语音回复时调用。"
-            "本工具会用基础 TTS 合成原声，再用克隆音色替换，发送语音条。"
-        ),
+        description="说话功能暂不支持：TTS 与旧后处理未接入受限媒体单元，不合成或发送语音。",
         activation_type=ActivationType.ALWAYS,
-        timeout_ms=600_000,
+        timeout_ms=10_000,
         parameters=[
             ToolParameterInfo(name="text", param_type=ToolParamType.STRING, description="要说的文本", required=True),
         ],
     )
-    async def handle_speak_tool(self, text: str = "", stream_id: str = "", **kwargs: Any) -> dict[str, str]:
+    async def handle_speak_tool(self, text: str = "", stream_id: str = "", **kwargs: Any) -> dict[str, Any]:
         del text, stream_id, kwargs
-        return {'content': '工具没有可信原始用户消息身份，拒绝自动生成或发送语音；请用户亲自使用 /说 命令。'}
-
-    # ===== 编排调用 =====
-
-    async def _run_speak(self, text: str, sid: str, stream_id: str) -> bytes:
-        if self._pipeline is None:
-            raise RuntimeError("插件未初始化完成")
-        cfg = self.config.mimo
-        if cfg.rvc_after_tts:
-            raise RuntimeError('说话 RVC 尚无受限本地转换路径；关闭 mimo.rvc_after_tts 可使用原生 MiMo TTS')
-        reference_b64 = ""
-        if cfg.voice_mode == "clone":
-            ref_path = cfg.reference_audio.strip()
-            if not ref_path:
-                raise RuntimeError("clone 模式需配置 mimo.reference_audio 参考音频路径")
-            if not Path(ref_path).exists():
-                raise RuntimeError(f"参考音频不存在: {ref_path}")
-            reference_b64 = base64.b64encode(Path(ref_path).read_bytes()).decode("ascii")
-        return await self._pipeline.speak(
-            text,
-            sid,
-            voice_id=cfg.preset_voice,
-            reference_audio_base64=reference_b64,
-            convert=cfg.rvc_after_tts,
-            convert_kwargs=self._convert_kwargs(sid),
-        )
+        return {'success': False, 'code': 'unsupported',
+                'content': '工具没有可信原始用户消息身份，拒绝自动生成或发送语音；说话功能暂不支持，/说 也不会合成或发送语音。'}
 
 
 def create_plugin() -> SingPlugin:

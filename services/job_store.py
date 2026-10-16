@@ -15,15 +15,43 @@ import sqlite3
 import time
 import uuid
 
+from .stage_errors import MESSAGES as STAGE_MESSAGES
 
-# Only plugin-side validation of the current NapCat codec + registered Host
-# gateway may assign this version. A historic consent_event alone is unsafe.
-TRUSTED_QQ_INGRESS = 'napcat-host-route-v1'
+
+# Plugin-side SDK/MaiCore session-context trust labels, NOT cryptographic proof.
+# Only the entrypoint assigns them after its supported context checks. A historic
+# consent_event alone is not upgraded to permission by this ledger.
+# * direct-text: slash Command using supported direct Host text/session context.
+# * tool-session: structured LLM Tool using consistent SDK session context.
+# Neither label claims a stronger original-message anchor for Tool invocations.
+TRUSTED_QQ_INGRESS = 'napcat-direct-text-v2'
+TRUSTED_TOOL_INGRESS = 'napcat-tool-session-v1'
+TRUSTED_INGRESS_PROOFS = (TRUSTED_QQ_INGRESS, TRUSTED_TOOL_INGRESS)
+DELIVERY_MODES = frozenset(('file','voice'))
+RENDER_MODES = frozenset(('full','excerpt'))
+JOB_PROGRESS_STAGES = ('starting','resolving','downloading','separating','excerpt',
+                       'converting','encoding','validating','publishing')
+
+
+def request_modes(request: Dict[str, Any]) -> Tuple[str, str, bool]:
+    """Validate public render/delivery modes without rewriting legacy requests."""
+    if not isinstance(request,dict):
+        raise ValueError('Expected request object')
+    delivery_mode = request.get('delivery_mode','voice')
+    render_mode = request.get('render_mode','full')
+    instrumental = request.get('instrumental',False)
+    if not isinstance(delivery_mode, str) or delivery_mode not in DELIVERY_MODES:
+        raise ValueError('Invalid delivery mode')
+    if not isinstance(render_mode, str) or render_mode not in RENDER_MODES:
+        raise ValueError('Invalid render mode')
+    if type(instrumental) is not bool:
+        raise ValueError('instrumental must be bool')
+    return delivery_mode,render_mode,instrumental
 
 
 def trusted_delivery_request(request: Dict[str, Any]) -> bool:
     return (isinstance(request, dict)
-            and request.get('ingress_proof') == TRUSTED_QQ_INGRESS
+            and request.get('ingress_proof') in TRUSTED_INGRESS_PROOFS
             and request.get('platform') == 'qq'
             and request.get('auto_reply') is True)
 
@@ -79,9 +107,10 @@ def _json(value: Dict[str, Any]) -> str:
 class JobStore:
     """Single-media-slot ledger; delivery state is not render state.
 
-    request_token must come from a stable trusted invocation/message identity,
-    not a model-invented identifier. An identical token with changed content is
-    a conflict. auto_reply requires a persisted explicit user consent event.
+    request_token comes from a stable trusted invocation/message identity or
+    bind_tool_request's atomic session-intent reservation, never an LLM-invented
+    message anchor. An identical token with changed content is a conflict.
+    auto_reply requires a persisted explicit user consent event.
     """
     def __init__(self, database: Path, max_pending: int = 3):
         if not database.is_absolute() or not 1 <= max_pending <= 16:
@@ -131,6 +160,13 @@ class JobStore:
                 CREATE TABLE IF NOT EXISTS events (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
                     event TEXT NOT NULL, revision INTEGER NOT NULL, created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS failure_notices (
+                    job_id TEXT NOT NULL, kind TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('pending','dispatching','sent','unknown')),
+                    token TEXT, message_id TEXT,
+                    created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                    UNIQUE(job_id,kind)
                 );
                 CREATE TABLE IF NOT EXISTS store_settings (
                     namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
@@ -183,6 +219,60 @@ class JobStore:
                    (row['id'],event,row['revision']+1,time.time()))
         return JobStore._job(db.execute('SELECT * FROM jobs WHERE id=?',(row['id'],)).fetchone())
 
+    @staticmethod
+    def _authorize_failure_notice(db, job_id, request, auto_reply, consent_event, now):
+        # Admission-time authorization only. Never backfill existing jobs, even
+        # if a historic request happens to contain a current proof spelling.
+        if auto_reply and consent_event and trusted_delivery_request(request):
+            db.execute('''INSERT INTO failure_notices(
+                job_id,kind,state,created_at,updated_at)
+                VALUES(?,'failure','pending',?,?)''', (job_id,now,now))
+
+    def bind_tool_request(self, stream_id: str, binding_key: str,
+                          request: Dict[str, Any], *, auto_reply: bool = False
+                          ) -> Tuple[str, Optional[Job]]:
+        """Atomically reserve/reuse a Tool token, without a fictitious message ID.
+
+        ``binding_key`` describes the trusted session user and structured intent;
+        the complete request hash (including service generation) is also scoped.
+        Active jobs reuse indefinitely; terminal jobs reuse for 60 seconds from
+        jobs.updated_at. Thereafter a NEW random token can admit a new job.
+        An uncommitted search reservation lasts 60 seconds (catalogue timeout is
+        shorter). This is not a queue/scheduler. All writers serialize via BEGIN
+        IMMEDIATE; admission still uses jobs UNIQUE(stream_id,request_token).
+        """
+        _text(stream_id,'stream'); _text(binding_key,'tool binding key')
+        request_modes(request)
+        if (type(auto_reply) is not bool
+                or type(request.get('auto_reply',False)) is not bool
+                or request.get('auto_reply',False) != auto_reply):
+            raise ValueError('Tool auto reply selector differs from request')
+        document = _json(request)
+        key = hashlib.sha256(_json({'stream':stream_id,'binding':binding_key,
+                                   'request':request,'auto_reply':auto_reply}).encode()).hexdigest()
+        with self._transaction() as db:
+            now = time.time()
+            binding = db.execute('''SELECT value FROM store_settings
+                WHERE namespace='tool_request.v1' AND key=?''', (key,)).fetchone()
+            if binding:
+                saved = json.loads(binding['value'])
+                row = db.execute('SELECT * FROM jobs WHERE stream_id=? AND request_token=?',
+                                 (stream_id,saved['token'])).fetchone()
+                if row is not None:
+                    if row['request_json'] != document:
+                        raise JobConflict('Tool binding contents changed')
+                    if (row['state'] in ('searching','queued','running','cancel_requested','needs_selection')
+                            or now - row['updated_at'] <= 60):
+                        return saved['token'], self._job(row)
+                elif now - saved['reserved_at'] <= 60:
+                    return saved['token'], None
+            token = uuid.uuid4().hex
+            db.execute('''INSERT INTO store_settings(namespace,key,value)
+                VALUES('tool_request.v1',?,?) ON CONFLICT(namespace,key)
+                DO UPDATE SET value=excluded.value''',
+                       (key,_json({'token':token,'reserved_at':now})))
+            return token, None
+
     def submit(self, stream_id: str, request_token: str, request: Dict[str, Any], *,
                auto_reply: bool = False, consent_event: Optional[str] = None) -> Tuple[Job, bool]:
         _text(stream_id,'stream'); _text(request_token,'request token')
@@ -192,6 +282,7 @@ class JobStore:
             _text(consent_event,'explicit auto-reply consent')
         elif consent_event is not None:
             raise ValueError('Consent event supplied without auto_reply')
+        request_modes(request)
         document = _json(request)
         digest = hashlib.sha256(document.encode()).hexdigest()
         with self._transaction() as db:
@@ -209,6 +300,7 @@ class JobStore:
                           delivery_state,consent_event,created_at,updated_at) VALUES(?,?,?,?,?,'searching','searching',?,?,?,?)''',
                        (job_id,stream_id,request_token,document,digest,'pending' if auto_reply else 'not_requested',consent_event,now,now))
             db.execute('INSERT INTO events(job_id,event,revision,created_at) VALUES(?,?,0,?)',(job_id,'submitted',now))
+            self._authorize_failure_notice(db,job_id,request,auto_reply,consent_event,now)
             return self._job(db.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()), True
 
     def admit_offer(self, stream_id: str, request_token: str, request: Dict[str, Any],
@@ -230,6 +322,7 @@ class JobStore:
             raise ValueError('Consent event supplied without auto_reply')
         if type(ttl_s) is not int or not 30 <= ttl_s <= 1800:
             raise ValueError('Invalid offer expiry')
+        request_modes(request)
         document = _json(request)
         digest = hashlib.sha256(document.encode()).hexdigest()
         with self._transaction() as db:
@@ -271,6 +364,7 @@ class JobStore:
             if selected is not None:
                 db.execute('INSERT INTO events(job_id,event,revision,created_at) VALUES(?,?,2,?)',
                            (job_id,'source_selected',now))
+            self._authorize_failure_notice(db,job_id,request,auto_reply,consent_event,now)
             row = db.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
             return self._job(row), True
 
@@ -479,7 +573,7 @@ class JobStore:
         return row
 
     def progress(self, job_id: str, run_token: str, *, stage: str, done: int, total: int) -> Job:
-        stages = ('starting','resolving','downloading','separating','converting','encoding','validating','publishing')
+        stages = JOB_PROGRESS_STAGES
         if stage not in stages or type(done) is not int or type(total) is not int or not 0 <= done <= total <= 60:
             raise ValueError('Invalid stage progress')
         with self._transaction() as db:
@@ -547,8 +641,13 @@ class JobStore:
             if not db.execute('''SELECT 1 FROM store_settings
                     WHERE namespace='artifact_store.v1' AND key='root' ''').fetchone():
                 raise JobConflict('Artifact root is not bound; delivery claim refused')
+            request = json.loads(row['request_json'])
+            try:
+                request_modes(request)
+            except ValueError as exc:
+                raise JobConflict('Persisted request has invalid delivery or render modes') from exc
             if (not row['consent_event']
-                    or not trusted_delivery_request(json.loads(row['request_json']))):
+                    or not trusted_delivery_request(request)):
                 raise JobConflict('No verified QQ ingress and explicit authorization to auto-reply')
             return self._change(db,row,'delivery_claimed',delivery_state='dispatching',delivery_token=uuid.uuid4().hex)
 
@@ -579,6 +678,79 @@ class JobStore:
             for row in rows:
                 self._change(db,row,'delivery_uncertain_after_restart',delivery_state='unknown')
             return len(rows)
+
+    def failure_notice_candidates(self, limit: int = 8) -> list:
+        """Discover authorized failed/interrupted jobs, independently of media delivery."""
+        if type(limit) is not int or not 1 <= limit <= 32:
+            raise ValueError('Invalid failure notice scan limit')
+        with self._connect() as db:
+            return [(row['id'],row['stream_id']) for row in db.execute('''
+                SELECT j.id,j.stream_id FROM jobs j JOIN failure_notices n ON n.job_id=j.id
+                WHERE n.kind='failure' AND n.state='pending'
+                  AND j.state IN ('failed','interrupted')
+                ORDER BY j.updated_at,j.id LIMIT ?''', (limit,))]
+
+    def claim_failure_notice(self, job_id: str, stream_id: str) -> Optional[dict]:
+        """Persist dispatching BEFORE one text transport call; no retry permission."""
+        with self._transaction() as db:
+            row = self._owned(db,job_id,stream_id)
+            notice = db.execute('''SELECT * FROM failure_notices
+                WHERE job_id=? AND kind='failure' ''', (job_id,)).fetchone()
+            request = json.loads(row['request_json'])
+            if (notice is None or notice['state'] != 'pending'
+                    or row['state'] not in ('failed','interrupted')
+                    or not row['consent_event'] or not trusted_delivery_request(request)):
+                return None
+            token = uuid.uuid4().hex
+            db.execute('''UPDATE failure_notices SET state='dispatching',token=?,updated_at=?
+                WHERE job_id=? AND kind='failure' AND state='pending' ''',
+                       (token,time.time(),job_id))
+            # Never export arbitrary stored exception messages, paths or remote
+            # error labels. Only plugin-owned public codes cross this boundary.
+            code = (json.loads(row['error_json']) if row['error_json'] else {}).get('code')
+            public_codes = frozenset(STAGE_MESSAGES) | frozenset((
+                'job_failed','job_service_error','orchestration_conflict',
+                'configuration_changed','stage_deadline','unit_failed',
+                'source_search_timeout','source_resolution_timeout','source_unavailable',
+                'source_duration_limit','source_preview','source_identity_mismatch',
+                'download_failed','download_timeout','download_too_large',
+                'media_invalid','artifact_invalid','inventory_changed'))
+            return {'job_id':job_id,'stream_id':stream_id,'kind':'failure',
+                    'token':token,'state':row['state'],
+                    'code':code if isinstance(code,str) and code in public_codes else 'job_failed'}
+
+    def settle_failure_notice(self, job_id: str, token: str, outcome: str, *,
+                              message_id: Optional[str] = None) -> dict:
+        """Only positive platform acknowledgement is sent; everything else unknown.
+
+        A late positive acknowledgement may settle unknown after recovery. No
+        result ever restores pending. This never changes jobs.updated_at or any
+        media delivery field (including delivery_token and message_id).
+        """
+        _text(token,'failure notice token')
+        if outcome not in ('sent','unknown'):
+            raise ValueError('Invalid failure notice outcome')
+        if outcome == 'sent':
+            _text(message_id,'platform message id')
+        elif message_id is not None:
+            raise ValueError('Unknown notice must not carry a platform message id')
+        with self._transaction() as db:
+            row = db.execute('''SELECT * FROM failure_notices
+                WHERE job_id=? AND kind='failure' ''', (job_id,)).fetchone()
+            if row is None or row['token'] != token or row['state'] not in ('dispatching','unknown'):
+                raise JobConflict('Stale failure notice acknowledgement')
+            db.execute('''UPDATE failure_notices SET state=?,message_id=?,updated_at=?
+                WHERE job_id=? AND kind='failure' ''',
+                       (outcome,message_id,time.time(),job_id))
+            return dict(db.execute('''SELECT * FROM failure_notices
+                WHERE job_id=? AND kind='failure' ''', (job_id,)).fetchone())
+
+    def recover_failure_notices(self) -> int:
+        """Startup only AFTER exclusive scheduler ownership; never resend dispatching."""
+        with self._transaction() as db:
+            result = db.execute('''UPDATE failure_notices SET state='unknown',updated_at=?
+                WHERE state='dispatching' ''', (time.time(),))
+            return result.rowcount
 
     def history(self, job_id: str, stream_id: str) -> list:
         with self._connect() as db:

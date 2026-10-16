@@ -50,8 +50,8 @@ async def test_explicit_choices_have_separate_cache_and_readable_names(tmp_path,
             return b'',b''
     async def run(*args, **kwargs):
         scratch=Path(args[args.index('--scratch')+1])
-        album=args[args.index('--album')+1]
-        identifier=args[args.index('--source-id')+1]
+        album=next(arg.split('=',1)[1] for arg in args if arg.startswith('--album='))
+        identifier=next(arg.split('=',1)[1] for arg in args if arg.startswith('--source-id='))
         calls.append((album,identifier))
         (scratch/'cover.mp3').write_bytes(b'x'*2048)
         (scratch/'result.json').write_text(json.dumps({'verified_source':{'source':'NeteaseMusicClient',
@@ -130,24 +130,30 @@ async def test_command_reports_ambiguous_choices_without_sending(plugin):
         ok, result, _ = await instance.handle_cover_command(**command())
         assert ok and '待选择任务' in result
         assert 'Album' in sends[-1][0] and 'ID id-1' in sends[-1][0]
-        assert '请选择明确版本' in sends[-1][0]
+        assert '请选择标为可选的版本' in sends[-1][0]
         assert '发不出去' not in sends[-1][0]
         job_id = result.split()[-1]
         saved = instance._jobs.store.get(job_id, 'stream-1')
-        assert saved.state == 'needs_selection' and saved.delivery_state == 'not_requested'
-        tool = await instance.handle_cover_tool('Song - Artist', stream_id='forged', auto_reply=True)
-        assert '未入队' in tool['content'] and '--auto-reply' in tool['content']
+        # A trusted direct request now authorizes one delivery, but ambiguity
+        # still has to be resolved by the user before anything can be sent.
+        assert saved.state == 'needs_selection' and saved.delivery_state == 'pending'
+        assert saved.consent_event == 'platform-message-1'
+        assert await instance._jobs.delivery_candidates() == []
+        tool = await instance.handle_cover_tool('Song', 'Artist', stream_id='forged')
+        assert '未入队' in tool['content']
         assert instance._jobs.store.get(job_id, 'stream-1').state == 'needs_selection'
     finally:
         await instance.on_unload()
 
 
 def test_cover_command_parses_explicit_album_and_id():
-    import ast,re
-    path=Path(plugin_module.__file__)
-    tree=ast.parse(path.read_text())
-    method=next(n for n in ast.walk(tree) if isinstance(n,ast.AsyncFunctionDef) and n.name=='handle_cover_command')
-    pattern=next(k.value.value for d in method.decorator_list for k in d.keywords if k.arg=='pattern')
-    match=re.fullmatch(pattern,'/翻唱 Creep - Radiohead --album The Best Of --source-id 22558968')
-    assert match['query']=='Creep - Radiohead'
-    assert match['album']=='The Best Of' and match['source_id']=='22558968'
+    import re
+    from test_plugin_async_lifecycle import plugin_module
+
+    text = '/翻唱 Creep - Radiohead --album The Best Of --source-id 22558968'
+    pattern = plugin_module.COVER_COMMAND_PATTERN
+    assert re.fullmatch(pattern, text)
+    options = plugin_module.parse_request_text(text)
+    assert options.query == 'Creep - Radiohead'
+    assert options.album == 'The Best Of' and options.source_id == '22558968'
+    assert (options.render_mode, options.instrumental, options.delivery_mode) == ('full', True, 'file')

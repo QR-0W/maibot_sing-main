@@ -34,7 +34,11 @@ class CatalogueService:
         self.timeout_s = timeout_s
         self.max_duration_s = max_duration_s
 
-    async def search(self, query: str, provider: str = '163', limit: int = 5) -> List[CatalogueItem]:
+    async def search(self, query: str, provider: str = '163', limit: int = 5, *,
+                     max_duration_s: Optional[int] = None) -> List[CatalogueItem]:
+        duration_limit = self.max_duration_s if max_duration_s is None else max_duration_s
+        if type(duration_limit) is not int or not 30 <= duration_limit <= 900:
+            raise ValueError('Invalid per-request source duration limit')
         try:
             songs = await asyncio.wait_for(self.client.search(query,provider,limit=limit),self.timeout_s)
         except asyncio.TimeoutError as exc:
@@ -48,7 +52,7 @@ class CatalogueService:
                 raise CatalogueError('source_protocol_error','音乐平台返回了不匹配的来源。')
             item = CatalogueItem(provider=provider,track_id=song.song_id,title=song.name,
                 artist=song.artists or '艺人未标注',album=song.album,duration_s=song.duration_s,
-                availability='over_limit' if song.duration_s and song.duration_s > self.max_duration_s else 'unknown',
+                availability='over_limit' if song.duration_s and song.duration_s > duration_limit else 'unknown',
                 version=explicit_version(song.name),media_id=song.media_id)
             identity = (provider,item.track_id)
             if identity in by_id:

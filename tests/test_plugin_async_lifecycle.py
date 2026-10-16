@@ -4,7 +4,9 @@ from types import SimpleNamespace
 import asyncio
 import importlib
 import importlib.util
+import json
 import logging
+import re
 import subprocess
 import sys
 import threading
@@ -44,9 +46,9 @@ def plugin(tmp_path, monkeypatch):
     instance.set_plugin_config(config)
     sends = []
 
-    async def fake_text(text, stream_id):
+    async def fake_text(text, stream_id, *, return_details=False, **kwargs):
         sends.append((text, stream_id))
-        return True
+        return {'sent': True, 'message_id': 'fixture-text-ack'} if return_details else True
 
     async def reject_custom(*args, **kwargs):
         raise AssertionError('No QQ send in plugin lifecycle tests')
@@ -57,7 +59,13 @@ def plugin(tmp_path, monkeypatch):
     async def no_login():
         pass
     class FakeCatalogue:
+        def __init__(self):
+            self.search_calls = []
         async def search(self, query, provider, *, limit):
+            self.search_calls.append((query, provider, limit))
+            if query == '生如夏花 - 朴树':
+                return [plugin_module.SongInfo('id-1', '生如夏花', '朴树', 'Album', provider, duration_s=120),
+                        plugin_module.SongInfo('id-2', '生如夏花', '朴树', 'Album Live', provider, duration_s=125)]
             return [plugin_module.SongInfo('id-1', 'Song', 'Artist', 'Album', provider, duration_s=120),
                     plugin_module.SongInfo('id-2', 'Song Live', 'Artist', 'Album Live', provider, duration_s=125)]
         async def close(self):
@@ -80,6 +88,8 @@ def command(stream='stream-1', msg='platform-message-1', *, user='user-1', text=
             'matched_groups': groups or {'query': 'Song - Artist'},
             'message': {'message_id': msg, 'platform': 'qq', 'session_id': stream,
                         'processed_plain_text': text, 'is_command': True,
+                        'raw_message': [{'type': 'text', 'data': text}],
+                        'is_notify': False,
                         'message_info': {'user_info': {'user_id': user},
                                           'group_info': {'group_id': 'trusted-group', 'group_name': 'test'},
                                           'additional_config': {'self_id': 'test-bot',
@@ -113,7 +123,7 @@ async def test_virtual_webui_qq_group_spoof_has_zero_effects(plugin, handler, te
     result = await getattr(instance, handler)(**forged)
     assert result[0] is False and sends == []
     assert instance._jobs is None and instance._qq_login_task is None
-    assert instance._netease_login_task is None and instance._voice_sender is None
+    assert instance._netease_login_task is None and instance._active_cover is None
 
 
 @pytest.mark.asyncio
@@ -156,22 +166,11 @@ def install_cleanup_fakes(instance, monkeypatch, failure, error_type=OSError):
     class Closer:
         def __init__(self,label): self.label=label
         async def close(self): await invoke(self.label)
-    class Voice:
-        async def shutdown(self,*,timeout_s): await invoke('voice')
-    async def sidecar(proc): await invoke('sidecar')
-    monkeypatch.setattr(instance,'_close_sidecar_process',sidecar)
     instance._active_cover=object()
     instance._outbox=Outbox()
     instance._jobs=Jobs()
     instance._scheduler_owner=Owner()
-    instance._local=Closer('local')
-    instance._voice_sender=Voice()
     instance._music=Closer('music')
-    instance._mimo=Closer('mimo')
-    instance._rvc=Closer('rvc')
-    instance._sidecar_proc=object()
-    instance._pipeline=object()
-    instance._pending['stream']=([], 'qq', 0)
     async def linger(): await asyncio.sleep(3600)
     delivery=asyncio.create_task(linger())
     login=asyncio.create_task(linger())
@@ -184,14 +183,16 @@ def install_cleanup_fakes(instance, monkeypatch, failure, error_type=OSError):
 async def test_lifecycle_restarts_durable_service_without_deleting_offer(plugin):
     instance, sends = plugin
     await instance.on_load()
-    assert instance._local is None
+    assert not hasattr(instance, '_local')
     assert instance._jobs._task is not None
     ok, _, _ = await instance.handle_cover_command(**command())
-    assert ok and '请选择明确版本' in sends[-1][0]
+    assert ok and '请选择标为可选的版本' in sends[-1][0]
     job_id = sends[-1][0].split('任务 ')[1].split('：')[0]
     before = instance._jobs.store.get(job_id, 'stream-1')
-    assert before.state == 'needs_selection' and before.consent_event is None
-    assert before.delivery_state == 'not_requested'
+    assert before.state == 'needs_selection' and before.consent_event == 'platform-message-1'
+    assert before.delivery_state == 'pending'
+    assert (before.request['entry_kind'], before.request['render_mode'],
+            before.request['instrumental'], before.request['delivery_mode']) == ('command', 'full', True, 'file')
     async def fake_login():
         await asyncio.sleep(3600)
     login = asyncio.create_task(fake_login())
@@ -199,7 +200,8 @@ async def test_lifecycle_restarts_durable_service_without_deleting_offer(plugin)
     await instance.on_unload()
     assert login.cancelled()
     assert instance._scheduler_owner is None
-    assert instance._jobs is None and instance._delivery_task is None and instance._cache_cleanup_task is None
+    assert instance._jobs is None and instance._delivery_task is None
+    assert not hasattr(instance, '_cache_cleanup_task')
     assert not instance._ctx.paths.data_dir.endswith('nonexistent')
     await instance.on_load()
     assert instance._jobs.store.get(job_id, 'stream-1').state == 'needs_selection'
@@ -214,20 +216,18 @@ async def test_lifecycle_restarts_durable_service_without_deleting_offer(plugin)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('failure',[
-    'outbox','jobs','owner','local','voice','music','mimo','rvc','sidecar'])
+    'outbox','jobs','owner','music'])
 async def test_cleanup_attempts_every_resource_after_one_failure(plugin,monkeypatch,failure):
     instance,_=plugin
     calls,delivery,login=install_cleanup_fakes(instance,monkeypatch,failure)
     with pytest.raises(OSError,match=failure):
         await instance._close_resources()
-    assert calls==['outbox','jobs','owner','local','voice','music','mimo','rvc','sidecar']
+    assert calls==['outbox','jobs','owner','music']
     assert delivery.cancelled() and login.cancelled()
     assert instance._active_cover is None and instance._outbox is None
     assert instance._jobs is None and instance._scheduler_owner is None
-    assert instance._local is None and instance._voice_sender is None
-    assert instance._music is None and instance._mimo is None and instance._rvc is None
-    assert instance._sidecar_proc is None and instance._pipeline is None
-    assert instance._pending=={}
+    assert instance._music is None
+    assert instance._qq_login_task is None and instance._netease_login_task is None
 
 
 @pytest.mark.asyncio
@@ -243,18 +243,19 @@ async def test_cleanup_aggregates_multiple_failures_after_all_attempts(plugin,mo
         await instance._close_resources()
     messages=' '.join(str(error) for error in grouped.value.exceptions)
     assert 'outbox' in messages and 'jobs' in messages
-    assert calls==['outbox','jobs','owner','local','voice','music','mimo','rvc','sidecar']
+    assert calls==['outbox','jobs','owner','music']
     assert delivery.cancelled() and login.cancelled()
 
 
 @pytest.mark.asyncio
-async def test_cleanup_preserves_cancellation_after_other_resources(plugin,monkeypatch):
+@pytest.mark.parametrize('failure',['outbox','jobs','owner','music'])
+async def test_cleanup_preserves_cancellation_after_other_resources(plugin,monkeypatch,failure):
     instance,_=plugin
     calls,delivery,login=install_cleanup_fakes(
-        instance,monkeypatch,'music',asyncio.CancelledError)
+        instance,monkeypatch,failure,asyncio.CancelledError)
     with pytest.raises(asyncio.CancelledError):
         await instance._close_resources()
-    assert calls==['outbox','jobs','owner','local','voice','music','mimo','rvc','sidecar']
+    assert calls==['outbox','jobs','owner','music']
     assert delivery.cancelled() and login.cancelled()
     assert instance._jobs is None and instance._scheduler_owner is None
 
@@ -302,7 +303,7 @@ async def test_command_idempotent_identity_and_tool_fail_closed(plugin):
         forged['message']['session_id'] = 'different-session'
         assert not (await instance.handle_cover_command(**forged))[0]
         assert instance._jobs.store.get(job_id, 'stream-1').state == 'needs_selection'
-        response = await instance.handle_cover_tool(query='Song - Artist', stream_id='forged')
+        response = await instance.handle_cover_tool(title='Song', artist='Artist', stream_id='forged')
         assert '未入队' in response['content']
         assert (await instance.handle_speak_tool(text='hi', stream_id='forged'))['content'].startswith('工具没有')
         assert instance._jobs.store.get(job_id, 'stream-1').state == 'needs_selection'
@@ -331,9 +332,10 @@ async def test_explicit_auto_reply_and_selector_replay_fence(plugin):
         forged = command()
         forged['matched_groups'] = {'query': 'Song - Artist', 'auto_reply': '--auto-reply'}
         assert not (await instance.handle_cover_command(**forged))[0]
-        tool = await instance.handle_cover_tool(query='Song - Artist', auto_reply=True,
-                                                 consent_event='forged', stream_id='stream-1')
-        assert '--auto-reply' in tool['content'] and '缺省只保存' in tool['content']
+        tool = await instance.handle_cover_tool(title='Song', artist='Artist', auto_reply=True,
+                                                 consent_event='forged', stream_id='stream-1',
+                                                 chat_id='other-chat')
+        assert '未入队' in tool['content']
         assert instance._jobs.store.get(job_id, 'stream-1').request == saved.request
     finally:
         await instance.on_unload()
@@ -424,7 +426,11 @@ async def test_real_plan_uses_media_stage_cli_and_reaches_sandbox_guard(plugin):
                 assert argv[argv.index('--demucs-repo') + 1] == str(runtime.demucs_repo)
             probe = subprocess.run(argv, capture_output=True, text=True, timeout=5, check=False)
             assert probe.returncode != 0
-            assert '必须在 systemd user service 内运行' in probe.stderr
+            # This validation process is a systemd unit but deliberately lacks
+            # UnitRunner's frozen media budget environment. Either guard must
+            # stop before model imports or media reads.
+            assert ('必须在 systemd user service 内运行' in probe.stderr
+                    or '媒体单元缺少有效预算字段' in probe.stderr)
             assert 'the following arguments are required' not in probe.stderr
     finally:
         await instance.on_unload()
@@ -437,7 +443,8 @@ async def test_reload_closes_old_search_before_atomic_admission(plugin):
     try:
         old=instance._active_cover
         entered,release=asyncio.Event(),asyncio.Event()
-        async def blocked_search(query,provider,*,limit):
+        async def blocked_search(query,provider,*,limit,max_duration_s):
+            assert max_duration_s==old.jobs.runtime.max_duration_s
             assert limit==old.search_limit
             entered.set()
             await release.wait()
@@ -447,7 +454,7 @@ async def test_reload_closes_old_search_before_atomic_admission(plugin):
         old.jobs.catalogue.search=blocked_search
         invocation=command(msg='reload-search')
         request=asyncio.create_task(instance.handle_cover_command(**invocation))
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(),timeout=2)
         data=instance.get_plugin_config_data()
         data['music']['search_limit']=1
         instance.set_plugin_config(data)
@@ -455,8 +462,11 @@ async def test_reload_closes_old_search_before_atomic_admission(plugin):
         assert instance._active_cover is not old
         assert instance._active_cover.search_limit==1
         release.set()
-        result=await request
-        assert result[0] is False and ('closing' in result[1] or 'closed' in result[1])
+        # Shared admission owns the catalogue task; close cancels it before
+        # releasing scheduler ownership rather than allowing a late admission.
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert request.cancelled()
         identity=instance._command_identity('stream-1',invocation)
         token=instance._request_token(identity)
         assert old.jobs.store.find_request('stream-1',token) is None
@@ -569,38 +579,43 @@ async def test_cancelled_store_creation_retains_lease_until_schema_finishes(plug
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('outcome,message_id,expected_text',[
-    ('sent','platform-positive-id',None),
-    ('unknown',None,'语音发送结果未知，可能已送达；不会自动重发。')])
-async def test_speak_preserves_single_sender_receipt(plugin,outcome,message_id,expected_text):
+async def test_speak_reports_unsupported_without_media_or_reference_io(plugin,monkeypatch):
     instance,sends=plugin
-    await instance.on_load()
-    try:
-        from sing_async_test.services.delivery_outbox import DeliveryReceipt
-        previous=instance._voice_sender
-        await previous.shutdown(timeout_s=0)
-        class Sender:
-            def __init__(self): self.calls=[]
-            async def send_file(self,path,stream_id):
-                self.calls.append((path,stream_id))
-                return DeliveryReceipt(outcome,message_id)
-            async def shutdown(self,*,timeout_s=1): pass
-        sender=Sender()
-        instance._voice_sender=sender
-        async def speech(text,model,stream_id):
-            return b'one synthetic wav attempt'
-        instance._run_speak=speech
-        instance._resolve_model=lambda selector: 'fixed-test-model'
-        before=len(sends)
+    # Retirement is independent of load state or legacy TTS/clone configuration.
+    data=instance.get_plugin_config_data()
+    data['mimo'].update(voice_mode='clone',reference_audio='/forbidden/reference.wav',
+                        rvc_after_tts=True,api_key='unused-secret')
+    instance.set_plugin_config(data)
+    def forbidden_io(*args,**kwargs):
+        raise AssertionError('retired speech must not read/write audio or spawn media')
+    with monkeypatch.context() as guard:
+        guard.setattr(Path,'read_bytes',forbidden_io)
+        guard.setattr(Path,'write_bytes',forbidden_io)
+        guard.setattr(asyncio,'create_subprocess_exec',forbidden_io)
         result=await instance.handle_speak_command(**command(
             text='/说 hello',groups={'text':'hello'}))
-        assert len(sender.calls)==1 and result[0] is True
-        if expected_text is None:
-            assert 'platform-positive-id' in result[1] and len(sends)==before
-        else:
-            assert result[1]==expected_text and sends[-1][0]==expected_text
-    finally:
-        await instance.on_unload()
+        tool=await instance.handle_speak_tool(text='hello',stream_id='stream-1',
+                                             chat_id='stream-1',platform='qq',user_id='user-1')
+    assert result[0] is False and result[2] is True
+    assert '暂不支持' in result[1] and '受限媒体单元' in result[1]
+    assert sends==[(result[1],'stream-1')]
+    assert tool['success'] is False and tool['code']=='unsupported'
+    assert '可信原始用户消息身份' in tool['content'] and '暂不支持' in tool['content']
+    assert instance._jobs is None and instance._active_cover is None
+
+
+def test_retired_resources_and_entry_helpers_are_absent(plugin):
+    instance,_=plugin
+    for name in ('_local','_rvc','_mimo','_pipeline','_sidecar_proc','_pending',
+                 '_pending_lock','_voice_sender','_cache_cleanup_task',
+                 '_make_local_backend','_start_sidecar','_ensure_sidecar_ready',
+                 '_terminate_stale_sidecar','_stop_sidecar','_close_sidecar_process',
+                 '_resolve_python_path','_sidecar_script_path','_convert_kwargs',
+                 '_resolve_f0_up_key','_resolve_model','_run_speak','_send_voice',
+                 '_voice_cache_dir','_cleanup_voice_cache','_voice_cache_cleanup_loop'):
+        assert not hasattr(instance,name),name
+    for name in ('LocalBackend','RVCClient','MiMoTTSService','Pipeline','SingleVoiceSender'):
+        assert not hasattr(plugin_module,name),name
 
 
 @pytest.mark.asyncio
@@ -608,12 +623,7 @@ async def test_model_list_uses_active_snapshot_and_never_sidecar(plugin):
     instance,sends=plugin
     await instance.on_load()
     try:
-        class ForbiddenSidecar:
-            async def list_models(self):
-                raise AssertionError('disabled sidecar model listing must not be used')
-            async def close(self):
-                pass
-        instance._rvc=ForbiddenSidecar()
+        assert not hasattr(instance,'_rvc')
         active_name=Path(instance._active_cover.model_path).name
         data=instance.get_plugin_config_data()
         data['local']['model_path']=str(Path(instance.ctx.paths.data_dir)/'changed-after-await.pth')
@@ -629,25 +639,148 @@ async def test_model_list_uses_active_snapshot_and_never_sidecar(plugin):
 @pytest.mark.asyncio
 async def test_model_list_reports_not_ready_without_sidecar(plugin):
     instance,sends=plugin
-    class ForbiddenSidecar:
-        async def list_models(self):
-            raise AssertionError('unready model listing must not access sidecar')
-    instance._rvc=ForbiddenSidecar()
+    assert not hasattr(instance,'_rvc')
     result=await instance.handle_list_models(**command(text='/音色列表'))
     assert result[0] is False and '尚未就绪或正在重载' in sends[-1][0]
 
 
 @pytest.mark.asyncio
-async def test_missing_demucs_bundle_fails_before_scheduler_or_qq(plugin):
-    instance, _ = plugin
+@pytest.mark.parametrize('missing', ['model_index', 'worker_python', 'stage_executor'])
+@pytest.mark.parametrize('proof', ['active', 'oom'])
+async def test_real_on_load_recovers_owned_probe_without_execution_assets(
+        plugin, monkeypatch, tmp_path, missing, proof):
+    instance, sends = plugin
+    media = importlib.import_module('sing_async_test.services.media_probe')
+    jobs_module = importlib.import_module('sing_async_test.services.job_service')
+    offers = importlib.import_module('sing_async_test.services.source_offer')
+    await instance.on_load()
+    jobs = instance._jobs
+    # Persist an old exact probe claim without invoking the real runner/media.
+    jobs._task.cancel()
+    await asyncio.gather(jobs._task, return_exceptions=True)
+    jobs._task = None
+    await jobs.prepare()
+    chosen = offers.CatalogueItem('163', 'old-track', 'Song', 'Artist', 'Album', 31., 'available')
+    queued, _ = await jobs.submit_selected('stream-1', 'old-probe-request',
+        {'instrumental': False, 'auto_reply': True, 'platform': 'qq',
+         'ingress_proof': importlib.import_module(
+             'sing_async_test.services.job_store').TRUSTED_QQ_INGRESS}, chosen,
+        auto_reply=True, consent_event='old-probe-request')
+    active = jobs.store.claim_next()
+    workspace = jobs.runtime.work_root/queued.id
+    workspace.mkdir(mode=0o700)
+    (workspace/'source.audio').write_bytes(b'synthetic bounded probe source')
+    request = {'schema': 'sing-source-probe-v1',
+        'selected': {'provider': '163', 'track_id': 'old-track', 'duration_s': 31.},
+        'max_seconds': jobs.runtime.max_duration_s,
+        'max_bytes': jobs.runtime.max_download_bytes,
+        'source_sha256': media.source_hash(workspace/'source.audio', jobs.runtime.max_download_bytes),
+        'worker_sha256': jobs._runtime_inventory.hashes['worker'],
+        'worker_python': str(jobs.runtime.worker_python),
+        'worker_script': jobs._runtime_context['execution_paths']['worker'],
+        'inference_lock': str(jobs.runtime.inference_lock)}
+    (workspace/'source-probe-request.json').write_text(json.dumps(request))
+    step = media.probe_step(workspace, request)
+    jobs_module.save_plan(workspace/'source-probe-plan.json', workspace=workspace,
+        recipe=media.probe_key(request), inference_lock=jobs.runtime.inference_lock, steps=(step,))
+    claimed = jobs.store.claim_step(active.id, active.run_token, 'source_probe')
+    await instance.on_unload()
+    if missing == 'model_index':
+        Path(instance.config.local.model_path).unlink()
+        Path(instance.config.local.index_path).unlink()
+    elif missing == 'worker_python':
+        data = instance.get_plugin_config_data()
+        data['local']['worker_python'] = str(tmp_path/'missing-python')
+        instance.set_plugin_config(data)
+    else:
+        # Redirect only the frozen startup runtime directory: never delete actual
+        # repository execution files to simulate an administrator generation loss.
+        from dataclasses import replace
+        capture = instance._capture_durable_settings
+        monkeypatch.setattr(instance, '_capture_durable_settings',
+            lambda: replace(capture(), runtime_dir=tmp_path/'missing-runtime'))
+    inventory_module = importlib.import_module('sing_async_test.services.asset_inventory')
+    # Restore the actual startup probe constructor. The fixture metadata provider
+    # was used only to seed a previous valid generation, never for recovery.
+    monkeypatch.setattr(plugin_module, 'RuntimeVersionProbe', inventory_module.RuntimeVersionProbe)
+    def forbidden_metadata(*args, **kwargs):
+        raise AssertionError('No metadata subprocess permitted in this static recovery fixture')
+    monkeypatch.setattr(inventory_module.RuntimeVersionProbe, '_run', forbidden_metadata)
+    calls = []
+    async def state(runner, unit):
+        assert unit == claimed.unit_name
+        calls.append(unit)
+        return 'active' if proof == 'active' else 'stopped'
+    async def forbidden_launch(*args, **kwargs):
+        raise AssertionError('Recovery cannot launch a replacement or new stage')
+    monkeypatch.setattr(plugin_module.UnitRunner, 'state', state)
+    monkeypatch.setattr(plugin_module.UnitRunner, 'run', forbidden_launch)
+    if proof == 'oom':
+        logs = workspace/'unit-logs'
+        logs.mkdir()
+        (logs/(claimed.unit_name+'.exit.json')).write_text(json.dumps({
+            'schema': 2, 'completed': True, 'returncode': 1,
+            'service': {'LoadState': 'loaded', 'ActiveState': 'failed',
+                        'Result': 'oom-kill', 'ExecMainCode': '2', 'ExecMainStatus': '9'}}))
+    # Keep real on_load/storage/outbox startup, but run recovery deterministically
+    # by hand and keep the actual notification RPC loop idle (zero fake QQ send).
+    async def idle_jobs(service):
+        await service.prepare_storage()
+    async def idle_delivery():
+        await asyncio.Event().wait()
+    monkeypatch.setattr(plugin_module.JobService, 'start', idle_jobs)
+    monkeypatch.setattr(instance, '_delivery_loop', idle_delivery)
+    await instance.on_load()
+    try:
+        recovered = instance._jobs
+        assert recovered._generation is None and recovered._runtime_inventory is None
+        assert recovered._context_task is None
+        assert instance._outbox is not None and instance._scheduler_owner is not None
+        assert instance._active_cover is not None
+        await recovered.run_once()
+        current = await recovered.get_job(queued.id, queued.stream_id)
+        assert calls == [claimed.unit_name] and sends == []
+        assert current.artifact_key is None and not (workspace/'recipe.json').exists()
+        if proof == 'active':
+            assert current.state == 'running' and current.unit_name == claimed.unit_name
+        else:
+            assert current.state == 'failed' and current.error['code'] == 'unit_oom'
+            assert await recovered.failure_notice_candidates() == [(queued.id, queued.stream_id)]
+            notice = await recovered.claim_failure_notice(queued.id, queued.stream_id)
+            assert notice['code'] == 'unit_oom' and notice['token']
+            await recovered.settle_failure_notice(queued.id, notice['token'], 'unknown')
+        with pytest.raises(inventory_module.InventoryError):
+            await recovered.submit_selected('stream-new', 'missing-assets-new', {}, chosen)
+        assert recovered.store.find_request('stream-new', 'missing-assets-new') is None
+        assert recovered._generation is None and recovered._runtime_inventory is None
+        assert sends == []
+    finally:
+        await instance.on_unload()
+    assert instance._jobs is None and instance._scheduler_owner is None
+
+
+@pytest.mark.asyncio
+async def test_missing_demucs_bundle_keeps_recovery_but_refuses_new_admission(plugin):
+    instance, sends = plugin
     repo = Path(instance.config.local.demucs_repo_path)
     (repo / 'htdemucs.yaml').unlink()
-    from sing_async_test.services.asset_inventory import InventoryError
-    with pytest.raises(InventoryError, match='Demucs'):
-        await instance.on_load()
+    await instance.on_load()
+    try:
+        assert instance._jobs is not None and instance._scheduler_owner is not None
+        assert instance._outbox is not None and instance._active_cover is not None
+        assert isinstance(instance._jobs.artifacts, plugin_module.ArtifactStore)
+        result = await instance.handle_cover_tool(title='Song', artist='Artist',
+            stream_id='stream-1', chat_id='stream-1', platform='qq', user_id='user-1')
+        assert result['success'] is False and result['state'] == 'not_admitted'
+        assert result['job_id'] is None and sends == []
+        assert instance._music.search_calls == []
+        assert instance._jobs._generation is None
+        assert instance._jobs.scanner(instance._jobs.store,
+            ('running', 'cancel_requested')) == []
+        assert not hasattr(instance,'_voice_sender')
+    finally:
+        await instance.on_unload()
     assert instance._jobs is None and instance._scheduler_owner is None
-    assert instance._outbox is None and instance._active_cover is None
-    assert instance._voice_sender is None
 
 
 def test_rvc_wrapper_must_match_inventoried_upstream(plugin):
@@ -666,3 +799,73 @@ def test_missing_hubert_rejected_before_any_render(plugin):
     instance.set_plugin_config(data)
     with pytest.raises(ValueError, match='hubert_path'):
         instance._render_paths()
+
+
+def test_sdk_cover_command_does_not_capture_natural_requests(plugin):
+    instance,_=plugin
+    components=[item for item in instance.get_components()
+                if item['type']=='COMMAND' and item['name']=='翻唱']
+    assert len(components)==1
+    metadata=components[0]['metadata']
+    assert metadata['handler_name']=='handle_cover_command'
+    assert re.match(metadata['command_pattern'],'/翻唱 Song - Artist')
+    for text in ('唱一下《Song - Artist》','唱一段《Song - Artist》',
+                 '你能唱一下朴树的生如夏花吗？','请翻唱朴树的生如夏花'):
+        assert re.match(metadata['command_pattern'],text) is None,text
+
+
+@pytest.mark.asyncio
+async def test_structured_tool_real_admission_defaults_replay_and_owned_status(plugin,monkeypatch):
+    instance,sends=plugin
+    await instance.on_load()
+    try:
+        async def idle():
+            return None
+        monkeypatch.setattr(instance._jobs,'run_once',idle)
+        context={'stream_id':'stream-1','chat_id':'stream-1','platform':'qq','user_id':'user-1'}
+        first=await instance.handle_cover_tool(title='生如夏花',artist='朴树',**context)
+        assert first['success'] is True and first['state']=='queued'
+        assert first['code']=='queued'
+        assert first['job_id'] and '无需选择序号' in first['content']
+        saved=instance._jobs.store.get(first['job_id'],'stream-1')
+        assert (saved.request['entry_kind'],saved.request['render_mode'],
+                saved.request['instrumental'],saved.request['delivery_mode'])==('tool','excerpt',False,'voice')
+        assert saved.request['ingress_proof']==plugin_module.TRUSTED_TOOL_INGRESS
+        assert saved.request['auto_reply'] is True and saved.consent_event
+        assert saved.delivery_state=='pending' and sends==[]
+        assert instance._music.search_calls==[('生如夏花 - 朴树',saved.request['provider'],5)]
+        again=await instance.handle_cover_tool(title='生如夏花',artist='朴树',**context)
+        assert again==first and len(instance._music.search_calls)==1
+        status=await instance.handle_cover_status_tool(job_id=first['job_id'],**context)
+        assert status==first
+        for change in ({'user_id':'user-2'},
+                       {'stream_id':'other-stream','chat_id':'other-stream'}):
+            denied=await instance.handle_cover_status_tool(job_id=first['job_id'],**(context|change))
+            assert denied['success'] is False and denied['job_id'] is None
+            assert denied['code']=='job_unavailable'
+        assert instance._jobs.store.get(first['job_id'],'stream-1')==saved
+        assert len(instance._music.search_calls)==1 and sends==[]
+    finally:
+        await instance.on_unload()
+
+
+@pytest.mark.asyncio
+async def test_structured_tool_single_source_uses_shared_admission_and_format(plugin,monkeypatch):
+    instance,sends=plugin
+    await instance.on_load()
+    try:
+        async def idle():
+            return None
+        monkeypatch.setattr(instance._jobs,'run_once',idle)
+        reply=await instance.handle_cover_tool(title='Song',artist='Artist',source_id='id-1',
+            render_mode='full',instrumental=True,delivery_mode='file',
+            stream_id='stream-1',chat_id='stream-1',platform='qq',user_id='user-1')
+        assert reply['success'] is True and reply['state']=='queued'
+        saved=instance._jobs.store.get(reply['job_id'],'stream-1')
+        assert saved.selected_source['track_id']=='id-1'
+        assert (saved.request['render_mode'],saved.request['instrumental'],
+                saved.request['delivery_mode'])==('full',True,'file')
+        assert saved.delivery_state=='pending' and saved.consent_event
+        assert len(instance._music.search_calls)==1 and sends==[]
+    finally:
+        await instance.on_unload()

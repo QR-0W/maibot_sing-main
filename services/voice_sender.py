@@ -1,4 +1,4 @@
-"""Single-attempt voice send for non-durable speech messages.
+"""Single-attempt file/voice send for non-durable messages.
 
 Unlike the cover outbox this has no persisted per-message identity; it never
 claims cross-request exactly-once behavior. A timeout/cancellation does not
@@ -11,7 +11,7 @@ import asyncio
 import math
 import stat
 
-from .delivery_outbox import DeliveryReceipt, classify_ack
+from .delivery_outbox import DeliveryReceipt, classify_ack, custom_media_payload
 
 
 class SingleVoiceSender:
@@ -53,24 +53,26 @@ class SingleVoiceSender:
         self._watchers.add(watcher)
         watcher.add_done_callback(self._watchers.discard)
 
-    async def send_file(self, path: Path, stream_id: str) -> DeliveryReceipt:
+    async def send_file(self, path: Path, stream_id: str, *,
+                        delivery_mode: str = 'voice') -> DeliveryReceipt:
         if self._closed:
             raise RuntimeError('Voice sender is closed')
         path = Path(path)
         if not path.is_absolute():
-            raise ValueError('Voice file must exist at an absolute path')
+            raise ValueError('Media file must exist at an absolute path')
+        message_type, content = custom_media_payload(path,delivery_mode)
         if not isinstance(stream_id, str) or not stream_id.strip():
             raise ValueError('Invalid stream identity')
         try:
             file_stat = await asyncio.to_thread(path.lstat)
         except OSError as exc:
-            raise ValueError('Voice file is unavailable') from exc
+            raise ValueError('Media file is unavailable') from exc
         if not stat.S_ISREG(file_stat.st_mode):
-            raise ValueError('Voice file must be regular, not a symlink')
+            raise ValueError('Media file must be regular, not a symlink')
         if self._closed:
             raise RuntimeError('Voice sender is closed')
         send_task = asyncio.create_task(self._send_custom(
-            'voiceurl', {'url': path.as_uri()}, stream_id,
+            message_type, content, stream_id,
             return_details=True, timeout_ms=self._rpc_timeout_ms))
         self._tasks.add(send_task)
         send_task.add_done_callback(self._consume_send)

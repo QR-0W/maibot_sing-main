@@ -14,7 +14,6 @@ import re
 import shutil
 import sys
 import time
-import unicodedata
 import uuid
 
 if __package__:
@@ -67,17 +66,13 @@ PARAMETERS = {'pitch': 0, 'f0_method': 'harvest', 'index_rate': 0.5, 'filter_rad
               'rvc_chunk_seconds': 20}
 
 
-def safe_text(value: str) -> str:
-    value = value.strip()
-    if not value or len(value) > 180 or any(ord(ch) < 32 for ch in value):
-        raise ValueError('歌名/艺人为空、过长或含控制字符')
-    if '/' in value or '\\' in value or '..' in value or value.startswith(('-', '~')):
-        raise ValueError('不接受文件路径或命令参数作为歌名')
-    return value
-
-
-def normalized_catalogue_text(value: str) -> str:
-    return ' '.join(unicodedata.normalize('NFKC', value).casefold().split())
+if __package__:
+    from ..runtime.catalogue_text import normalized_catalogue_text, validate_catalogue_text as safe_text
+else:
+    # Keep direct legacy imports independent of the plugin/SDK entry point.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'runtime'))
+    from catalogue_text import normalized_catalogue_text, validate_catalogue_text as safe_text
+    sys.path.pop(0)
 
 
 def digest_file(path: Path) -> str:
@@ -371,13 +366,13 @@ class LocalBackend:
                        str(worker_python), str(script),
                        '--worker-python', str(worker_python), '--musicdl-python', str(musicdl_python),
                        '--rvc-script', str(rvc_script), '--inference-lock', str(inference_lock),
-                       '--scratch', str(scratch), '--title', title, '--artist', artist,
+                       '--scratch', str(scratch), '--title=' + title, '--artist=' + artist,
                        '--model', str(self.model), '--index', str(self.index),
                        '--max-seconds', str(self.max_duration_s), '--max-bytes', str(self.max_download_bytes)]
             if album is not None:
-                command.extend(['--album', album])
+                command.append('--album=' + album)
             if source_id is not None:
-                command.extend(['--source-id', source_id])
+                command.append('--source-id=' + source_id)
             if instrumental:
                 command.append('--instrumental')
             if source_file:

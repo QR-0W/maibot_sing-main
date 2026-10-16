@@ -7,13 +7,13 @@ import sys
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1] / 'services'
+ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('ledger_test_pkg', ROOT/'__init__.py', submodule_search_locations=[str(ROOT)])
 package = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = package
 spec.loader.exec_module(package)
-ledger = importlib.import_module('ledger_test_pkg.job_store')
-choices = importlib.import_module('ledger_test_pkg.source_offer')
+ledger = importlib.import_module('ledger_test_pkg.services.job_store')
+choices = importlib.import_module('ledger_test_pkg.services.source_offer')
 JobStore, JobConflict, JobNotFound = ledger.JobStore, ledger.JobConflict, ledger.JobNotFound
 Item = choices.CatalogueItem
 
@@ -72,6 +72,28 @@ def test_consent_required_and_never_implicitly_added(store):
     job = ready(store,consent=False)
     assert job.state=='ready' and job.delivery_state=='not_requested'
     assert store.claim_delivery(job.id,job.stream_id) is None
+
+
+@pytest.mark.parametrize('field,invalid', [
+    (field, invalid)
+    for field in ('delivery_mode', 'render_mode')
+    for invalid in ('invalid', '', None, True, 1, [], {})
+] + [('instrumental', invalid) for invalid in (None, 0, 1, 'false', [], {})])
+def test_invalid_public_request_modes_are_rejected_before_admission(store, field, invalid):
+    payload = {field: invalid}
+    with pytest.raises(ValueError):
+        store.submit('a', 'legacy', payload)
+    with pytest.raises(ValueError):
+        store.admit_offer('a', 'atomic', payload, catalogue())
+    assert store.find_request('a', 'legacy') is None
+    assert store.find_request('a', 'atomic') is None
+
+
+
+def test_legacy_and_explicit_public_request_modes(store):
+    assert ledger.request_modes({})==('voice','full',False)
+    assert ledger.request_modes({'delivery_mode':'file','render_mode':'excerpt',
+                                 'instrumental':True})==('file','excerpt',True)
 
 
 def test_atomic_admission_commits_offer_and_optional_single_selection(store):
@@ -289,7 +311,7 @@ def test_crash_during_send_becomes_unknown_never_automatically_resent(store):
 def test_legacy_pending_consent_is_never_scanned_or_claimed(store):
     legacy = ready(store, trusted=False)
     assert legacy.delivery_state == 'pending' and legacy.consent_event
-    root = ROOT.parent
+    root = ROOT
     project = importlib.util.spec_from_file_location(
         'ledger_project_test', root/'__init__.py',
         submodule_search_locations=[str(root)])
@@ -414,3 +436,202 @@ def test_queue_cap_applies_to_searching_and_history_is_monotonic(store):
     assert [e['revision'] for e in history]==[0,1]
     with pytest.raises(JobNotFound):
         store.history(job.id,'b')
+
+
+@pytest.mark.parametrize('delivery_mode', ['file', 'voice'])
+@pytest.mark.parametrize('render_mode', ['full', 'excerpt'])
+@pytest.mark.parametrize('instrumental', [False, True])
+def test_mode_combinations_persist_unchanged_across_restart(
+        store, delivery_mode, render_mode, instrumental):
+    payload = dict(delivery_mode=delivery_mode, render_mode=render_mode,
+                   instrumental=instrumental)
+    job, created = store.admit_offer('a', 'modes', payload, catalogue())
+    assert created
+    reopened = JobStore(store.path)
+    assert reopened.get(job.id, 'a').request == payload
+    assert ledger.request_modes(payload) == (delivery_mode, render_mode, instrumental)
+    again, created = reopened.admit_offer('a', 'modes', payload, catalogue())
+    assert not created and again.id == job.id
+
+
+def test_legacy_request_is_not_rewritten_on_admission_or_restart(store):
+    job, _ = store.admit_offer('a', 'legacy', {'query': 'creep'}, catalogue())
+    persisted = JobStore(store.path).get(job.id, 'a')
+    assert persisted.request == {'query': 'creep'}
+    assert ledger.request_modes(persisted.request) == ('voice', 'full', False)
+
+
+def tool_payload(**changes):
+    return dict({'title':'Creep','artist':'Radiohead','platform':'qq','user_id':'user-a',
+                 'auto_reply':True,'ingress_proof':ledger.TRUSTED_TOOL_INGRESS,
+                 'render_mode':'excerpt','delivery_mode':'voice','instrumental':False,
+                 'service_generation':'generation-a'}, **changes)
+
+
+def test_tool_binding_is_atomic_before_search_and_uses_new_random_token(store):
+    other = JobStore(store.path)
+    request = tool_payload()
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        bindings = list(threads.map(lambda current: current.bind_tool_request(
+            'a','session-user-intent',request,auto_reply=True), (store,other)))
+    assert len({token for token,_ in bindings}) == 1
+    assert all(job is None for _,job in bindings)
+    token = bindings[0][0]
+    assert token != 'session-user-intent'
+    job,_ = store.admit_offer('a',token,request,catalogue(),
+                             auto_reply=True,consent_event=token)
+    assert other.bind_tool_request('a','session-user-intent',request,
+                                  auto_reply=True) == (token,job)
+
+
+def test_tool_binding_active_then_terminal_cooldown_not_permanent(store,monkeypatch):
+    now = [1000.]
+    monkeypatch.setattr(ledger.time,'time',lambda:now[0])
+    request = tool_payload()
+    token,_ = store.bind_tool_request('a','intent',request,auto_reply=True)
+    job,_ = store.admit_offer('a',token,request,catalogue(),auto_reply=True,consent_event=token)
+    now[0] = 2000.
+    assert store.bind_tool_request('a','intent',request,auto_reply=True) == (token,job)
+    terminal = store.cancel(job.id,'a')
+    now[0] = 2060.
+    assert store.bind_tool_request('a','intent',request,auto_reply=True) == (token,terminal)
+    now[0] = 2060.001
+    new_token,existing = JobStore(store.path).bind_tool_request('a','intent',request,auto_reply=True)
+    assert new_token != token and existing is None
+    new_job,created = store.admit_offer('a',new_token,request,catalogue(),
+                                      auto_reply=True,consent_event=new_token)
+    assert created and new_job.id != job.id
+
+
+@pytest.mark.parametrize('state', ['ready','failed','interrupted','cancelled'])
+def test_tool_binding_cooldown_uses_every_terminal_states_updated_time(store,monkeypatch,state):
+    now = [1000.]
+    monkeypatch.setattr(ledger.time,'time',lambda:now[0])
+    request = tool_payload()
+    token,_ = store.bind_tool_request('a','intent',request,auto_reply=True)
+    job,_ = store.admit_offer('a',token,request,catalogue(),auto_reply=True,consent_event=token)
+    # Pure ledger fixture: simulate an already fenced terminal write.
+    with store._transaction() as db:
+        db.execute('UPDATE jobs SET state=?,updated_at=? WHERE id=?',(state,1100.,job.id))
+    now[0] = 1159.
+    assert store.bind_tool_request('a','intent',request,auto_reply=True)[0] == token
+    now[0] = 1161.
+    assert store.bind_tool_request('a','intent',request,auto_reply=True)[0] != token
+
+
+def test_tool_binding_is_scoped_to_stream_user_modes_and_generation(store):
+    request = tool_payload()
+    first,_ = store.bind_tool_request('a','intent',request,auto_reply=True)
+    assert store.bind_tool_request('b','intent',request,auto_reply=True)[0] != first
+    for change in ({'user_id':'b'},{'render_mode':'full'},
+                   {'service_generation':'generation-b'},{'title':'Other'}):
+        assert store.bind_tool_request('a','intent',tool_payload(**change),auto_reply=True)[0] != first
+
+
+def test_tool_uncommitted_reservation_expires_without_fake_message_anchor(store,monkeypatch):
+    now = [1000.]
+    monkeypatch.setattr(ledger.time,'time',lambda:now[0])
+    request = tool_payload()
+    token,_ = store.bind_tool_request('a','intent',request,auto_reply=True)
+    now[0] = 1060.
+    assert store.bind_tool_request('a','intent',request,auto_reply=True) == (token,None)
+    now[0] += .001
+    assert store.bind_tool_request('a','intent',request,auto_reply=True)[0] != token
+    assert store.find_request('a',token) is None
+
+
+def failed_notice_job(store, token='notice', *, trusted=True, consent=True, interrupted=False):
+    job = queued(store,token=token,trusted=trusted,consent=consent)
+    run = store.claim_next()
+    return store.finish_failure(job.id,run.run_token,
+        {'code':'stage_timeout','message':'private /path and playback credentials'},
+        expected_unit=None,expected_revision=run.revision,interrupted=interrupted)
+
+
+@pytest.mark.parametrize('interrupted', [False,True])
+def test_failure_notice_claim_is_atomic_and_separate_from_media(store,interrupted):
+    job = failed_notice_job(store,interrupted=interrupted)
+    assert store.failure_notice_candidates() == [(job.id,job.stream_id)]
+    other = JobStore(store.path)
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        claims = list(threads.map(lambda current: current.claim_failure_notice(job.id,job.stream_id),
+                                  (store,other)))
+    claim = next(value for value in claims if value)
+    assert sum(value is not None for value in claims) == 1
+    assert claim['code'] == 'stage_timeout' and 'message' not in claim
+    assert claim['state'] == ('interrupted' if interrupted else 'failed')
+    assert store.failure_notice_candidates() == []
+    assert store.get(job.id,job.stream_id) == job
+    with pytest.raises(ValueError):
+        store.settle_failure_notice(job.id,claim['token'],'sent')
+    with pytest.raises(ValueError):
+        store.settle_failure_notice(job.id,claim['token'],'unknown',message_id='fake')
+    with pytest.raises(JobConflict):
+        store.settle_failure_notice(job.id,'stale','sent',message_id='ack')
+    result = store.settle_failure_notice(job.id,claim['token'],'sent',message_id='ack')
+    assert result['state'] == 'sent' and result['message_id'] == 'ack'
+    assert store.get(job.id,job.stream_id) == job
+    assert store.claim_failure_notice(job.id,job.stream_id) is None
+
+
+@pytest.mark.parametrize('code', ['unit_oom', 'resource_budget_exhausted', 'cgroup_unavailable'])
+def test_failure_notice_keeps_confirmed_resource_error_codes(store, code):
+    job = queued(store, token='resource-' + code)
+    run = store.claim_next()
+    store.finish_failure(job.id, run.run_token, {'code': code, 'message': '/private/diagnosis'},
+                         expected_unit=None, expected_revision=run.revision)
+    claim = store.claim_failure_notice(job.id, job.stream_id)
+    assert claim['code'] == code and 'message' not in claim
+
+
+def test_failure_notice_recovery_marks_unknown_never_resends_and_allows_late_ack(store):
+    job = failed_notice_job(store)
+    claim = store.claim_failure_notice(job.id,job.stream_id)
+    reopened = JobStore(store.path)
+    assert reopened.recover_failure_notices() == 1
+    assert reopened.recover_failure_notices() == 0
+    assert reopened.failure_notice_candidates() == []
+    assert reopened.claim_failure_notice(job.id,job.stream_id) is None
+    result = reopened.settle_failure_notice(job.id,claim['token'],'sent',message_id='late-ack')
+    assert result['state'] == 'sent'
+    assert reopened.get(job.id,job.stream_id) == job
+
+
+@pytest.mark.parametrize('trusted,consent', [(False,True),(True,False),(False,False)])
+def test_untrusted_or_unconsented_failure_never_gets_notice(store,trusted,consent):
+    job = failed_notice_job(store,trusted=trusted,consent=consent)
+    assert store.failure_notice_candidates() == []
+    assert store.claim_failure_notice(job.id,job.stream_id) is None
+
+
+def test_old_task_is_not_upgraded_on_restart_or_request_replay(store):
+    request = tool_payload()
+    job,_ = store.admit_offer('a','historic',request,catalogue()[:1],
+                             auto_reply=True,consent_event='historic')
+    # Fixture for a pre-notice ledger: prior versions could have current proof
+    # spelling, but did not persist the new admission-time authorization.
+    with store._transaction() as db:
+        db.execute('DELETE FROM failure_notices WHERE job_id=?',(job.id,))
+    reopened = JobStore(store.path)
+    replay,created = reopened.admit_offer('a','historic',request,catalogue()[:1],
+                                         auto_reply=True,consent_event='historic')
+    assert not created and replay.id == job.id
+    run = reopened.claim_next()
+    reopened.finish_failure(job.id,run.run_token,{'code':'stage_timeout','message':'failed'},
+                            expected_unit=None,expected_revision=run.revision)
+    assert reopened.failure_notice_candidates() == []
+    assert reopened.claim_failure_notice(job.id,'a') is None
+
+
+def test_failure_notice_ignores_cancelled_and_masks_unknown_error_code(store):
+    cancelled = queued(store,token='cancelled')
+    store.cancel(cancelled.id,cancelled.stream_id)
+    assert store.claim_failure_notice(cancelled.id,cancelled.stream_id) is None
+    job = queued(store,token='failed')
+    run = store.claim_next()
+    store.finish_failure(job.id,run.run_token,{'code':'credential-secret','message':'private'},
+                         expected_unit=None,expected_revision=run.revision)
+    claim = store.claim_failure_notice(job.id,job.stream_id)
+    assert claim['code'] == 'job_failed'
+    assert store.settle_failure_notice(job.id,claim['token'],'unknown')['state'] == 'unknown'
+    assert JobStore(store.path).claim_failure_notice(job.id,job.stream_id) is None

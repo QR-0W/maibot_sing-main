@@ -14,11 +14,15 @@ MESSAGES={
     'unit_result_missing':'阶段已退出，但缺少可验证的阶段结果；不推断为内存或发送失败。',
     'unit_result_invalid':'阶段结果格式或身份无效，不能据此标记成功。',
     'stage_interrupted':'阶段已停止但没有完整输出凭据；已完成分块保留。',
+    'resource_budget_exhausted':'宿主内存余量不足，未启动该阶段；请释放内存或调低资源配置后重试。',
+    'cgroup_unavailable':'无法读取 cgroup 内存限制，拒绝在未受限环境启动阶段。',
 }
 WORKER_CODES={'stage_timeout','stage_exit','stage_terminated','inference_busy',
-              'unsealed_output','checkpoint_error','executor_error'}
+              'unsealed_output','checkpoint_error','executor_error',
+              'resource_budget_exhausted','cgroup_unavailable'}
 INTERRUPTED_CODES={'stage_timeout','unit_timeout','unit_signal','stage_terminated',
-                   'inference_busy','unsealed_output','unit_result_missing','stage_interrupted'}
+                   'inference_busy','unsealed_output','unit_result_missing','stage_interrupted',
+                   'resource_budget_exhausted','cgroup_unavailable'}
 
 
 def failure_document(code,stage):

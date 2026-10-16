@@ -5,11 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 import math
-import unicodedata
 
-
-def _normalized(value: str) -> str:
-    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+if __package__:
+    from .catalogue_text import normalized_catalogue_text as _normalized
+else:
+    from catalogue_text import normalized_catalogue_text as _normalized
 
 
 @dataclass(frozen=True)

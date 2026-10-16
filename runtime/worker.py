@@ -6,6 +6,8 @@ from dataclasses import asdict
 from pathlib import Path
 from types import MethodType
 import argparse
+import asyncio
+from types import SimpleNamespace
 import fcntl
 import hashlib
 import json
@@ -20,26 +22,84 @@ import unicodedata
 # Support direct CLI execution and isolated import-based tests without importing
 # the plugin entry point or any model library here.
 if __package__:
+    from .context_window import freeze_context, full_context
     from .source_selection import SourceCandidate, SourceSelectionError, select_source
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from context_window import freeze_context, full_context
     from source_selection import SourceCandidate, SourceSelectionError, select_source
     sys.path.pop(0)
 
 
+def _budget_value(name: str) -> int:
+    """Use the launcher's frozen budget; a missing value must not use defaults."""
+    value = os.environ.get('MAIBOT_SING_BUDGET_' + name, '')
+    if not value.isascii() or not value.isdecimal() or int(value) <= 0:
+        raise RuntimeError('媒体单元缺少有效预算字段：' + name)
+    return int(value)
+
+
+def _unit_cgroup() -> Path:
+    rel = Path('/proc/self/cgroup').read_text().strip().split('0::', 1)[1]
+    if not rel.startswith('/') or '..' in Path(rel).parts:
+        raise RuntimeError('媒体单元 cgroup 路径无效')
+    return Path('/sys/fs/cgroup') / rel.lstrip('/')
+
+
 def verify_limits() -> None:
+    """Verify the actual service against the single launch-time budget."""
     if not os.environ.get('INVOCATION_ID'):
         raise RuntimeError('必须在 systemd user service 内运行')
-    rel = Path('/proc/self/cgroup').read_text().strip().split('0::', 1)[1]
-    base = Path('/sys/fs/cgroup') / rel.lstrip('/')
-    expected = {'memory.max': '4294967296', 'memory.high': '3221225472',
-                'memory.swap.max': '0', 'pids.max': '64'}
+    base = _unit_cgroup()
+    expected = {
+        'memory.max': str(_budget_value('MEMORY_MAX')),
+        'memory.high': str(_budget_value('MEMORY_HIGH')),
+        'memory.swap.max': '0',
+        'memory.oom.group': '1',
+        'pids.max': str(_budget_value('TASKS_MAX')),
+    }
     for name, value in expected.items():
         if (base / name).read_text().strip() != value:
             raise RuntimeError('未应用隔离配置: ' + name)
     quota, period = (base / 'cpu.max').read_text().split()
-    if quota == 'max' or int(quota) / int(period) > 1.5:
+    if quota == 'max' or int(quota) * 100 > _budget_value('CPU_PERCENT') * int(period):
         raise RuntimeError('CPU 未受限')
+
+
+def verify_host_headroom() -> None:
+    """Recheck finite ancestors after acquiring the shared inference lock.
+
+    This tiny Python-3.9-compatible check uses the frozen launcher budget. The
+    unit leaf is excluded: only shared ancestors carry the competing workloads.
+    """
+    required = _budget_value('MEMORY_MAX') + _budget_value('HEADROOM')
+    root, current = Path('/sys/fs/cgroup'), _unit_cgroup().parent
+    measured = False
+    while current == root or root in current.parents:
+        try:
+            maximum = (current / 'memory.max').read_text().strip()
+            usage = (current / 'memory.current').read_text().strip()
+            if not usage.isascii() or not usage.isdecimal():
+                raise ValueError('invalid usage')
+            if maximum != 'max':
+                if not maximum.isascii() or not maximum.isdecimal():
+                    raise ValueError('invalid capacity')
+                measured = True
+                if int(maximum) - int(usage) < required:
+                    error = RuntimeError('共享祖先内存余量不足，未启动媒体子进程')
+                    error.code = 'resource_budget_exhausted'
+                    raise error
+        except (OSError, ValueError) as exc:
+            error = RuntimeError('无法读取共享祖先内存限制，未启动媒体子进程')
+            error.code = 'cgroup_unavailable'
+            raise error from exc
+        if current == root:
+            break
+        current = current.parent
+    if not measured:
+        error = RuntimeError('没有有限共享祖先内存容量，未启动媒体子进程')
+        error.code = 'cgroup_unavailable'
+        raise error
 
 
 def run(*args: str, timeout: int = 300, capture: bool = False) -> subprocess.CompletedProcess:
@@ -246,13 +306,13 @@ def orchestrate(args: argparse.Namespace) -> None:
         python = str(args.worker_python)
         opts = ['--worker-python', str(args.worker_python), '--musicdl-python', str(args.musicdl_python),
                 '--rvc-script', str(args.rvc_script), '--inference-lock', str(args.inference_lock),
-                '--scratch', str(args.scratch), '--title', args.title, '--artist', args.artist,
+                '--scratch', str(args.scratch), '--title=' + args.title, '--artist=' + args.artist,
                 '--model', str(args.model), '--index', str(args.index),
                 '--max-seconds', str(args.max_seconds), '--max-bytes', str(args.max_bytes)]
         if args.album:
-            opts.extend(['--album', args.album])
+            opts.append('--album=' + args.album)
         if args.source_id:
-            opts.extend(['--source-id', args.source_id])
+            opts.append('--source-id=' + args.source_id)
         if args.instrumental:
             opts.append('--instrumental')
         if args.source_file:
@@ -303,7 +363,322 @@ def orchestrate(args: argparse.Namespace) -> None:
             'resources': resources}, ensure_ascii=False))
 
 
+_SAMPLE_RATE = 44100
+_CHANNELS = 2
+_FRAME_BYTES = 8
+_STDOUT_LIMIT = 65536
+_STDERR_LIMIT = 8192
+_FFPROBE_TIMEOUT_S = 20
+_FFMPEG_TIMEOUT_S = 120
+_PROCESS_CLEANUP_S = 3
+
+
+class ProbeError(RuntimeError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+class _OutputLimit(RuntimeError):
+    pass
+
+
+class _DecodedTooLong(RuntimeError):
+    pass
+
+
+async def _read_limited(stream, limit):
+    output = bytearray()
+    while True:
+        block = await stream.read(min(8192, limit-len(output)+1))
+        if not block:
+            return bytes(output)
+        output.extend(block)
+        if len(output) > limit:
+            raise _OutputLimit
+
+
+async def _count_pcm(stream, max_bytes):
+    amount = 0
+    while True:
+        block = await stream.read(256*1024)
+        if not block:
+            return amount
+        amount += len(block)
+        if amount > max_bytes:
+            raise _DecodedTooLong
+
+
+async def _drain_pipe(stream):
+    try:
+        while await stream.read(256*1024):
+            pass
+    except (BrokenPipeError, ConnectionError, RuntimeError):
+        pass
+
+
+def _close_pipe_transport(stream):
+    transport = getattr(stream, '_transport', None)
+    if transport is not None:
+        try:
+            transport.close()
+        except BaseException:
+            pass
+
+
+async def _cleanup_owned(process, readers, waited):
+    """Bound kill/drain/reap, including cancellation during ownership cleanup."""
+    async def settle_reader(task, stream):
+        await asyncio.gather(task, return_exceptions=True)
+        at_eof = getattr(stream, 'at_eof', None)
+        if at_eof is None or not at_eof():
+            await _drain_pipe(stream)
+
+    async def finish():
+        if process.returncode is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        output, errors = readers
+        settling = [asyncio.create_task(settle_reader(output, process.stdout),
+                                        name='media-probe-clean-stdout'),
+                    asyncio.create_task(settle_reader(errors, process.stderr),
+                                        name='media-probe-clean-stderr')]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*settling, waited, return_exceptions=True),
+                _PROCESS_CLEANUP_S)
+        except asyncio.TimeoutError:
+            _close_pipe_transport(process.stdout)
+            _close_pipe_transport(process.stderr)
+            transport = getattr(process, '_transport', None)
+            if transport is not None:
+                try:
+                    transport.close()
+                except BaseException:
+                    pass
+            for task in (*settling, *readers, waited):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*settling, *readers, waited, return_exceptions=True)
+
+    cleanup = asyncio.create_task(finish(), name='media-probe-cleanup')
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+    await asyncio.gather(cleanup, return_exceptions=True)
+
+
+async def _execute(argv, output_reader, *, timeout_s, pipe_limit):
+    # Private algorithm helper: production enters ONLY through probe_cli, inside
+    # StageExecutor's admitted, locked service. No Host-facing adapter calls it.
+    process = await asyncio.create_subprocess_exec(*argv,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=pipe_limit)
+    output = asyncio.create_task(output_reader(process.stdout), name='media-probe-stdout')
+    errors = asyncio.create_task(_read_limited(process.stderr, _STDERR_LIMIT),
+                                 name='media-probe-stderr')
+    waited = asyncio.create_task(process.wait(), name='media-probe-wait')
+    owned = (output, errors, waited)
+
+    async def collect():
+        done, _ = await asyncio.wait(owned, return_when=asyncio.FIRST_EXCEPTION)
+        for task in done:
+            exception = task.exception()
+            if exception is not None:
+                raise exception
+        values = await asyncio.gather(*owned)
+        return values[0], values[1], values[2]
+
+    try:
+        # asyncio.timeout is unavailable in the frozen Python 3.9 worker.
+        return await asyncio.wait_for(collect(), timeout_s)
+    except BaseException:
+        await _cleanup_owned(process, (output, errors), waited)
+        raise
+
+
+async def _metadata(path):
+    try:
+        raw, errors, returncode = await _execute([
+            'ffprobe', '-v', 'error', '-show_entries',
+            'format=duration:stream=codec_type', '-of', 'json', str(path)],
+            lambda stream: _read_limited(stream, _STDOUT_LIMIT),
+            timeout_s=_FFPROBE_TIMEOUT_S, pipe_limit=_STDOUT_LIMIT)
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError as exc:
+        raise ProbeError('source_probe_timeout', '已选曲目的媒体检测超时，没有改选其他版本。') from exc
+    except (OSError, _OutputLimit) as exc:
+        raise ProbeError('source_invalid_media', '已选曲目的媒体元数据无法安全读取。') from exc
+    if returncode or not raw or errors:
+        raise ProbeError('source_invalid_media', '已选曲目的下载内容不是可验证的完整音频。')
+    try:
+        record = json.loads(raw)
+        streams = record['streams']
+        if not isinstance(streams, list):
+            raise ValueError('invalid streams')
+        audio = [stream for stream in streams
+                 if isinstance(stream, dict) and stream.get('codec_type') == 'audio']
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ProbeError('source_invalid_media', '已选曲目的媒体格式无效。') from exc
+    container_duration = None
+    try:
+        candidate = float(record.get('format', {}).get('duration'))
+        if math.isfinite(candidate) and candidate >= 0:
+            container_duration = candidate
+    except (ValueError, TypeError, AttributeError):
+        pass
+    if not audio:
+        raise ProbeError('source_duration_limit', '媒体无有效完整音轨，或超出本机时长范围。')
+    return len(audio), container_duration
+
+
+async def _decoded_frames(path, max_seconds):
+    try:
+        amount, errors, returncode = await _execute([
+            'ffmpeg', '-nostdin', '-v', 'error', '-xerror', '-threads', '1',
+            '-max_alloc', str(64*1024*1024), '-i', str(path), '-map', '0:a:0',
+            '-ar', str(_SAMPLE_RATE), '-ac', str(_CHANNELS), '-c:a', 'pcm_f32le',
+            '-f', 'f32le', 'pipe:1'],
+            lambda stream: _count_pcm(stream, max_seconds*_SAMPLE_RATE*_FRAME_BYTES),
+            timeout_s=_FFMPEG_TIMEOUT_S, pipe_limit=256*1024)
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError as exc:
+        raise ProbeError('source_probe_timeout', '已选曲目的受控解码超时，没有改选其他版本。') from exc
+    except _DecodedTooLong as exc:
+        raise ProbeError('source_duration_limit', '媒体无有效完整音轨，或超出本机时长范围。') from exc
+    except (OSError, _OutputLimit) as exc:
+        raise ProbeError('source_invalid_media', '已选曲目的受控解码输出无效。') from exc
+    if returncode or errors or amount <= 0 or amount % _FRAME_BYTES:
+        raise ProbeError('source_invalid_media', '已选曲目的下载内容不能完整解码。')
+    return amount // _FRAME_BYTES
+
+
+async def probe_download(path, selected, *, max_seconds=300, render_mode=None):
+    """Single streamed frame/duration algorithm; CLI supplies bounded execution.
+
+    Direct calls are algorithm-test injection, never a production Host API.
+    Container duration is diagnostic, not recording identity or a planning clock.
+    """
+    if not path.is_absolute() or not path.is_file() or path.is_symlink():
+        raise ProbeError('source_missing', '已选曲目的下载文件不存在。')
+    if (type(max_seconds) is not int or render_mode not in (None, 'full', 'excerpt')
+            or (render_mode in (None, 'full') and not 30 <= max_seconds <= 300)
+            or (render_mode == 'excerpt' and max_seconds != 900)):
+        raise ValueError('Invalid media duration limit')
+    audio_streams, container_duration = await _metadata(path)
+    frames = await _decoded_frames(path, max_seconds)
+    if not 30*_SAMPLE_RATE <= frames <= max_seconds*_SAMPLE_RATE:
+        raise ProbeError('source_duration_limit', '媒体无有效完整音轨，或超出本机时长范围。')
+    duration = frames / _SAMPLE_RATE
+    expected = selected.duration_s
+    if expected is not None and abs(duration-expected) > max(3., expected*.02):
+        raise ProbeError('source_duration_mismatch',
+                         '下载时长与所选曲目列表不符；不能据此判断录音身份。')
+    report = {'duration_s': duration, 'container_duration_s': container_duration,
+              'frames': frames, 'sample_rate': _SAMPLE_RATE, 'audio_streams': audio_streams,
+              'source_id': selected.track_id, 'provider': selected.provider}
+    if render_mode is not None:
+        report.update(source_frames=frames, render_mode=render_mode,
+                      context_window=(freeze_context(frames) if render_mode == 'excerpt'
+                                      else full_context(frames)))
+    return report
+
+
+def probe_cli(argv):
+    parser = argparse.ArgumentParser(description='Bounded source probe')
+    parser.add_argument('--source', type=Path, required=True)
+    parser.add_argument('--request', type=Path, required=True)
+    parser.add_argument('--report', type=Path, required=True)
+    args = parser.parse_args(argv)
+    verify_limits()
+    verify_host_headroom()  # StageExecutor holds the common inference flock.
+    for path in (args.source, args.request, args.report):
+        if not path.is_absolute() or any(part.is_symlink() for part in (path, *path.parents)):
+            raise ValueError('Unsafe source probe path')
+    workspace = args.request.parent
+    if (args.source != workspace/'source.audio'
+            or args.request != workspace/'source-probe-request.json'
+            or args.report != workspace/'source-probe-report.json'):
+        raise ValueError('Source probe path binding changed')
+    with args.request.open('rb') as stream:
+        raw = stream.read(_STDOUT_LIMIT+1)
+    if len(raw) > _STDOUT_LIMIT:
+        raise ValueError('Oversized source probe request')
+    request = json.loads(raw)
+    selected = request['selected']
+    duration = selected['duration_s']
+    common = {'schema', 'selected', 'max_bytes', 'source_sha256', 'worker_sha256',
+              'worker_python', 'worker_script', 'inference_lock'}
+    if request.get('schema') == 'sing-source-probe-v1':
+        schema_valid = (set(request) == common | {'max_seconds'}
+                        and type(request.get('max_seconds')) is int
+                        and 30 <= request['max_seconds'] <= 300)
+        max_seconds = request.get('max_seconds')
+        render_mode = None
+    elif request.get('schema') == 'sing-source-probe-v2':
+        render_mode = request.get('render_mode')
+        schema_valid = (set(request) == common | {
+                'render_mode', 'source_max_seconds', 'context_max_seconds',
+                'context_policy', 'context_helper_sha256'}
+            and render_mode in ('full', 'excerpt')
+            and type(request.get('source_max_seconds')) is int
+            and ((render_mode == 'full' and 30 <= request['source_max_seconds'] <= 300)
+                 or (render_mode == 'excerpt' and request['source_max_seconds'] == 900))
+            and type(request.get('context_max_seconds')) is int
+            and request['context_max_seconds'] == 90
+            and request.get('context_policy') == 'centered-source-v1'
+            and digest_file(Path(__file__).with_name('context_window.py')) ==
+                request.get('context_helper_sha256'))
+        max_seconds = request.get('source_max_seconds')
+    else:
+        schema_valid = False
+        max_seconds = None
+        render_mode = None
+    if (not schema_valid or set(selected) != {'provider', 'track_id', 'duration_s'}
+            or any(not isinstance(selected[name], str) or not 1 <= len(selected[name]) <= 512
+                   for name in ('provider', 'track_id'))
+            or (duration is not None and (isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not math.isfinite(duration) or duration <= 0))
+            or type(request['max_bytes']) is not int
+            or not 1024 <= request['max_bytes'] <= 64*1024*1024
+            or args.source.stat().st_size > request['max_bytes']
+            or digest_file(args.source) != request['source_sha256']
+            or digest_file(Path(__file__).resolve()) != request['worker_sha256']):
+        raise ValueError('Source probe request or frozen bytes changed')
+    temporary = args.report.with_name(args.report.name+'.part')
+    if args.report.exists() or temporary.exists() or temporary.is_symlink():
+        raise ValueError('Unsealed source probe output preserved; no automatic retry')
+    report = asyncio.run(probe_download(args.source, SimpleNamespace(**selected),
+                                        max_seconds=max_seconds, render_mode=render_mode))
+    encoded = json.dumps(report, ensure_ascii=False, sort_keys=True,
+                         separators=(',', ':'), allow_nan=False).encode('utf-8')
+    if len(encoded) > _STDOUT_LIMIT:
+        raise ValueError('Oversized probe report')
+    # Never replace a partial report or an earlier output after interruption.
+    with temporary.open('xb') as output:
+        os.chmod(temporary, 0o600)
+        output.write(encoded)
+        output.flush()
+        os.fsync(output.fileno())
+    os.link(temporary, args.report)
+    directory = os.open(workspace, os.O_DIRECTORY | os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    temporary.unlink()
+
+
 def main() -> None:
+    if sys.argv[1:2] == ['probe']:
+        probe_cli(sys.argv[2:])
+        return
     parser = argparse.ArgumentParser()
     parser.add_argument('stage', nargs='?', default='run', choices=['run', 'download', 'separate', 'mix'])
     parser.add_argument('--scratch', type=Path, required=True)
